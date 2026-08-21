@@ -91,7 +91,10 @@ class ZFSPoolService(CRUDService):
         enabled = (libzfs.FeatureState.ENABLED, libzfs.FeatureState.ACTIVE)
         with libzfs.ZFS() as zfs:
             for pool in filter(lambda x: x.name == pool_name, zfs.pools):
-                return all((i.state in enabled for i in pool.features))
+                return all(
+                    i.state in enabled for i in pool.features
+                    if getattr(i, 'supports_upgrade', True)
+                )
             else:
                 raise CallError(f'{pool_name!r} not found', errno.ENOENT)
 
@@ -357,11 +360,14 @@ class ZFSPoolService(CRUDService):
     def find_not_online(self, pool):
         pool = self.middleware.call_sync('zfs.pool.query', [['id', '=', pool]], {'get': True})
 
-        unavails = []
-        for nodes in pool['groups'].values():
+        result = {'groups': {}}
+        for group_name, nodes in pool['groups'].items():
+            unavails = []
             for node in nodes:
                 unavails.extend(self.__find_not_online(node))
-        return unavails
+            if unavails:
+                result['groups'][group_name] = unavails
+        return result
 
     def __find_not_online(self, node):
         if len(node['children']) == 0 and node['status'] not in ('ONLINE', 'AVAIL'):
@@ -403,9 +409,21 @@ class ZFSDatasetService(CRUDService):
                 if about_to_lock_dataset else []
             )
         ]
-        return self.query([['encrypted', '=', True], or_filters], {
-            'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']}, 'select': ['id', 'mountpoint']
-        })
+        # `datasets_serialized` stopped emitting a top-level `mountpoint` key (py-libzfs 3b100a9,
+        # "Do not treat mountpoint specially"). 13.3 shipped an older py-libzfs that still emitted it,
+        # so `select: ['id', 'mountpoint']` silently yielded rows with no `mountpoint` at all and every
+        # consumer subscripting it raised KeyError. Read it out of `properties` instead.
+        return [
+            {
+                'id': ds['id'],
+                'mountpoint': None if (
+                    mountpoint := ds['properties'].get('mountpoint', {}).get('value')
+                ) == 'none' else mountpoint,
+            }
+            for ds in self.query([['encrypted', '=', True], or_filters], {
+                'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']},
+            })
+        ]
 
     def flatten_datasets(self, datasets):
         return sum([[deepcopy(ds)] + self.flatten_datasets(ds['children']) for ds in datasets], [])

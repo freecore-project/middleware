@@ -6,6 +6,7 @@ from middlewared.service import CRUDService, private
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, run
 from middlewared.validators import Match
+from middlewared.etc_files.sysctl_config import ZFS_SYSCTL_RENAMES
 
 
 class TunableModel(sa.Model):
@@ -212,10 +213,10 @@ class TunableService(CRUDService):
     @private
     async def validate(self, tunable, schema_name):
         sysctl_re = \
-            re.compile('[a-z][a-z0-9_]+\.([a-z0-9_]+\.)*[a-z0-9_]+', re.I)
+            re.compile(r'[a-z][a-z0-9_]+\.([a-z0-9_]+\.)*[a-z0-9_]+', re.I)
 
         loader_re = \
-            re.compile('[a-z][a-z0-9_]+\.*([a-z0-9_]+\.)*[a-z0-9_]+', re.I)
+            re.compile(r'[a-z][a-z0-9_]+\.*([a-z0-9_]+\.)*[a-z0-9_]+', re.I)
 
         verrors = ValidationErrors()
         tun_var = tunable['var'].lower()
@@ -236,6 +237,15 @@ class TunableService(CRUDService):
             not sysctl_re.match(tun_var)
         ):
             verrors.add(f"{schema_name}.var", err_msg)
+
+        # Warn about deprecated ZFS sysctl names (OpenZFS 2.2+ renames)
+        if tun_type == 'sysctl' and tunable['var'] in ZFS_SYSCTL_RENAMES:
+            new_name = ZFS_SYSCTL_RENAMES[tunable['var']]
+            verrors.add(
+                f"{schema_name}.var",
+                f'Deprecated ZFS sysctl name. Use "{new_name}" instead '
+                f'(OpenZFS 2.2+ renamed this sysctl).'
+            )
 
         if verrors:
             raise verrors

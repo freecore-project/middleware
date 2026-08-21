@@ -2,7 +2,7 @@ import contextlib
 import logging
 import os
 import subprocess
-import sysctl
+import sysctl as _sysctl
 
 from middlewared.client.utils import Struct
 logger = logging.getLogger(__name__)
@@ -404,7 +404,7 @@ def set_ctl_ha_peer(middleware):
         cp = subprocess.run(["sysctl", f"{sysctl_key}={value}"], stderr=subprocess.PIPE)
         if cp.returncode:
             middleware.logger.error(
-                "Failed to set sysctl '%s' to '%s': %s", sysctl, str(value), str(cp.stderr.decode())
+                "Failed to set sysctl '%s' to '%s': %s", sysctl_key, str(value), str(cp.stderr.decode())
             )
 
     with contextlib.suppress(IndexError):
@@ -415,7 +415,10 @@ def set_ctl_ha_peer(middleware):
             # net.inet.ip.portrange.lowfirst=998 to ensure local
             # websocket connections do not have the opportunity
             # to interfere.
-            sysctl.filter("net.inet.ip.portrange.lowfirst")[0].value = 998
+            try:
+                _sysctl.filter("net.inet.ip.portrange.lowfirst")[0].value = 998
+            except (IndexError, OSError):
+                set_sysctl("net.inet.ip.portrange.lowfirst", 998)
             set_sysctl("kern.cam.ctl.ha_peer", "listen 169.254.10.1" if node == "A" else "connect 169.254.10.1")
         else:
             set_sysctl("kern.cam.ctl.ha_peer", "")
