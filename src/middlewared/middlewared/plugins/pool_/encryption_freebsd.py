@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import os
 import shutil
 import tempfile
@@ -408,26 +409,37 @@ class PoolService(Service):
         if verrors:
             raise verrors
 
-        await self.middleware.call_hook('pool.pre_lock', pool=pool)
+        # Hook failures are logged and swallowed, so Bastille teardown must be an explicit
+        # precondition before exporting its active pool.
+        bastille_stopped = await self.middleware.call('bastille.stop_for_pool', pool['name'])
+        try:
+            await self.middleware.call_hook('pool.pre_lock', pool=pool)
 
-        sysds = await self.middleware.call('systemdataset.config')
-        if sysds['pool'] == pool['name']:
-            sysds_update_job = await self.middleware.call('systemdataset.update', {
-                'pool': None, 'pool_exclude': pool['name'],
-            })
-            await sysds_update_job.wait()
-            if sysds_update_job.error:
-                raise CallError(sysds_update_job.error)
+            sysds = await self.middleware.call('systemdataset.config')
+            if sysds['pool'] == pool['name']:
+                sysds_update_job = await self.middleware.call('systemdataset.update', {
+                    'pool': None, 'pool_exclude': pool['name'],
+                })
+                await sysds_update_job.wait()
+                if sysds_update_job.error:
+                    raise CallError(sysds_update_job.error)
 
-        await self.middleware.call('zfs.pool.export', pool['name'])
+            await self.middleware.call('zfs.pool.export', pool['name'])
 
-        for ed in await self.middleware.call(
-            'datastore.query', 'storage.encrypteddisk', [('encrypted_volume', '=', pool['id'])]
-        ):
-            await self.middleware.call('disk.geli_detach_single', ed['encrypted_provider'])
+            for ed in await self.middleware.call(
+                'datastore.query', 'storage.encrypteddisk', [('encrypted_volume', '=', pool['id'])]
+            ):
+                await self.middleware.call('disk.geli_detach_single', ed['encrypted_provider'])
 
-        await self.middleware.call_hook('pool.post_lock', pool=pool['name'])
-        await self.middleware.call('service.restart', 'system_datasets')
+            await self.middleware.call_hook('pool.post_lock', pool=pool['name'])
+            await self.middleware.call('service.restart', 'system_datasets')
+        except BaseException:
+            if bastille_stopped:
+                with contextlib.suppress(Exception):
+                    state = await self.middleware.call('bastille.pool_available', pool['name'])
+                    if state['matched'] and state['enabled'] and await self.middleware.call('system.ready'):
+                        await self.middleware.call('service.start', 'bastille')
+            raise
         return True
 
     @item_method

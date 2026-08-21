@@ -28,6 +28,7 @@ import asyncio
 import asyncssh
 import contextlib
 import enum
+import errno
 import glob
 import os
 import shlex
@@ -38,6 +39,7 @@ from middlewared.validators import Range, Match
 from middlewared.service import (
     CallError, SystemServiceService, ValidationErrors, job, item_method, private, SharingService, TaskPathService,
 )
+from middlewared.plugins.rsync_utils import ssh_remote_path
 import middlewared.sqlalchemy as sa
 from middlewared.utils.osc import run_command_with_user_context
 
@@ -331,6 +333,7 @@ class RsyncTaskService(TaskPathService):
     @private
     async def validate_rsync_task(self, data, schema):
         verrors = ValidationErrors()
+        validate_rpath = data.pop('validate_rpath', False)
 
         # Windows users can have spaces in their usernames
         # http://www.freebsd.org/cgi/query-pr.cgi?pr=164808
@@ -397,9 +400,7 @@ class RsyncTaskService(TaskPathService):
                                 f'correct them by running chmod 600 {file}'
                             )
 
-            if(
-                data['enabled'] and data['validate_rpath'] and remote_path and remote_host and remote_port
-            ):
+            if data['enabled'] and validate_rpath and remote_path and remote_host and remote_port:
                 if '@' in remote_host:
                     remote_username, remote_host = remote_host.rsplit('@', 1)
                 else:
@@ -422,7 +423,7 @@ class RsyncTaskService(TaskPathService):
 
                 except OSError as e:
 
-                    if e.errno == 113:
+                    if e.errno == errno.EHOSTUNREACH:
                         verrors.add(
                             f'{schema}.remotehost',
                             f'Connection to the remote host {remote_host} on port {remote_port} failed.'
@@ -467,13 +468,11 @@ class RsyncTaskService(TaskPathService):
                         f'{schema}.remotepath',
                         f'Remote Path could not be validated. An exception was raised. {exception_reason}'
                     )
-            elif data['enabled'] and data['validate_rpath']:
+            elif data['enabled'] and validate_rpath:
                 verrors.add(
                     f'{schema}.remotepath',
                     'Remote path could not be validated because of missing fields'
                 )
-
-        data.pop('validate_rpath', None)
 
         # Keeping compatibility with legacy UI
         for field in ('mode', 'direction'):
@@ -668,7 +667,7 @@ class RsyncTaskService(TaskPathService):
                 '-e',
                 f'"ssh -p {rsync["remoteport"]} -o BatchMode=yes -o StrictHostKeyChecking=yes"'
             ]
-            path_args = [path, f'{remote}:"{shlex.quote(rsync["remotepath"])}"']
+            path_args = [path, ssh_remote_path(remote, rsync['remotepath'])]
             if rsync['direction'] != 'PUSH':
                 path_args.reverse()
             line += path_args
@@ -680,7 +679,7 @@ class RsyncTaskService(TaskPathService):
 
     @item_method
     @accepts(Int('id'))
-    @job(lock=lambda args: args[-1], lock_queue_size=1, logs=True)
+    @job(lock=lambda args: args[-1], lock_queue_size=1, logs=True, abortable=True)
     def run(self, job, id):
         """
         Job to run rsync task of `id`.
@@ -695,8 +694,14 @@ class RsyncTaskService(TaskPathService):
         commandline = self.middleware.call_sync('rsynctask.commandline', id)
 
         cp = run_command_with_user_context(
-            commandline, rsync['user'], lambda v: job.logs_fd.write(v)
+            commandline, rsync['user'], lambda v: job.logs_fd.write(v), abort=lambda: job.aborted,
         )
+
+        # An abortable synchronous job is not marked terminal until its process
+        # group has been reaped.  Raise only after the helper has done that, and
+        # before any success/failure one-shot alert can be emitted.
+        if job.aborted:
+            raise asyncio.CancelledError()
 
         for klass in ('RsyncSuccess', 'RsyncFailed') if not rsync['quiet'] else ():
             self.middleware.call_sync('alert.oneshot_delete', klass, rsync['id'])

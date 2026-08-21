@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import errno
 
 import psutil
@@ -7,7 +8,7 @@ from middlewared.plugins.service_.services.all import all_services
 from middlewared.plugins.service_.services.base import IdentifiableServiceInterface
 
 from middlewared.schema import accepts, Bool, Dict, Int, Ref, Str
-from middlewared.service import filterable, CallError, CRUDService, periodic, private
+from middlewared.service import LOCKS, filterable, CallError, CRUDService, periodic, private
 from middlewared.service_exception import MatchNotFound
 import middlewared.sqlalchemy as sa
 from middlewared.utils import filter_list
@@ -88,14 +89,54 @@ class ServiceService(CRUDService):
         service should start on boot.
 
         """
-        if not id_or_name.isdigit():
-            svc = await self.middleware.call('datastore.query', 'services.services', [('srv_service', '=', id_or_name)])
-            if not svc:
-                raise CallError(f'Service {id_or_name} not found.', errno.ENOENT)
-            id_or_name = svc[0]['id']
+        filters = (
+            [('id', '=', int(id_or_name))] if id_or_name.isdigit() else
+            [('srv_service', '=', id_or_name)]
+        )
+        services = await self.middleware.call('datastore.query', 'services.services', filters)
+        if not services:
+            raise CallError(f'Service {id_or_name} not found.', errno.ENOENT)
 
-        rv = await self.middleware.call('datastore.update', 'services.services', id_or_name, {'srv_enable': data['enable']})
-        await self.middleware.call('etc.generate', 'rc')
+        service = services[0]
+        if service['srv_service'] == 'bastille':
+            async with LOCKS['bastille_lifecycle_internal']:
+                services = await self.middleware.call(
+                    'datastore.query', 'services.services', [('id', '=', service['id'])]
+                )
+                if not services:
+                    raise CallError(f'Service {id_or_name} not found.', errno.ENOENT)
+                return await self._update_service(services[0], data)
+        return await self._update_service(service, data)
+
+    @private
+    async def _update_service(self, service, data):
+        if data['enable']:
+            service_object = await self.middleware.call('service.object', service['srv_service'])
+            await service_object.before_enable()
+
+        updated = False
+        try:
+            rv = await self.middleware.call(
+                'datastore.update', 'services.services', service['id'],
+                {'srv_enable': data['enable']},
+            )
+            updated = True
+            await self.middleware.call('etc.generate', 'rc')
+            if service['srv_service'] == 'bastille':
+                await self.middleware.call('bastille.verify_current_rc')
+        except Exception:
+            if updated:
+                with contextlib.suppress(Exception):
+                    await self.middleware.call(
+                        'datastore.update', 'services.services', service['id'],
+                        {'srv_enable': service['srv_enable']},
+                    )
+                with contextlib.suppress(Exception):
+                    await self.middleware.call('etc.generate', 'rc')
+                if service['srv_service'] == 'bastille':
+                    with contextlib.suppress(Exception):
+                        await self.middleware.call('bastille.verify_current_rc')
+            raise
         return rv
 
     @accepts(
