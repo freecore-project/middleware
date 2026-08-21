@@ -15,7 +15,12 @@ import iocage_lib.ioc_common as ioc_common
 from iocage_lib.ioc_check import IOCCheck
 from iocage_lib.ioc_clean import IOCClean
 from iocage_lib.ioc_image import IOCImage
-from iocage_lib.ioc_json import IOCJson
+from iocage_lib.ioc_json import (
+    IOCJson,
+    OFFICIAL_PLUGIN_REPOSITORY as FREECORE_PLUGIN_REPOSITORY,
+    legacy_ix_plugin_repository,
+    normalize_plugin_repository,
+)
 # iocage's imports are per command, these are just general facilities
 from iocage_lib.ioc_list import IOCList
 from iocage_lib.ioc_plugin import IOCPlugin
@@ -28,9 +33,10 @@ from middlewared.service_exception import CallError, ValidationErrors
 from middlewared.utils import filter_list, run
 from middlewared.validators import IpInUse, MACAddr
 
-from pkg_resources import parse_version
+from packaging.version import parse as parse_version
 
-from collections import deque, Iterable
+from collections import deque
+from collections.abc import Iterable
 
 BRANCH_REGEX = re.compile(r'\d+\.\d-RELEASE')
 
@@ -150,25 +156,16 @@ class PluginService(CRUDService):
         """
         List officially supported plugin repositories.
         """
-        is_fn = await self.middleware.call('system.is_freenas')
-        repos = {
-            'IXSYSTEMS': {
-                'name': 'iXsystems',
-                'git_repository': f'https://github.com/{"freenas" if is_fn else "truenas"}/iocage-ix-plugins.git'
+        return {
+            'FREECORE': {
+                'name': 'FreeCORE',
+                'git_repository': FREECORE_PLUGIN_REPOSITORY,
             }
         }
-        if is_fn:
-            repos.update({
-                'COMMUNITY': {
-                    'name': 'Community',
-                    'git_repository': 'https://github.com/ix-plugin-hub/iocage-plugin-index.git'
-                }
-            })
-        return repos
 
     @private
     def default_repo(self):
-        return self.middleware.call_sync('plugin.official_repositories')['IXSYSTEMS']['git_repository']
+        return FREECORE_PLUGIN_REPOSITORY
 
     @filterable
     def query(self, filters=None, options=None):
@@ -240,9 +237,20 @@ class PluginService(CRUDService):
         `branch` is the FreeNAS repository branch to use as the base for the `plugin_repository`. The default is to
         use the current system version. Example: 11.3-RELEASE.
         """
-        data['plugin_repository'] = data.get('plugin_repository') or self.default_repo()
-        self.middleware.call_sync('jail.check_dataset_existence')
+        data['plugin_repository'] = normalize_plugin_repository(
+            data.get('plugin_repository')
+        )
         verrors = ValidationErrors()
+        if legacy_ix_plugin_repository(data['plugin_repository']):
+            verrors.add(
+                'plugin_create.plugin_repository',
+                'New plugin jails cannot be created from a retired TrueNAS '
+                '13.3 catalog. Choose the FreeCORE plugin catalog. Existing '
+                'plugin jails keep their stored repository for compatibility.'
+            )
+            verrors.check()
+
+        self.middleware.call_sync('jail.check_dataset_existence')
         branch = data.pop('branch') or self.get_version()
         install_notes = ''
         plugin_name = data.pop('plugin_name')
@@ -368,7 +376,9 @@ class PluginService(CRUDService):
         default_branch = self.get_version()
         default_repo = self.default_repo()
         options['branch'] = options.get('branch') or default_branch
-        options['plugin_repository'] = options.get('plugin_repository') or default_repo
+        options['plugin_repository'] = normalize_plugin_repository(
+            options.get('plugin_repository') or default_repo
+        )
         return self.middleware.call_sync('plugin.available_impl', options).wait_sync(raise_error=True)
 
     @job(lock=lambda args: f'available_plugins_{args[0]["plugin_repository"]}_{args[0]["branch"]}')
@@ -437,7 +447,9 @@ class PluginService(CRUDService):
 
         When `refresh` is specified, `plugin_repository` is updated before retrieving plugin's default properties.
         """
-        plugin_repository = options.get('plugin_repository') or self.default_repo()
+        plugin_repository = normalize_plugin_repository(
+            options.get('plugin_repository') or self.default_repo()
+        )
         branch = options['branch'] or self.get_version()
 
         if not self.middleware.call_sync('jail.iocage_set_up'):
@@ -463,7 +475,9 @@ class PluginService(CRUDService):
         Str('repository', default=None, null=True, empty=False)
     )
     async def branches_choices(self, repository):
-        repository = repository or self.default_repo()
+        repository = normalize_plugin_repository(
+            repository or self.default_repo()
+        )
 
         cp = await run(['git', 'ls-remote', repository], check=False, encoding='utf8')
         if cp.returncode:
@@ -700,7 +714,8 @@ class PluginService(CRUDService):
         with conn:
             cur = conn.cursor()
             cur.execute(
-                f'SELECT * FROM packages WHERE origin="{pkg}" OR name="{pkg}"'
+                'SELECT * FROM packages WHERE origin = ? OR name = ?',
+                (pkg, pkg),
             )
 
             rows = cur.fetchall()
@@ -761,16 +776,16 @@ class JailService(CRUDService):
                         if jail['state'] == 'up':
                             interface = jail['interfaces'].split(',')[0].split(
                                 ':')[0]
-                            if interface == 'vnet0':
-                                # Inside jails they are epair0b
-                                interface = 'epair0b'
+                            if 'vnet' in interface:
+                                # Inside jails they are epairNb
+                                interface = f'{interface.replace("vnet", "epair")}b'
                             ip4_cmd = ['jexec', f'ioc-{uuid}', 'ifconfig',
                                        interface, 'inet']
                             try:
                                 out = su.check_output(ip4_cmd)
-                                out = out.splitlines()[2].split()[1].decode()
-                                jail['ip4_addr'] = f'{interface}|{out}'
-                            except (su.CalledProcessError, IndexError):
+                                addr, _ = ioc_common.parse_dhcp_address(out)
+                                jail['ip4_addr'] = f'{interface}|{addr}'
+                            except (su.CalledProcessError, ValueError):
                                 jail['ip4_addr'] = f'{interface}|ERROR'
                         else:
                             jail['ip4_addr'] = 'DHCP (not running)'
