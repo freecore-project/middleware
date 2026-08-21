@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <err.h>
 #include <fts.h>
+#include <limits.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdio.h>

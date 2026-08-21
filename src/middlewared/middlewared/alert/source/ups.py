@@ -36,6 +36,18 @@ class UPSCommokAlertClass(AlertClass, SimpleOneShotAlertClass):
     text = 'Communication with UPS %(ups)s established.'
 
 
+class UPSServiceNotRunningAlertClass(AlertClass, SimpleOneShotAlertClass):
+    # the internal development record: raised when the boot-time retry (#567) gives up.
+    category = AlertCategory.UPS
+    level = AlertLevel.CRITICAL
+    title = 'UPS Service Is Not Running'
+    text = (
+        'The UPS service is enabled but is not running: UPS %(ups)s could not be reached after boot and the '
+        'start retries have stopped. Until the service runs, this system is not protected by the UPS. Check the '
+        'UPS connection, then start the UPS service.'
+    )
+
+
 class UPSReplbattAlertClass(AlertClass, SimpleOneShotAlertClass):
     category = AlertCategory.UPS
     level = AlertLevel.CRITICAL

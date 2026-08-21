@@ -57,6 +57,12 @@ fi
 
 /etc/rc.d/ldconfig start
 
-while :; do
-    /etc/install.sh
-done
+# the internal development record: the installer used to loop here, on init's console.
+# That is /dev/console, which the kernel binds to the PRIMARY console only
+# (kern_cons.c cnadd() -> ttyconsdev_select(); a secondary console receives
+# kernel output and nothing else).  On a UEFI guest the primary is whichever
+# port the firmware lists first, so the installer was reachable on the display
+# or on the serial port, never on both.  Returning to init lets it start a
+# getty(8) on every console named in /etc/ttys; each getty owns its tty and
+# runs the installer on it (/etc/gettytab, /etc/install-session.sh).
+exit 0

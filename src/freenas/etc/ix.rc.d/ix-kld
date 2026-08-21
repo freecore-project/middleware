@@ -1,0 +1,70 @@
+#!/bin/sh
+#
+# PROVIDE: ix-kld
+# REQUIRE: ix-etc kld
+# KEYWORD: nojail
+
+# Load kld_list modules that kld(8) could not see.
+#
+# /etc/rc sources rc_conf_files once, near the top of boot, and load_rc_config
+# short-circuits on _rc_conf_loaded.  run_rc_script runs each rc.d script in a
+# ( ... ) subshell, which inherits that variable, so later scripts -- including
+# kld(8) at rcorder position ~55 -- evaluate the kld_list that was captured
+# before ix-etc (position ~15) regenerated /etc/rc.conf.freenas from the
+# configuration database.  An operator RC tunable that sets kld_list is written
+# into that file correctly and is still never loaded.
+#
+# /etc/rc does carry `trap "_rc_conf_loaded=false; load_rc_config" ALRM`, and
+# ix-etc does `killall -ALRM sh` for exactly this reason, but the modules are
+# observably still absent after boot (the internal development record, three consecutive
+# boots on an exact image).  Rather than depend on that signal landing before
+# the consumer runs, re-read the generated file directly and load whatever is
+# still missing.  load_kld skips modules that are already present, so this is a
+# no-op on any boot where the ordinary path did work.
+#
+# This is not drm-specific -- it repairs every kld_list RC tunable.  It matters
+# most for drm because stock /boot/defaults/loader.conf blacklists
+# drm/drm2/radeonkms/i915kms/amdgpu and loader.conf(5) exposes no per-module
+# override (the loader's `force` flag is settable only from the loader prompt
+# and menu, never from a *_load directive), so kld_list is the only supported
+# route for those modules.
+
+. /etc/rc.subr
+
+name="ix_kld"
+start_cmd='ix_kld_start'
+stop_cmd=':'
+
+ix_kld_start()
+{
+	local _fresh _kld _missing
+
+	[ -r /etc/rc.conf.freenas ] || return 0
+	[ -z "$(kenv -q kld_disable 2>/dev/null)" ] || return 0
+
+	# Read the freshly generated value in a subshell so the boot shell's own
+	# variables are left exactly as they are.  tunable_config() emits a
+	# complete `kld_list="..."` assignment and runs last, so the generated
+	# file is self-contained and the operator's value wins.
+	_fresh=$(. /etc/rc.conf.freenas >/dev/null 2>&1; printf '%s' "${kld_list}")
+	[ -n "$_fresh" ] || return 0
+
+	# Pre-filter purely so a fully-loaded boot stays quiet; load_kld repeats
+	# the check authoritatively before loading anything.
+	_missing=""
+	for _kld in $_fresh; do
+		if ! kldstat -v 2>/dev/null | egrep -q -e "${_kld}\.ko"; then
+			_missing="${_missing} ${_kld}"
+		fi
+	done
+	[ -n "$_missing" ] || return 0
+
+	echo 'Loading deferred kernel modules:' $_missing
+	for _kld in $_missing; do
+		load_kld -e "${_kld}\.ko" "$_kld" ||
+			warn "ix-kld: unable to load kernel module '${_kld}' from kld_list"
+	done
+}
+
+load_rc_config $name
+run_rc_command "$1"

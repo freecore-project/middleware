@@ -30,7 +30,7 @@ def test_03_create_an_alertservice():
         "name": "Critical Email Test",
         "type": "Mail",
         "attributes": {
-            "email": "eric.spam@ixsystems.com"
+            "email": "qa-critical@freecore.local"
         },
         "level": "CRITICAL",
         "enabled": True
@@ -64,7 +64,7 @@ def test_07_change_config_to_alertservice_id():
         "name": "Warning Email Test",
         "type": "Mail",
         "attributes": {
-            "email": "william.spam@ixsystems.com@"
+            "email": "qa-warning@freecore.local"
         },
         "level": "WARNING",
         "enabled": False

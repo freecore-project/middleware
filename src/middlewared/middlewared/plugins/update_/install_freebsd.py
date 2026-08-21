@@ -4,7 +4,10 @@ import os
 import shutil
 import subprocess
 
-from freenasOS import Configuration, Manifest, Update
+try:
+    from freenasOS import Configuration, Manifest, Update
+except ImportError:
+    from middlewared.utils.freenasOS import Configuration, Manifest, Update
 
 from middlewared.service import CallError, job, private, Service
 from middlewared.worker import FakeJob

@@ -63,8 +63,7 @@ class VMService(Service, LibvirtConnectionMixin):
             while self.LIBVIRT_CONNECTION and self.LIBVIRT_CONNECTION._o and self.LIBVIRT_CONNECTION.isAlive():
                 libvirt.virEventRunDefaultImpl()
 
-        event_thread = threading.Thread(target=event_loop_execution, name='libvirt_event_loop')
-        event_thread.setDaemon(True)
+        event_thread = threading.Thread(target=event_loop_execution, name='libvirt_event_loop', daemon=True)
         event_thread.start()
         self.LIBVIRT_CONNECTION.domainEventRegister(callback, None)
         self.LIBVIRT_CONNECTION.setKeepAlive(5, 3)

@@ -1,6 +1,85 @@
+import pytest
 from mock import ANY, Mock, patch
 
-from middlewared.plugins.nfs import SharingNFSService
+from middlewared.plugins.nfs import NFSService as NFSConfigService, SharingNFSService, interface_post_sync
+from middlewared.plugins.service_.services.nfs import NFSService
+
+
+class NFSServiceMiddleware:
+
+    def __init__(self, v4=False, v4_krb_enabled=False):
+        self.v4 = v4
+        self.v4_krb_enabled = v4_krb_enabled
+
+    async def call(self, name, *args):
+        if name == "nfs.setup_v4":
+            return None
+        if name == "nfs.config":
+            return {"v4": self.v4, "v4_krb_enabled": self.v4_krb_enabled}
+        if name == "nis.get_state":
+            return "DISABLED"
+
+        raise AssertionError(f"unexpected call {name!r}")
+
+
+def make_nfs_service(v4=False, v4_krb_enabled=False, gssd_status=0):
+    service = NFSService(NFSServiceMiddleware(v4, v4_krb_enabled))
+    freebsd_calls = []
+
+    async def _freebsd_service(rc, verb, force=False):
+        freebsd_calls.append((rc, verb, force))
+        return Mock(returncode=gssd_status if rc == "gssd" and verb == "status" else 0)
+
+    service._freebsd_service = _freebsd_service
+    return service, freebsd_calls
+
+
+@pytest.mark.asyncio
+async def test__nfs_service__start_freebsd__does_not_start_gssd_without_kerberos():
+    service, freebsd_calls = make_nfs_service(v4_krb_enabled=False)
+
+    await service._start_freebsd()
+
+    assert all(call[0] != "gssd" for call in freebsd_calls)
+    assert ("nfsd", "start", False) in freebsd_calls
+
+
+@pytest.mark.asyncio
+async def test__nfs_service__start_freebsd__starts_gssd_with_kerberos():
+    service, freebsd_calls = make_nfs_service(v4=True, v4_krb_enabled=True, gssd_status=1)
+
+    await service._start_freebsd()
+
+    assert ("gssd", "status", False) in freebsd_calls
+    assert ("gssd", "start", False) in freebsd_calls
+    assert freebsd_calls.index(("gssd", "start", False)) < freebsd_calls.index(("nfsd", "start", False))
+
+
+@pytest.mark.asyncio
+async def test__nfs_service__start_freebsd__does_not_start_gssd_without_v4():
+    service, freebsd_calls = make_nfs_service(v4=False, v4_krb_enabled=True, gssd_status=1)
+
+    await service._start_freebsd()
+
+    assert all(call[0] != "gssd" for call in freebsd_calls)
+    assert ("nfsd", "start", False) in freebsd_calls
+
+
+@pytest.mark.asyncio
+async def test__nfs_config_service__extend__requires_v4_for_kerberos_enabled():
+    class Middleware:
+        async def call(self, name, *args):
+            assert name == "kerberos.keytab.has_nfs_principal"
+            return True
+
+    config = await NFSConfigService(Middleware()).nfs_extend({
+        "16": False,
+        "v4": False,
+        "v4_krb": False,
+        "v4_owner_major": "",
+    })
+
+    assert config["v4_krb_enabled"] is False
 
 
 def test__sharing_nfs_service__validate_paths__same_filesystem():
@@ -147,3 +226,67 @@ def test__sharing_nfs_service__validate_hosts_and_networks__fs_is_already_export
         )
 
         verrors.add.assert_called_once_with("sharingnfs_update.networks", ANY)
+
+
+class InterfacePostSyncMiddleware:
+    """the internal development record: the first interface.sync after middlewared starts."""
+
+    def __init__(self, started, bindip=("192.0.2.5",), enabled=True, shares=True):
+        self.cache = {}
+        self.started = started
+        self.bindip = list(bindip)
+        self.enabled = enabled
+        self.shares = shares
+        self.calls = []
+        self.tasks = []
+
+    async def call(self, name, *args):
+        self.calls.append(name)
+        if name == "cache.has_key":
+            return args[0] in self.cache
+        if name == "cache.put":
+            self.cache[args[0]] = args[1]
+            return None
+        if name == "datastore.query":
+            return {"srv_enable": self.enabled}
+        if name == "sharing.nfs.query":
+            return [{"enabled": True}] if self.shares else []
+        if name == "nfs.config":
+            return {"bindip": self.bindip}
+        if name == "service.started":
+            return self.started
+        if name == "service.restart":
+            return None
+        raise AssertionError(f"unexpected call {name!r}")
+
+    def create_task(self, coro):
+        self.tasks.append(coro)
+        coro.close()
+
+
+@pytest.mark.asyncio
+async def test__interface_post_sync__boot_leaves_nfs_to_rc():
+    # At boot NFS is not running yet: /etc/rc starts it once, with the bind IP.
+    middleware = InterfacePostSyncMiddleware(started=False)
+    await interface_post_sync(middleware)
+    assert middleware.tasks == []
+    assert "service.restart" not in middleware.calls
+
+
+@pytest.mark.asyncio
+async def test__interface_post_sync__restarts_running_nfs_onto_bind_ip():
+    # middlewared restarted on a running box: NFS is restarted as before.
+    middleware = InterfacePostSyncMiddleware(started=True)
+    await interface_post_sync(middleware)
+    assert len(middleware.tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test__interface_post_sync__runs_once_and_ignores_unbound_nfs():
+    middleware = InterfacePostSyncMiddleware(started=True, bindip=())
+    await interface_post_sync(middleware)
+    assert middleware.tasks == []
+    assert "service.started" not in middleware.calls
+    middleware.bindip = ["192.0.2.5"]
+    await interface_post_sync(middleware)
+    assert middleware.tasks == []

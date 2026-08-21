@@ -2,6 +2,9 @@
 /bin/install_worker2.sh
 /etc/install.sh
 /etc/rc
+/etc/ttys
+/etc/gettytab
+/etc/install-session.sh
 /lib/functions.sh
 /pre-install/0001.prevent_downgrade.sh
 /pre-install/0002.arch.sh

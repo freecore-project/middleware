@@ -4,7 +4,7 @@
 #
 
 # PROVIDE: ix_sshd_save_keys
-# REQUIRE: openssh
+# REQUIRE: openssh middlewared
 
 #
 # Save any generated keys by /usr/local/etc/rc.d/sshd into the config db.

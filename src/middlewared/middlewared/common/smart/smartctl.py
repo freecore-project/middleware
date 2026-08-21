@@ -21,7 +21,7 @@ async def get_smartctl_args(context, disk):
     devices = context.devices
     enterprise_hardware = context.enterprise_hardware
 
-    if disk.startswith(('nvd', 'nvme')):
+    if disk.startswith(('nvd', 'nda', 'nvme')):
         try:
             nvme, nsid = await middleware.run_in_thread(get_nsid, f'/dev/{disk}')
         except Exception as e:
@@ -64,14 +64,15 @@ async def get_smartctl_args(context, disk):
         channel_no = channel_no + 1
         return [f"/dev/{driver}", "-d", f"hpt,{controller_id}/{channel_no}"]
 
-    # HP Smart Array Controller
-    if driver.startswith("ciss"):
+    # HP Smart Array Controller (ciss on FB13, smartpqi on FB14+)
+    if driver.startswith(("ciss", "smartpqi")):
         args = [f"/dev/{driver}{controller_id}", "-d", f"cciss,{channel_no}"]
         p = await smartctl(args + ["-i"], check=False)
         if (p.returncode & 0b11) == 0:
             return args
 
-    if driver.startswith(("twa", "twe", "tws")):
+    # 3ware RAID controllers (twe removed in FB14+, twa/tws remain)
+    if driver.startswith(("twa", "tws")):
         p = await run(["/usr/local/sbin/tw_cli", f"/c{controller_id}", "show"], encoding="utf8")
 
         units = {}

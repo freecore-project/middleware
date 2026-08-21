@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# Restore a staged return-to-13.3 plan after middlewared and its dependent
+# services have stopped, while the data pools are still imported.
+#
+
+# PROVIDE: ix-system-rollback
+# BEFORE: middlewared
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+restore_system_rollback()
+{
+	if [ -f /data/system-rollback.pending ]; then
+		/usr/local/libexec/ix_system_rollback.py
+	fi
+}
+
+name="ix_system_rollback"
+start_cmd=':'
+stop_cmd='restore_system_rollback'
+
+load_rc_config $name
+run_rc_command "$1"

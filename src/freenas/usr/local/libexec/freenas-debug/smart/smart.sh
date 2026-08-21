@@ -94,7 +94,7 @@ smart_func()
 	# we'll try to run it without translation
 	for i in $disks; do
 		case "$i" in
-		    nvd*)
+		    nvd*|nda*)
 			ns=$(nvmecontrol nsid $i | awk '{print $1}')
 			output=$(smartctl -a /dev/$ns)
 		        msg="(NVME DEVICE DETECTED)"

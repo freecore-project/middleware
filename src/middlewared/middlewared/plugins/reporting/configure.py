@@ -6,6 +6,8 @@ import time
 
 from middlewared.service import lock, private, Service
 
+from .utils import reconcile_hostname_link
+
 
 def get_members(tar, prefix):
     for tarinfo in tar.getmembers():
@@ -21,7 +23,7 @@ class ReportingService(Service):
     def setup(self):
         systemdatasetconfig = self.middleware.call_sync('systemdataset.config')
         if not systemdatasetconfig['path']:
-            self.middleware.logger.error('System dataset is not mounted')
+            self.middleware.logger.debug('System dataset not yet mounted — reporting.setup deferred')
             return False
 
         rrd_mount = f'{systemdatasetconfig["path"]}/rrd-{systemdatasetconfig["uuid"]}'
@@ -72,29 +74,7 @@ class ReportingService(Service):
                     )
             shutil.move(os.path.join(pwd, hostname), os.path.join(pwd, 'localhost'))
 
-        for item in os.listdir(pwd):
-            if item == 'localhost' or item.startswith('localhost.bak.'):
-                continue
-
-            path = os.path.join(pwd, item)
-
-            if os.path.islink(path):
-                # Remove all symlinks (that are stale if hostname was changed)
-                os.unlink(path)
-            elif os.path.isdir(path):
-                # Remove all directories except "localhost" and its backups (that may be erroneously created by
-                # running collectd before this script)
-                subprocess.run(['rm', '-rfx', path])
-            else:
-                os.unlink(path)
-
-        # Create "localhost" directory if it does not exist
-        if not os.path.exists(os.path.join(pwd, 'localhost')):
-            os.makedirs(os.path.join(pwd, 'localhost'))
-
-        # Create "${hostname}" -> "localhost" symlink if necessary
-        if hostname != 'localhost':
-            os.symlink(os.path.join(pwd, 'localhost'), os.path.join(pwd, hostname))
+        reconcile_hostname_link(pwd, hostname)
 
         # Let's return a positive value to indicate that necessary collectd operations were performed successfully
         return True

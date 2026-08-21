@@ -1,1 +1,2 @@
 @shell /etc/netcli.sh
+@shell /usr/local/bin/scponly

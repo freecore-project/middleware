@@ -46,7 +46,7 @@ class NFSService(SystemServiceService):
     @private
     async def nfs_extend(self, nfs):
         keytab_has_nfs = await self.middleware.call("kerberos.keytab.has_nfs_principal")
-        nfs["v4_krb_enabled"] = (nfs["v4_krb"] or keytab_has_nfs)
+        nfs["v4_krb_enabled"] = nfs["v4"] and (nfs["v4_krb"] or keytab_has_nfs)
         nfs["userd_manage_gids"] = nfs.pop("16")
         nfs["v4_owner_major"] = nfs.pop("v4_owner_major")
         return nfs
@@ -554,7 +554,13 @@ async def interface_post_sync(middleware):
         options = {'get': True}
         nfs = await middleware.call('datastore.query', 'services_services', filters, options)
         if nfs['srv_enable'] and any([i['enabled'] for i in await middleware.call('sharing.nfs.query')]):
-            if (await middleware.call('nfs.config'))['bindip']:
+            # the internal development record: only a running NFS needs restarting onto the bind IP. At boot
+            # this hook fires during middlewared's own start, before /etc/rc reaches rpcbind, statd,
+            # lockd, mountd and nfsd; a "restart" here was really a first start, and /etc/rc then
+            # started every daemon again (faststart skips the running check): a second rpc.statd and
+            # "NLM: can't start server - it appears to be running already". /etc/rc starts NFS with
+            # the bind IP itself (ix-nfsbind regenerates rc.conf after NETWORKING).
+            if (await middleware.call('nfs.config'))['bindip'] and await middleware.call('service.started', 'nfs'):
                 middleware.create_task(middleware.call('service.restart', 'nfs'))
 
 

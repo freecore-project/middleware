@@ -95,9 +95,14 @@ class DiskService(Service, DiskInfoBase):
                     if (prov := provider.find('name')) is not None:
                         dev_to_disk[prov.text] = name.text
 
+        whole_disks = [
+            name.text for name in (g.find('name') for g in xml.iterfind('.//class[name="DISK"]/geom')) if name is not None
+        ]
+
         return {
             'label_to_dev': label_to_dev,
             'dev_to_disk': dev_to_disk,
+            'whole_disks': whole_disks,  # the internal development record
         }
 
     def label_to_dev(self, label, geom_scan=True, cache=None):

@@ -10,8 +10,6 @@
 	twofactor_enabled = twofactor_auth['enabled'] and twofactor_auth['services']['ssh']
 %>\
 # auth
-auth		sufficient	pam_opie.so		no_warn no_fake_prompts
-auth		requisite	pam_opieaccess.so	no_warn allow_local
 % if dsp.enabled() and dsp.name() != 'NIS' and not twofactor_enabled:
 ${dsp.pam_auth()}
 % endif
