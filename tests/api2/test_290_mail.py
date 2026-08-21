@@ -15,25 +15,25 @@ pytestmark = pytest.mark.skipif(dev_test, reason='Skip for testing')
 
 
 def test_01_Configuring_settings():
-    payload = {"fromemail": "william.spam@ixsystems.com",
-               "outgoingserver": "mail.ixsystems.com",
+    payload = {"fromemail": "qa-noreply@freecore.local",
+               "outgoingserver": "mail.freecore.local",
                "pass": "changeme",
                "port": 25,
                "security": "PLAIN",
                "smtp": True,
-               "user": "william.spam@ixsystems.com"}
+               "user": "qa-noreply@freecore.local"}
     results = PUT("/mail/", payload)
     assert results.status_code == 200, results.text
 
 
 def test_02_look_fromemail_settings_change():
     results = GET("/mail/")
-    assert results.json()["fromemail"] == "william.spam@ixsystems.com"
+    assert results.json()["fromemail"] == "qa-noreply@freecore.local"
 
 
 def test_03_look_outgoingserver_settings_change():
     results = GET("/mail/")
-    assert results.json()["outgoingserver"] == "mail.ixsystems.com"
+    assert results.json()["outgoingserver"] == "mail.freecore.local"
 
 
 def test_04_look_pass_settings_change():
@@ -58,4 +58,4 @@ def test_07_look_smtp_settings_change():
 
 def test_08_look_user_settings_change():
     results = GET("/mail/")
-    assert results.json()["user"] == "william.spam@ixsystems.com"
+    assert results.json()["user"] == "qa-noreply@freecore.local"

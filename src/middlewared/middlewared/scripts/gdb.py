@@ -18,7 +18,7 @@ class MiddlewareGDB(object):
         zfs = libzfs.ZFS()
         if name is None:
             for pool in zfs.pools:
-                if pool.name == 'freenas-boot':
+                if pool.name in ('freenas-boot', 'boot-pool'):
                     continue
                 return pool.root_dataset
             raise RuntimeError('no dataset found')
@@ -40,7 +40,7 @@ class MiddlewareGDB(object):
 
     def debug_symbols_url(self):
         version = self._get_version()
-        if version['product'] == 'FreeNAS':
+        if version['product'] in ('FreeNAS', 'TrueNAS'):
             base_url = f'https://download.freenas.org/{version["major"]}'
             if 'MASTER' in version['version']:
                 verdir = f'MASTER/{version["version"].split("-")[-1]}'

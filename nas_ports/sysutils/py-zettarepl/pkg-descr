@@ -1,0 +1,2 @@
+Cross-platform ZFS replication scheduling library.
+Used by TrueNAS middleware for snapshot and replication task management.

@@ -6,7 +6,10 @@ from collections import defaultdict
 
 import middlewared.sqlalchemy as sa
 from bsd import geom
-from nvme import get_nsid
+try:
+    from nvme import get_nsid
+except ImportError:
+    get_nsid = None
 from middlewared.common.camcontrol import camcontrol_list
 from middlewared.schema import accepts, Bool, Dict, Int, Str
 from middlewared.service import filterable, private, CallError, CRUDService
@@ -467,7 +470,7 @@ class DiskService(CRUDService):
         return 'SUCCESS'
 
     def sed_dev_name(self, disk_name):
-        if disk_name.startswith("nvd"):
+        if disk_name.startswith(("nvd", "nda")) and get_nsid is not None:
             nvme, nsid = get_nsid(f"/dev/{disk_name}")
             return f"/dev/{nvme}"
 
@@ -530,7 +533,6 @@ class DiskService(CRUDService):
         If the disk is not currently in use by some Volume or iSCSI Disk Extent
         then a gmultipath is automatically created and will be available for use.
         """
-
         await self.middleware.run_in_thread(geom.scan)
 
         mp_disks = []

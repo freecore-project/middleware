@@ -208,7 +208,13 @@ def test_16_get_interface_has_pending_changes():
     assert results.json() is True, results.text
 
 
+@pytest.mark.timeout(90)
 def test_17_commit_interface():
+    # This applies the pending static-IP + vlan1 change to the target's only
+    # NIC. If connectivity does not survive the apply, this POST never returns
+    # and previously burned the full 300s pytest-timeout before failing --
+    # by which point every later module was failing for the same one reason.
+    # rollback=True means the target restores itself after checkin_timeout.
     payload = {
         "rollback": True,
         "checkin_timeout": 10

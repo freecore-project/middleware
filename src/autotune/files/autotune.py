@@ -90,21 +90,20 @@ DEF_KNOBS = {
         'net.inet.tcp.delayed_ack',
         'net.inet.tcp.recvbuf_max',
         'net.inet.tcp.sendbuf_max',
-        'vfs.zfs.arc_max',
-        'vfs.zfs.l2arc_noprefetch',
-        'vfs.zfs.l2arc_write_max',
-        'vfs.zfs.l2arc_write_boost',
+        'vfs.zfs.arc.max',
+        'vfs.zfs.l2arc.noprefetch',
+        'vfs.zfs.l2arc.write_max',
+        'vfs.zfs.l2arc.write_boost',
         'net.inet.tcp.mssdflt',
         'net.inet.tcp.recvspace',
         'net.inet.tcp.sendspace',
         'net.inet.tcp.sendbuf_max',
         'net.inet.tcp.recvbuf_max',
-        'net.inet.tcp.sendbuf_inc',
         'vfs.zfs.vdev.async_read_max_active',
         'vfs.zfs.vdev.sync_read_max_active',
         'vfs.zfs.vdev.async_write_max_active',
         'vfs.zfs.vdev.sync_write_max_active',
-        'vfs.zfs.zfetch.max_distance',
+        'vfs.zfs.prefetch.max_distance',
     },
 }
 
@@ -208,10 +207,6 @@ def guess_net_inet_tcp_sendspace():
         return 128 * KiB
 
 
-def guess_net_inet_tcp_sendbuf_inc():
-    return 16 * KiB
-
-
 def guess_vfs_zfs_vdev_async_read_max_active():
     if TRUENAS and hardware[0] == "Z50":
         return 64
@@ -240,7 +235,7 @@ def guess_vfs_zfs_vdev_sync_write_max_active():
         return None
 
 
-def guess_vfs_zfs_zfetch_max_distance():
+def guess_vfs_zfs_prefetch_max_distance():
     return 64 * MiB
 
 

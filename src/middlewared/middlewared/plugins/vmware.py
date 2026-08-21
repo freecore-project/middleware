@@ -280,7 +280,7 @@ class VMWareService(CRUDService):
 
     def __get_datastores(self, data):
         try:
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
             ssl_context.verify_mode = ssl.CERT_NONE
             server_instance = connect.SmartConnect(
                 host=data['hostname'],
@@ -353,7 +353,7 @@ class VMWareService(CRUDService):
 
         item = await self.query([('id', '=', pk)], {'get': True})
 
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
         ssl_context.verify_mode = ssl.CERT_NONE
         server_instance = connect.SmartConnect(
             host=item['hostname'],
@@ -424,7 +424,7 @@ class VMWareService(CRUDService):
             snapvmskips = []
 
             try:
-                ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
                 ssl_context.verify_mode = ssl.CERT_NONE
                 si = connect.SmartConnect(host=vmsnapobj["hostname"], user=vmsnapobj["username"],
                                           pwd=vmsnapobj["password"], sslContext=ssl_context)
@@ -508,7 +508,7 @@ class VMWareService(CRUDService):
             vmsnapobj = elem["vmsnapobj"]
 
             try:
-                ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
                 ssl_context.verify_mode = ssl.CERT_NONE
                 si = connect.SmartConnect(host=vmsnapobj["hostname"], user=vmsnapobj["username"],
                                           pwd=vmsnapobj["password"], sslContext=ssl_context)

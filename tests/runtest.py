@@ -5,6 +5,8 @@
 
 from subprocess import call
 from sys import argv
+import atexit
+import glob
 import os
 import getopt
 import sys
@@ -33,10 +35,10 @@ Mandatory option
     --ip <###.###.###.###>     - IP of the FreeNAS
     --password <root password> - Password of the FreeNAS root user
     --interface <interface>    - The interface that FreeNAS is run one
+    --ntp-server <ip>           - Explicit non-production NTP test fixture
 
 Optional option
     --test <test name>         - Test name (Network, ALL)
-    --vm-name <VM_NAME>        - Name the the Bhyve VM
     --ha                       - Run test for HA
     --dev-test                 - Run only the test that are not mark with
                                  pytestmark skipif dev_test is true.
@@ -51,10 +53,9 @@ option_list = [
     "ip=",
     "password=",
     "interface=",
+    "ntp-server=",
     'test=',
-    "vm-name=",
     "ha",
-    "update",
     "dev-test"
 ]
 
@@ -66,11 +67,13 @@ except getopt.GetoptError as e:
     print(error_msg)
     exit()
 
-vm_name = None
+ip = None
+passwd = None
+interface = None
+ntp_server = None
 testName = ''
 testexpr = None
 ha = False
-update = False
 dev_test = False
 for output, arg in myopts:
     if output in ('-i', '--ip'):
@@ -83,47 +86,60 @@ for output, arg in myopts:
         testName = arg
     elif output == '-k':
         testexpr = arg
-    elif output in ('--vm-name'):
-        vm_name = f"'{arg}'"
+    elif output == '--ntp-server':
+        ntp_server = arg
     elif output == '--ha':
         ha = True
-    elif output == '--update':
-        update = True
     elif output == '--dev-test':
         dev_test = True
 
-if 'ip' not in locals() and 'passwd' not in locals() and 'interface' not in locals():
+if None in (ip, passwd, interface, ntp_server):
     print("Mandatory option missing!\n")
     print(error_msg)
     exit()
 
-# create random hostname and random fake domain
-digit = ''.join(random.choices(string.digits, k=2))
+# create random hostname and random fake domain.
+# Three digits, not two: the AD modules pass this hostname through as the Active
+# Directory netbiosname, which names the computer account the join creates. Two
+# targets joining one realm concurrently share that account whenever they draw the
+# same value, and the second join resets its password -- breaking the first target's
+# Kerberos trust later, at renewal, looking like a fork regression rather than a
+# harness collision. Inherited from 13.3; k=2 was 1 collision per 100 concurrent pairs.
+digit = ''.join(random.choices(string.digits, k=3))
 hostname = f'test{digit}'
-domain = f'test{digit}.nb.ixsystems.com'
+domain = f'test{digit}.freecore.local'
 
 cfg_content = f"""#!{sys.executable}
 
 user = "root"
 password = "{passwd}"
 ip = "{ip}"
-vm_name = {vm_name}
 hostname = "{hostname}"
 domain = "{domain}"
 api_url = 'http://{ip}/api/v2.0'
 interface = "{interface}"
-ntpServer = "10.20.20.122"
+ntpServer = "{ntp_server}"
 localHome = "{localHome}"
 keyPath = "{keyPath}"
 pool_name = "tank"
 ha = {ha}
-update = {update}
 dev_test = {dev_test}
 """
 
 cfg_file = open("auto_config.py", 'w')
 cfg_file.writelines(cfg_content)
 cfg_file.close()
+
+
+def remove_generated_config():
+    for path in ['auto_config.py', *glob.glob('__pycache__/auto_config.*.pyc')]:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+atexit.register(remove_generated_config)
 
 from functions import setup_ssh_agent, create_key, add_ssh_key, get_folder
 from functions import SSH_TEST
@@ -145,7 +161,7 @@ cfg_file.close()
 
 # Use the right python version to start pytest with sys.executable
 # So that we can support virtualenv python pytest.
-call([
+pytest_result = call([
     sys.executable,
     "-m",
     "pytest",
@@ -162,16 +178,24 @@ artifacts = f"{workdir}/artifacts/"
 if not os.path.exists(artifacts):
     os.makedirs(artifacts)
 
-get_folder('/var/log', f'{artifacts}/log', 'root', 'testing', ip)
+artifact_result = 0
+try:
+    copied = get_folder('/var/log', f'{artifacts}/log', 'root', passwd, ip)
+    if not copied['result']:
+        raise RuntimeError(f"log copy failed: {copied['stderr']}")
 
-# get dmesg and put it in artifacts
-results = SSH_TEST('dmesg -a', 'root', 'testing', ip)
-dmsg = open(f'{artifacts}/dmesg', 'w')
-dmsg.writelines(results['output'])
-dmsg.close()
+    # get dmesg and put it in artifacts
+    results = SSH_TEST('dmesg -a', 'root', passwd, ip)
+    with open(f'{artifacts}/dmesg', 'w') as dmsg:
+        dmsg.writelines(results['output'])
 
-# get core.get_jobs and put it in artifacts
-results = SSH_TEST('midclt call core.get_jobs | jq .', 'root', 'testing', ip)
-dmsg = open(f'{artifacts}/core.get_jobs', 'w')
-dmsg.writelines(results['output'])
-dmsg.close()
+    # get core.get_jobs and put it in artifacts
+    results = SSH_TEST('midclt call core.get_jobs | jq .', 'root', passwd, ip)
+    with open(f'{artifacts}/core.get_jobs', 'w') as jobs:
+        jobs.writelines(results['output'])
+except Exception as e:
+    artifact_result = 1
+    print(f'artifact collection failed: {type(e).__name__}: {e}')
+
+# Never hide either a pytest failure or an artifact-collection failure.
+raise SystemExit(pytest_result or artifact_result)

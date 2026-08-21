@@ -17,7 +17,7 @@ from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, Ref, Str
 from middlewared.service import CallError, CRUDService, job, periodic, private, Service, skip_arg, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.validators import Email, IpAddress, Range
-from middlewared.utils import osc
+
 
 from acme import client, errors, messages
 from OpenSSL import crypto, SSL
@@ -327,7 +327,7 @@ class CryptoKeyService(Service):
             )
 
             try:
-                context = SSL.Context(SSL.TLSv1_2_METHOD)
+                context = SSL.Context(SSL.TLS_METHOD)
                 context.use_certificate(public_key_obj)
                 context.use_privatekey(private_key_obj)
                 context.check_privatekey()
@@ -477,11 +477,12 @@ class CryptoKeyService(Service):
         cert = self.generate_builder({
             'crypto_subject_name': {
                 'country_name': 'US',
-                'organization_name': 'iXsystems',
+                'organization_name': 'FreeCORE',
                 'common_name': 'localhost',
-                'email_address': 'info@ixsystems.com',
-                'state_or_province_name': 'Tennessee',
-                'locality_name': 'Maryville',
+                'email_address': 'dev@freecore.org',
+                # No state/locality: FreeCORE has no legal address, and generate_builder
+                # skips falsy values, so omitting them simply leaves them out of the
+                # subject rather than asserting somebody else's. the internal development record.
             },
             'lifetime': NOT_VALID_AFTER_DEFAULT,
             'san': self.normalize_san(['localhost'])
@@ -1380,6 +1381,12 @@ class CertificateService(CRUDService):
     @private
     def get_acme_client_and_key(self, acme_directory_uri, tos=False):
         data = self.middleware.call_sync('acme.registration.query', [['directory', '=', acme_directory_uri]])
+        if data and not data[0]['body']:
+            # An incomplete registration left by an interrupted create on an earlier
+            # version. It can never be used, and nothing public can remove it, so
+            # re-register instead of failing forever. acme.registration.create repairs
+            # the existing row in place rather than replacing it.
+            data = []
         if not data:
             data = self.middleware.call_sync(
                 'acme.registration.create',
@@ -1395,7 +1402,7 @@ class CertificateService(CRUDService):
             'uri': data['uri'],
             'terms_of_service': data['tos'],
             'body': {
-                'contact': [data['body']['contact']],
+                'contact': [data['body']['contact']] if data['body']['contact'] else [],
                 'status': data['body']['status'],
                 'key': {
                     'e': key_dict['e'],
@@ -1470,7 +1477,7 @@ class CertificateService(CRUDService):
         acme_client, key = self.get_acme_client_and_key(data['acme_directory_uri'], data['tos'])
         try:
             # perform operations and have a cert issued
-            order = acme_client.new_order(csr_data['CSR'])
+            order = acme_client.new_order(csr_data['CSR'].encode())
         except messages.Error as e:
             raise CallError(f'Failed to issue a new order for Certificate : {e}')
         else:
@@ -1484,17 +1491,44 @@ class CertificateService(CRUDService):
                     # hence we account for that in the mapping we keep
                     dns_mapping[d.replace('*.', '')] = v
 
-            self.handle_authorizations(job, progress, order, dns_mapping, acme_client, key)
+            cleanup_payloads = []
+            challenge_error = None
+            try:
+                self.handle_authorizations(
+                    job, progress, order, dns_mapping, acme_client, key, cleanup_payloads,
+                )
+                order = acme_client.poll_authorizations(
+                    order, datetime.datetime.now() + datetime.timedelta(minutes=10),
+                )
+            except errors.TimeoutError:
+                challenge_error = CallError('DNS challenge validation timed out')
+            except errors.ValidationError as e:
+                challenge_error = CallError(f'DNS challenge validation failed: {e}')
+            except Exception as e:
+                challenge_error = e
+
+            cleanup_errors = self.cleanup_authorizations(cleanup_payloads)
+            if challenge_error:
+                if cleanup_errors:
+                    raise CallError(
+                        f'{challenge_error}; DNS challenge cleanup also failed: '
+                        f'{"; ".join(cleanup_errors)}'
+                    ) from challenge_error
+                raise challenge_error
+            if cleanup_errors:
+                raise CallError(f'DNS challenge cleanup failed: {"; ".join(cleanup_errors)}')
 
             try:
-                # Polling for a maximum of 10 minutes while trying to finalize order
-                # Should we try .poll() instead first ? research please
-                return acme_client.poll_and_finalize(order, datetime.datetime.now() + datetime.timedelta(minutes=10))
+                return acme_client.finalize_order(
+                    order, datetime.datetime.now() + datetime.timedelta(minutes=10),
+                )
             except errors.TimeoutError:
                 raise CallError('Certificate request for final order timed out')
 
     @private
-    def handle_authorizations(self, job, progress, order, domain_names_dns_mapping, acme_client, key):
+    def handle_authorizations(
+        self, job, progress, order, domain_names_dns_mapping, acme_client, key, cleanup_payloads,
+    ):
         # When this is called, it should be ensured by the function calling this function that for all authorization
         # resource, a domain name dns mapping is available
         # For multiple domain providers in domain names, I think we should ask the end user to specify which domain
@@ -1504,10 +1538,10 @@ class CertificateService(CRUDService):
 
         dns_mapping = {d.replace('*.', '').split(':', 1)[-1]: v for d, v in domain_names_dns_mapping.items()}
         for authorization_resource in order.authorizations:
+            domain = authorization_resource.body.identifier.value
+            status = False
             try:
-                status = False
                 progress += (max_progress / len(order.authorizations))
-                domain = authorization_resource.body.identifier.value
                 challenge = None
                 for chg in authorization_resource.body.challenges:
                     if chg.typ == 'dns-01':
@@ -1518,14 +1552,17 @@ class CertificateService(CRUDService):
                         f'DNS Challenge not found for domain {authorization_resource.body.identifier.value}'
                     )
 
-                self.middleware.call_sync(
-                    'acme.dns.authenticator.update_txt_record', {
-                        'authenticator': dns_mapping[domain],
-                        'challenge': challenge.json_dumps(),
-                        'domain': domain,
-                        'key': key.json_dumps()
-                    }
-                )
+                payload = {
+                    'authenticator': dns_mapping[domain],
+                    'challenge': challenge.json_dumps(),
+                    'domain': domain,
+                    'key': key.json_dumps(),
+                }
+                # A provider can create the TXT record and then fail while
+                # waiting for propagation. Queue cleanup before making the
+                # call so that partial provider success does not leak it.
+                cleanup_payloads.append(payload)
+                self.middleware.call_sync('acme.dns.authenticator.update_txt_record', payload)
 
                 try:
                     status = acme_client.answer_challenge(challenge, challenge.response(key))
@@ -1536,8 +1573,18 @@ class CertificateService(CRUDService):
             finally:
                 job.set_progress(
                     progress,
-                    f'DNS challenge {"completed" if status else "failed"} for {domain}'
+                    f'DNS challenge {"submitted" if status else "failed"} for {domain}'
                 )
+
+    @private
+    def cleanup_authorizations(self, cleanup_payloads):
+        errors = []
+        for payload in reversed(cleanup_payloads):
+            try:
+                self.middleware.call_sync('acme.dns.authenticator.cleanup_txt_record', payload)
+            except Exception as e:
+                errors.append(f'{payload["domain"]}: {e}')
+        return errors
 
     @periodic(86400)
     @private
@@ -1622,11 +1669,7 @@ class CertificateService(CRUDService):
         if not os.path.exists(dhparam_path) or os.stat(dhparam_path).st_size == 0:
             with open('/dev/console', 'wb') as console:
                 with open(dhparam_path, 'wb') as f:
-                    if osc.IS_FREEBSD:
-                        rand = '/dev/random'
-                    else:
-                        rand = '/dev/urandom'
-                    subprocess.run(['openssl', 'dhparam', '-rand', rand, '2048'], stdout=f, stderr=console, check=True)
+                    subprocess.run(['openssl', 'dhparam', '2048'], stdout=f, stderr=console, check=True)
 
     # CREATE METHODS FOR CREATING CERTIFICATES
     # "do_create" IS CALLED FIRST AND THEN BASED ON THE TYPE OF THE CERTIFICATE WHICH IS TO BE CREATED THE
@@ -1753,8 +1796,8 @@ class CertificateService(CRUDService):
                     "city": "Nashville",
                     "common": "domain1.com",
                     "country": "US",
-                    "email": "dev@ixsystems.com",
-                    "organization": "iXsystems",
+                    "email": "dev@freecore.org",
+                    "organization": "FreeCORE",
                     "state": "Tennessee",
                     "digest_algorithm": "SHA256",
                     "signedby": 4,
@@ -2155,10 +2198,10 @@ class CertificateService(CRUDService):
             client, key = self.get_acme_client_and_key(certificate['acme']['directory'], True)
 
             try:
+                # the internal development record: acme 4.x revokes a cryptography certificate; josepy 2
+                # removed the ComparableX509 wrapper 13.3's josepy 1.x provided here.
                 client.revoke(
-                    jose.ComparableX509(
-                        crypto.load_certificate(crypto.FILETYPE_PEM, certificate['certificate'])
-                    ),
+                    x509.load_pem_x509_certificate(certificate['certificate'].encode(), default_backend()),
                     0
                 )
             except (errors.ClientError, messages.Error) as e:
@@ -2486,8 +2529,8 @@ class CertificateAuthorityService(CRUDService):
                     "city": "Nashville",
                     "common": "domain1.com",
                     "country": "US",
-                    "email": "dev@ixsystems.com",
-                    "organization": "iXsystems",
+                    "email": "dev@freecore.org",
+                    "organization": "FreeCORE",
                     "state": "Tennessee",
                     "digest_algorithm": "SHA256"
                     "create_type": "CA_CREATE_INTERNAL"

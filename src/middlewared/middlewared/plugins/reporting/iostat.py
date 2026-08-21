@@ -5,7 +5,7 @@ class DiskStats:
     def __init__(self, interval, prev_data):
         self.interval = interval
         self.prev_data = prev_data
-        self.disks = ('ada', 'da', 'nvd')
+        self.disks = ('ada', 'da', 'nvd', 'nda')
 
     def read(self):
         read_ops = read_bytes = write_ops = write_bytes = busy = total_disks = 0
