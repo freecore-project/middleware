@@ -669,7 +669,7 @@ def configure_interface():
                         mask = iface.int_v4netmaskbit
                         break
                     elif re.match(r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]"
-                                   "[0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|"
+                                   r"[0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|"
                                    "[01]?[0-9][0-9]?)$", mask):
                         try:
                             ipaddr.IPAddress(mask, version=4)

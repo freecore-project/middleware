@@ -116,8 +116,8 @@ active_directory_func()
 	#
 	#	List kerberos keytab entries
 	#
-	section_header "Kerberos Principals - 'ktutil'"
-	ktutil list
+	section_header "Kerberos Keytab Entries - 'klist -ket'"
+	klist -ket /etc/krb5.keytab
 	section_footer
 
 	#
@@ -194,8 +194,8 @@ active_directory_func()
 	#	Dump Kerberos SPNs
 	#
 	if [ "${enabled}" = "ENABLED" ]
-	section_header "Active Directory SPN list"
 	then
+	section_header "Active Directory SPN list"
 	midclt call activedirectory.get_spn_list | jq
 	section_footer
 	fi

@@ -71,7 +71,13 @@ collectd_daemon_stop()
     fi
 
     wait_for_pids "$collectd_pid" "$d_pid"
-    return $?
+    _rv=$?
+
+    # Remove stale pidfiles so the next start of daemon(8) doesn't abort
+    # with "process already running, pid: -1" on an empty pidfile left behind.
+    rm -f "/var/run/collectd.pid" "${pidfile}"
+
+    return $_rv
 }
 
 run_rc_command "$1"

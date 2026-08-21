@@ -15,7 +15,7 @@ from .overprovision_base import CanNotBeOverprovisionedException
 
 
 def can_overprovision(devname):
-    return devname.startswith(("ada", "da"))
+    return devname.startswith(("ada", "da", "nda"))
 
 
 @asynccontextmanager

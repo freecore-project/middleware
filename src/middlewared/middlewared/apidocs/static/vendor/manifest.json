@@ -1,0 +1,31 @@
+[
+  {
+    "name": "bootstrap",
+    "version": "3.4.1",
+    "source": "https://registry.npmjs.org/bootstrap/-/bootstrap-3.4.1.tgz",
+    "archive_sha256": "990c17dbc1560f3262b6a5404c6ed01ff5a58487b8f553663a284c37fb8ec5cc",
+    "files": {
+      "css/bootstrap.min.css": "6d92dfc1700fd38cd130ad818e23bc8aef697f815b2ea5face2b5dfad22f2e11",
+      "css/bootstrap-theme.min.css": "f2e1cc227d6bbb4192e4a3becdfed971c7fc530d76200e43add11c98cb962c53",
+      "js/bootstrap.min.js": "9ee2fcff6709e4d0d24b09ca0fc56aade12b4961ed9c43fd13b03248bfb57afe",
+      "fonts/glyphicons-halflings-regular.eot": "13634da87d9e23f8c3ed9108ce1724d183a39ad072e73e1b3d8cbf646d2d0407",
+      "fonts/glyphicons-halflings-regular.svg": "42f60659d265c1a3c30f9fa42abcbb56bd4a53af4d83d316d6dd7a36903c43e5",
+      "fonts/glyphicons-halflings-regular.ttf": "e395044093757d82afcb138957d06a1ea9361bdcf0b442d06a18a8051af57456",
+      "fonts/glyphicons-halflings-regular.woff": "a26394f7ede100ca118eff2eda08596275a9839b959c226e15439557a5a80742",
+      "fonts/glyphicons-halflings-regular.woff2": "fe185d11a49676890d47bb783312a0cda5a44c4039214094e7957b4c040ef11c",
+      "LICENSE": "0f9f7ff25c98790a39d5c70b785e9fa0a8d276d45e78c7559502085ccaab8209",
+      "css/bootstrap.min.css.map": "78b58c9ebfd42ec2c61bc4fdf46a5df998e6cd907c773076a0a6e8f5686bafc3",
+      "css/bootstrap-theme.min.css.map": "5ebabc49db378681cf6412aa00bd3b7a111a09f2815231f4b56e296fac486130"
+    }
+  },
+  {
+    "name": "jquery",
+    "version": "3.7.1",
+    "source": "https://registry.npmjs.org/jquery/-/jquery-3.7.1.tgz",
+    "archive_sha256": "68a9f787516da47c680e09c187bcbac4536b6f85d90eb882844e12919e583f53",
+    "files": {
+      "jquery.min.js": "fc9a93dd241f6b045cbff0481cf4e1901becd0e12fb45166a8f17f95823f0b1a",
+      "LICENSE.txt": "d4db9ebe6f29f5168eac45ad713f055623ac5d0dcd5ba92da23d650ae012020d"
+    }
+  }
+]

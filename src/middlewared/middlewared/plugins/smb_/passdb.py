@@ -35,7 +35,7 @@ class SMBService(Service):
         local users in an AD environment. Immediately return in ldap enviornment.
         """
         pdbentries = []
-        private_dir = SMBPath.PASSDB_DIR.path
+        private_dir = SMBPath.PRIVATEDIR.path
         if not os.path.exists(f'{private_dir}/passdb.tdb'):
             return pdbentries
 
@@ -146,7 +146,7 @@ class SMBService(Service):
         `conf_users` contains results of `user.query`. Since users will receive new
         SID values, we will need to flush samba's cache to ensure consistency.
         """
-        private_dir = SMBPath.PASSDB_DIR.path
+        private_dir = SMBPath.PRIVATEDIR.path
         ts = int(time.time())
         old_path = f'{private_dir}/passdb.tdb'
         new_path = f'{private_dir}/passdb.{ts}.corrupted'

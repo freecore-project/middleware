@@ -32,7 +32,6 @@ fileConfig(config.config_file_name)
 # target_metadata = mymodel.Base.metadata
 target_metadata = Model.metadata
 list(load_modules(os.path.join(os.path.dirname(middlewared.__file__), "plugins"), depth=1))
-list(load_modules("/usr/local/lib/middlewared_truenas/plugins", depth=1))
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

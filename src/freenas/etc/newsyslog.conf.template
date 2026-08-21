@@ -20,6 +20,7 @@
 /var/log/all.log			600  2	   *	@T00  J
 /var/log/amd.log			644  2	   100	*     J
 /var/log/auth.log			600  7     100  @0101T JC
+/var/log/samba4/audit.log		600  7     1000 @0101T JC
 /var/log/console.log			600  5	   100	*     J
 /var/log/cron				600  3	   100	*     JC
 /var/log/daemon.log			640  5	   100	@0101T JC

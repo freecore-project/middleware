@@ -8,11 +8,30 @@ from middlewared.validators import Match
 from datetime import datetime
 
 import errno
+import logging
 import os
 import subprocess
 
+logger = logging.getLogger(__name__)
+
 
 RE_BE_NAME = r'^[^/ *\'"?@!#$%^&()+=~<>;\\]+$'
+BE_KEEP_PROPERTIES = ('zectl:keep',) if osc.IS_LINUX else ('beadm:keep', 'bectl:keep')
+
+
+def get_be_keep(properties):
+    for property_name in BE_KEEP_PROPERTIES:
+        prop = properties.get(property_name)
+        if prop is None:
+            continue
+
+        value = prop['value']
+        if value == 'True':
+            return True
+        if value == 'False':
+            return False
+
+    return None
 
 
 class BootEnvService(CRUDService):
@@ -20,7 +39,7 @@ class BootEnvService(CRUDService):
     class Config:
         datastore_primary_key_type = 'string'
 
-    BE_TOOL = 'zectl' if osc.IS_LINUX else 'beadm'
+    BE_TOOL = 'zectl' if osc.IS_LINUX else 'bectl'
 
     @filterable
     def query(self, filters=None, options=None):
@@ -37,11 +56,18 @@ class BootEnvService(CRUDService):
         boot_pool = self.middleware.call_sync('boot.pool_name')
         for line in cp.stdout.strip().split('\n'):
             fields = line.split('\t')
+            if len(fields) < 5:
+                logger.warning('Unexpected bectl output format (got %d fields): %s', len(fields), line)
+                continue
             name = fields[0]
-            if len(fields) > 5 and fields[5] != '-':
-                name = fields[5]
+            # the internal development record: bectl(8) has no nickname column (beadm's was field 6 on
+            # 13.3, patched into every beadm verb by iX). Legacy nicknames from
+            # a 13.3 upgrade live on as the beadm:nickname dataset property and
+            # are surfaced below as the DISPLAY name only. `id` stays the real
+            # dataset name -- bectl knows nothing else, so activate/rename/
+            # destroy must never receive a nickname.
             be = {
-                'id': name,
+                'id': fields[0],
                 'realname': fields[0],
                 'name': name,
                 'active': fields[1],
@@ -65,11 +91,11 @@ class BootEnvService(CRUDService):
                     snapshot = self.middleware.call_sync('zfs.snapshot.query', [('id', '=', origin)])
                     if snapshot:
                         snapshot = snapshot[0]
-                if f'{self.BE_TOOL}:keep' in ds['properties']:
-                    if ds['properties'][f'{self.BE_TOOL}:keep']['value'] == 'True':
-                        be['keep'] = True
-                    elif ds['properties'][f'{self.BE_TOOL}:keep']['value'] == 'False':
-                        be['keep'] = False
+                be['keep'] = get_be_keep(ds['properties'])
+
+                nickname = ds['properties'].get('beadm:nickname', {}).get('value')
+                if nickname and nickname not in ('-', 'none'):
+                    be['name'] = nickname
 
                 # When a BE is deleted, following actions happen
                 # 1) It's descendants ( if any ) are promoted once
@@ -143,7 +169,7 @@ class BootEnvService(CRUDService):
             )
 
         try:
-            subprocess.run([self.BE_TOOL, 'activate', oid], capture_output=True, text=True, check=True)
+            subprocess.run([self.BE_TOOL, 'activate', be['realname']], capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError as cpe:
             raise CallError(f'Failed to activate BE: {cpe.stdout.strip()}')
         else:
@@ -170,7 +196,7 @@ class BootEnvService(CRUDService):
         if not ds:
             raise CallError(f'BE {oid!r} does not exist.', errno.ENOENT)
         await self.middleware.call('zfs.dataset.update', dsname, {
-            'properties': {f'{self.BE_TOOL}:keep': {'value': str(attrs['keep'])}},
+            'properties': {name: {'value': str(attrs['keep'])} for name in BE_KEEP_PROPERTIES},
         })
         return True
 
@@ -222,14 +248,22 @@ class BootEnvService(CRUDService):
         verrors.check()
 
         try:
-            await run(self.BE_TOOL, 'rename', oid, data['name'], encoding='utf8', check=True)
+            await run(self.BE_TOOL, 'rename', be['realname'], data['name'], encoding='utf8', check=True)
         except subprocess.CalledProcessError as cpe:
             raise CallError(f'Failed to update boot environment: {cpe.stdout}')
+
+        # A legacy beadm:nickname would keep overriding the display after a
+        # real rename; drop it so the BE shows the name it was just given.
+        boot_pool = await self.middleware.call('boot.pool_name')
+        await run(
+            'zfs', 'inherit', 'beadm:nickname', f'{boot_pool}/ROOT/{data["name"]}',
+            encoding='utf8', check=False,
+        )
         return data['name']
 
     async def _clean_be_name(self, verrors, schema, name):
         beadm_names = (await (await Popen(
-            f"{self.BE_TOOL} list -H | awk '{{print ${1 if osc.IS_LINUX else 7}}}'",
+            f"{self.BE_TOOL} list -H | awk '{{print $1}}'",
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -245,7 +279,7 @@ class BootEnvService(CRUDService):
         """
         be = await self._get_instance(oid)
         try:
-            await run(self.BE_TOOL, 'destroy', '-F', be['id'], encoding='utf8', check=True)
+            await run(self.BE_TOOL, 'destroy', '-F', be['realname'], encoding='utf8', check=True)
         except subprocess.CalledProcessError as cpe:
             raise CallError(f'Failed to delete boot environment: {cpe.stdout}')
         return True

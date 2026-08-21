@@ -17,6 +17,7 @@ import hashlib
 import re
 import os
 import secrets
+import subprocess
 try:
     import sysctl
 except ImportError:
@@ -586,7 +587,7 @@ class iSCSITargetExtentService(SharingService):
         await self.save(data, 'iscsi_extent_create', verrors)
 
         data['id'] = await self.middleware.call(
-            'datastore.insert', self._config.datastore, {**data, 'vendor': 'TrueNAS'},
+            'datastore.insert', self._config.datastore, {**data, 'vendor': 'FreeCORE'},
             {'prefix': self._config.datastore_prefix}
         )
 
@@ -962,9 +963,9 @@ class iSCSITargetExtentService(SharingService):
                     disk_identifier = disk_object.get('identifier', None)
                     data['path'] = disk_identifier
 
-                    if osc.IS_FREEBSD and disk_identifier.startswith('{devicename}') or disk_identifier.startswith(
+                    if osc.IS_FREEBSD and (disk_identifier.startswith('{devicename}') or disk_identifier.startswith(
                         '{uuid}'
-                    ):
+                    )):
                         try:
                             await self.middleware.call('disk.label', disk, f'extent_{disk}')
                         except Exception as e:
@@ -1391,9 +1392,12 @@ class iSCSITargetService(CRUDService):
         Deleting an iSCSI Target makes sure we delete all Associated Targets which use `id` iSCSI Target.
         """
         target = await self._get_instance(id)
-        fcport_usages = await self.middleware.call('fcport.query', [['target', '=', id]])
-        if fcport_usages:
-            raise CallError(f'Target {id!r} is in use by {", ".join([e["name"] for e in fcport_usages])} fcport(s).')
+        if await self.middleware.call('system.feature_enabled', 'FIBRECHANNEL'):
+            fcport_usages = await self.middleware.call('fcport.query', [['target', '=', id]])
+            if fcport_usages:
+                raise CallError(
+                    f'Target {id!r} is in use by {", ".join([e["name"] for e in fcport_usages])} fcport(s).'
+                )
 
         if await self.active_sessions_for_targets([target['id']]):
             if force:
@@ -1597,8 +1601,14 @@ class iSCSITargetToExtentService(CRUDService):
         # http://github.com/bvanassche/scst/blob/d483590da4de7d32c8371e0712fc186f3d8c509c/scst/include/scst_const.h#L69
         if osc.IS_LINUX:
             lun_map_size = 16383
-        else:
+        elif sysctl is not None:
             lun_map_size = sysctl.filter('kern.cam.ctl.lun_map_size')[0].value
+        else:
+            result = subprocess.run(
+                ['sysctl', '-n', 'kern.cam.ctl.lun_map_size'],
+                capture_output=True, text=True, check=False,
+            )
+            lun_map_size = int(result.stdout.strip()) if result.returncode == 0 else 1024
 
         if lunid < 0 or lunid > lun_map_size - 1:
             verrors.add(

@@ -46,7 +46,7 @@ class NFSService(SystemServiceService):
     @private
     async def nfs_extend(self, nfs):
         keytab_has_nfs = await self.middleware.call("kerberos.keytab.has_nfs_principal")
-        nfs["v4_krb_enabled"] = (nfs["v4_krb"] or keytab_has_nfs)
+        nfs["v4_krb_enabled"] = nfs["v4"] and (nfs["v4_krb"] or keytab_has_nfs)
         nfs["userd_manage_gids"] = nfs.pop("16")
         nfs["v4_owner_major"] = nfs.pop("v4_owner_major")
         return nfs

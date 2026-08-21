@@ -90,5 +90,8 @@ if not ha:
 
     def test_11_compare_ssh_keyscan_output(request):
         depends(request, ["get_keyscan"])
-        for line in output_after:
-            assert line in output_before
+        # output_after is a string; iterating it yielded single characters, so
+        # this compared alphabets and could never detect a changed host key.
+        for line in output_after.splitlines():
+            assert line in output_before.splitlines(), (
+                f'host key changed across reboot: {line}')

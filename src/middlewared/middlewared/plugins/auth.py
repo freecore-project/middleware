@@ -1,4 +1,5 @@
-import crypt
+import ctypes
+import ctypes.util
 from datetime import datetime, timedelta
 import hmac
 import pyotp
@@ -7,6 +8,7 @@ import re
 import socket
 import string
 import subprocess
+import threading
 import time
 
 from middlewared.schema import Dict, Int, Str, accepts, Bool
@@ -16,6 +18,27 @@ from middlewared.service import (
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, Popen
 from middlewared.validators import Range
+
+_libcrypt_path = ctypes.util.find_library('crypt')
+if _libcrypt_path is None:
+    # On FreeBSD 15, /usr/lib/libcrypt.so is an ld linker script (not ELF)
+    # and ctypes.util.find_library can't validate it. Use the versioned
+    # SONAME directly — ld.so resolves it via ldconfig to /lib/libcrypt.so.5.
+    # (Note: crypt(3) is NOT in libc on FB15 — moved entirely into libcrypt.)
+    _libcrypt_path = 'libcrypt.so.5'
+_libcrypt = ctypes.CDLL(_libcrypt_path)
+_libcrypt.crypt.restype = ctypes.c_char_p
+_libcrypt.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_crypt_lock = threading.Lock()
+
+
+def _crypt(word, salt):
+    """Call crypt(3) directly via ctypes (replacement for removed Python crypt module)."""
+    with _crypt_lock:
+        result = _libcrypt.crypt(word.encode('utf-8'), salt.encode('utf-8'))
+    if result is None:
+        raise OSError('crypt() returned NULL')
+    return result.decode('utf-8')
 
 
 class TokenManager:
@@ -278,7 +301,7 @@ class AuthService(Service):
             return False
         if user['bsdusr_unixhash'] in ('x', '*'):
             return False
-        return hmac.compare_digest(crypt.crypt(password, user['bsdusr_unixhash']), user['bsdusr_unixhash'])
+        return hmac.compare_digest(_crypt(password, user['bsdusr_unixhash']), user['bsdusr_unixhash'])
 
     @accepts(Int('ttl', default=600, null=True), Dict('attrs', additional_attrs=True))
     def generate_token(self, ttl=None, attrs=None):
@@ -333,6 +356,10 @@ class AuthService(Service):
                 'auth.twofactor.verify',
                 otp_token
             )
+        elif (await self.middleware.call('auth.webauthn.config'))['enabled']:
+            # WebAuthn is the only enabled second factor: a password-only login
+            # must not bypass the security key. Use auth.webauthn.login instead.
+            valid = False
 
         if valid:
             self.session_manager.login(app, LoginPasswordSessionManagerCredentials())
@@ -395,7 +422,7 @@ class TwoFactorAuthService(ConfigService):
 
     @private
     async def two_factor_extend(self, data):
-        for srv in ['ssh']:
+        for srv in ['ssh', 'console']:
             data['services'].setdefault(srv, False)
 
         return data
@@ -409,7 +436,8 @@ class TwoFactorAuthService(ConfigService):
             Int('interval', validators=[Range(min=5)]),
             Dict(
                 'services',
-                Bool('ssh', default=False)
+                Bool('ssh', default=False),
+                Bool('console', default=False)
             ),
             update=True
         )
@@ -427,6 +455,26 @@ class TwoFactorAuthService(ConfigService):
 
         config.update(data)
 
+        if not config['enabled'] and (await self.middleware.call('auth.webauthn.config'))['enabled']:
+            # TOTP is the guaranteed fallback login path while WebAuthn is enforced
+            # (security keys do not work on IP-address origins). Recovery order from
+            # the console: disable WebAuthn first, then TOTP.
+            raise CallError(
+                'Two-Factor authentication cannot be disabled while WebAuthn is enabled — it is '
+                'the fallback login path when security keys are unavailable. Disable WebAuthn first.'
+            )
+
+        if config['services'].get('console') and (
+            await self.middleware.call('system.advanced.config')
+        )['consolemenu']:
+            # The passwordless console menu runs without login(1), so PAM never
+            # gets a say — console OTP would be a false comfort until it is off.
+            raise CallError(
+                'Console OTP cannot be enabled while "Show Text Console without Password Prompt" '
+                'is active (System -> Advanced) — the passwordless console menu bypasses the '
+                'login prompt entirely. Disable it first.'
+            )
+
         if config['enabled'] and not config['secret']:
             # Only generate a new secret on `enabled` when `secret` is not already set.
             # This will aid users not setting secret up again on their mobiles.
@@ -441,6 +489,9 @@ class TwoFactorAuthService(ConfigService):
             config
         )
 
+        # pam.d/login (console OTP) lives in the 'pam' etc group; users.oath and
+        # pam.d/sshd ride the ssh service reload below.
+        await self.middleware.call('etc.generate', 'pam')
         await self.middleware.call('service.reload', 'ssh')
 
         return await self.config()
@@ -478,7 +529,7 @@ class TwoFactorAuthService(ConfigService):
             }
         )
 
-        if config['services']['ssh']:
+        if config['services']['ssh'] or config['services']['console']:
             self.middleware.call_sync('service.reload', 'ssh')
 
         return True
@@ -495,7 +546,7 @@ class TwoFactorAuthService(ConfigService):
         ).provisioning_uri(
             f'{(await self.middleware.call("system.info"))["hostname"]}@'
             f'{await self.middleware.call("system.product_name")}',
-            'iXsystems'
+            'FreeCORE'
         )
 
     @private

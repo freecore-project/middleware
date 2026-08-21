@@ -90,18 +90,20 @@ class PoolService(Service):
         try:
             await self.middleware.call('zfs.pool.replace', pool['name'], options['label'], new_devname)
         except Exception:
-            try:
-                # If replace has failed lets detach geli to not keep disk busy
-                await self.middleware.call('disk.geli_detach_single', new_devname)
-            except Exception:
-                self.logger.warning('Failed to geli detach %r', new_devname, exc_info=True)
+            if pool['encrypt'] > 0:
+                try:
+                    # If replace has failed, detach GELI to avoid keeping the disk busy.
+                    await self.middleware.call('disk.geli_detach_single', new_devname)
+                except Exception:
+                    self.logger.warning('Failed to geli detach %r', new_devname, exc_info=True)
             raise
         finally:
             # Needs to happen even if replace failed to put back disk that had been
             # removed from swap prior to replacement
             self.middleware.create_task(self.middleware.call('disk.swaps_configure'))
 
-        enc_disks = [{'disk': disk['devname'], 'devname': f'{new_devname.removeprefix("/dev/")}'}]
-        await self.middleware.call('pool.save_encrypteddisks', oid, enc_disks, {disk['devname']: disk})
+        if pool['encrypt'] > 0:
+            enc_disks = [{'disk': disk['devname'], 'devname': f'{new_devname.removeprefix("/dev/")}'}]
+            await self.middleware.call('pool.save_encrypteddisks', oid, enc_disks, {disk['devname']: disk})
 
         return True

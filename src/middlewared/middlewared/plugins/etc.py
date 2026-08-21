@@ -8,7 +8,7 @@ import asyncio
 from collections import defaultdict
 from contextlib import suppress
 import grp
-import imp
+import importlib.util
 import os
 import pwd
 import stat
@@ -85,8 +85,9 @@ class PyRenderer(object):
 
     async def render(self, path, ctx):
         name = os.path.basename(path)
-        find = imp.find_module(name, [os.path.dirname(path)])
-        mod = imp.load_module(name, *find)
+        spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(path), name + '.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
         args = [self.service, self.service.middleware]
         if ctx is not None:
             args.append(ctx)
@@ -240,6 +241,14 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'local/avahi/avahi-daemon.conf', 'checkpoint': 'interface_sync'},
             {'type': 'py', 'path': 'local/avahi/avahi_services', 'checkpoint': 'interface_sync'}
         ],
+        'rar2fs': {
+            'ctx': [
+                {'method': 'rar2fs.config'},
+            ],
+            'entries': [
+                {'type': 'mako', 'path': 'local/rar2fs.conf', 'mode': 0o600},
+            ],
+        },
         'wsd': [
             {'type': 'mako', 'path': 'local/wsdd.conf', 'checkpoint': 'interface_sync'},
         ],
@@ -299,11 +308,14 @@ class EtcService(Service):
         'openvpn_client': [
             {'type': 'mako', 'path': 'local/openvpn/client/openvpn_client.conf'}
         ],
-        'kmip': [
-            {'type': 'mako', 'path': 'pykmip/pykmip.conf'}
+        # mode 0600: this file embeds the server's WireGuard private key, and
+        # DEFAULT_ETC_PERMS is 0644.
+        'wireguard': [
+            {'type': 'mako', 'path': 'local/wireguard/wg1.conf', 'mode': 0o600}
         ],
-        'truecommand': [
-            {'type': 'mako', 'path': 'wireguard/wg0.conf'}
+        # Same reason for 0600: wg2.conf embeds this system's client private key.
+        'wireguard_client': [
+            {'type': 'mako', 'path': 'local/wireguard/wg2.conf', 'mode': 0o600}
         ]
     }
     LOCKS = defaultdict(asyncio.Lock)

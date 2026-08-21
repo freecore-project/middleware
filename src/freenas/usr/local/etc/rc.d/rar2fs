@@ -1,0 +1,136 @@
+#!/bin/sh
+#
+# PROVIDE: rar2fs
+# REQUIRE: middlewared ix-zfs
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="rar2fs"
+rcvar="rar2fs_enable"
+
+: ${rar2fs_enable:="NO"}
+: ${rar2fs_config:="/etc/local/rar2fs.conf"}
+
+start_cmd="rar2fs_start"
+stop_cmd="rar2fs_stop"
+status_cmd="rar2fs_status"
+extra_commands="status"
+
+load_rc_config $name
+
+rar2fs_read_config()
+{
+	if [ "$1" = "generate" ]; then
+		if ! LD_LIBRARY_PATH=/usr/local/lib /usr/local/bin/midclt -t 30 call etc.generate rar2fs >/dev/null 2>&1; then
+			echo "failed to generate rar2fs configuration"
+			return 1
+		fi
+	fi
+
+	if [ ! -r "${rar2fs_config}" ]; then
+		echo "${rar2fs_config} is missing or unreadable"
+		return 1
+	fi
+
+	. "${rar2fs_config}"
+}
+
+rar2fs_mounted()
+{
+	mount | grep -F " on ${rar2fs_mountpoint} (" | grep -F "fusefs.rar2fs" >/dev/null 2>&1
+}
+
+rar2fs_start()
+{
+	rar2fs_read_config generate || return 1
+
+	if [ -z "${rar2fs_source}" ] || [ -z "${rar2fs_mountpoint}" ] || [ -z "${rar2fs_command_args}" ]; then
+		echo "rar2fs source and mountpoint must be configured"
+		return 1
+	fi
+
+	if rar2fs_mounted; then
+		echo "rar2fs already mounted on ${rar2fs_mountpoint}"
+		return 0
+	fi
+
+	if ! /sbin/kldstat -m fusefs >/dev/null 2>&1; then
+		/sbin/kldload fusefs || return 1
+	fi
+
+	if [ ! -d "${rar2fs_source}" ]; then
+		echo "rar2fs source ${rar2fs_source} does not exist"
+		return 1
+	fi
+
+	if [ "${rar2fs_create_mountpoint}" = "YES" ]; then
+		/bin/mkdir -p "${rar2fs_mountpoint}" || return 1
+	elif [ ! -d "${rar2fs_mountpoint}" ]; then
+		echo "rar2fs mountpoint ${rar2fs_mountpoint} does not exist"
+		return 1
+	fi
+
+	eval "set -- ${rar2fs_command_args}"
+	/usr/local/bin/rar2fs "$@" || return 1
+
+	# FUSE mount registration is asynchronous; a fixed sleep races it and
+	# start reports failure on a mount that is about to appear.
+	_waited=0
+	while [ ${_waited} -lt 20 ]; do
+		if rar2fs_mounted; then
+			echo "rar2fs is mounted on ${rar2fs_mountpoint}"
+			return 0
+		fi
+		sleep 0.5
+		_waited=$((_waited + 1))
+	done
+	echo "rar2fs did not mount on ${rar2fs_mountpoint} within 10 seconds"
+	return 1
+}
+
+rar2fs_stop()
+{
+	rar2fs_read_config || rar2fs_read_config generate || return 1
+
+	if [ -z "${rar2fs_mountpoint}" ]; then
+		echo "rar2fs mountpoint must be configured"
+		return 1
+	fi
+
+	if ! rar2fs_mounted; then
+		echo "rar2fs is not mounted on ${rar2fs_mountpoint}"
+		return 0
+	fi
+
+	/sbin/umount "${rar2fs_mountpoint}" || return 1
+
+	# FUSE teardown is asynchronous; middleware start is rc restart, so an
+	# immediate follow-up mount hits a still-busy mountpoint unless stop
+	# waits for the daemon to actually exit.
+	_waited=0
+	while [ ${_waited} -lt 20 ]; do
+		if ! rar2fs_mounted && ! pgrep -qf "bin/rar2fs .*${rar2fs_mountpoint}" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.5
+		_waited=$((_waited + 1))
+	done
+	echo "rar2fs did not stop cleanly on ${rar2fs_mountpoint}"
+	return 1
+}
+
+rar2fs_status()
+{
+	rar2fs_read_config || return 1
+
+	if rar2fs_mounted; then
+		echo "rar2fs is mounted on ${rar2fs_mountpoint}"
+		return 0
+	fi
+
+	echo "rar2fs is not mounted on ${rar2fs_mountpoint}"
+	return 1
+}
+
+run_rc_command "$1"
