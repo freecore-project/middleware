@@ -27,6 +27,11 @@ def enable_nis_domain():
     results = PUT("/nis/", {
         'domain': NIS_DOMAIN,
         'servers': [NIS_SERVER],
+        # manycast makes ypbind(8) unicast to the listed servers instead of
+        # broadcasting, which is what lets the bind cross the VLAN to the QA
+        # fixture. The servers list must stay populated -- manycast with an
+        # empty list FAULTs after 60s (freecore/the internal development record).
+        'manycast': True,
         'enable': True
     })
     assert results.status_code == 200, results.text

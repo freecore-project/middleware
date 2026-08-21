@@ -1,12 +1,48 @@
 import itertools
 import re
 import subprocess
-import sysctl
+import sysctl as _sysctl
 
 from middlewared.utils.io import write_if_changed
 
 NFS_BINDIP_NOTFOUND = '/tmp/.nfsbindip_notfound'
 RE_FIRMWARE_VERSION = re.compile(r'Firmware Revision\s*:\s*(\S+)', re.M)
+KLDLOAD = '/sbin/kldload'
+SYSCTL = '/sbin/sysctl'
+
+
+def rc_conf_value(value):
+    return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+
+
+def _load_nfsd_module():
+    try:
+        subprocess.run(
+            [KLDLOAD, 'nfsd'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def _set_sysctl(oid, value):
+    try:
+        _sysctl.filter(oid)[0].value = value
+        return
+    except (IndexError, OSError):
+        pass
+
+    try:
+        subprocess.run(
+            [SYSCTL, f'{oid}={value}'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
 
 
 def get_context(middleware):
@@ -28,10 +64,14 @@ def collectd_config(middleware, context):
         yield 'collectd_daemon_enable="YES"'
         yield 'rrdcached_enable="YES"'
 
-        rrdcached_flags = '-s www -l /var/run/rrdcached.sock -p /var/run/rrdcached.pid'
+        yield 'rrdcached_group="www"'
+        yield 'rrdcached_address="/var/run/rrdcached.sock"'
+        yield 'rrdcached_pid="/var/run/rrdcached.pid"'
+
+        rrdcached_flags = ''
         sysds = middleware.call_sync('systemdataset.config')
         if sysds['pool'] in ('', middleware.call_sync('boot.pool_name')):
-            rrdcached_flags += ' -w 3600 -f 7200'
+            rrdcached_flags = '-w 3600 -f 7200'
         yield f'rrdcached_flags="{rrdcached_flags}"'
     else:
         return []
@@ -109,6 +149,44 @@ def service_announcement(middleware, context):
     yield f'wsdd_enable="{"YES" if announce["wsd"] else "NO"}"'
 
 
+def wsdd_config(middleware, context):
+    announce = middleware.call_sync("network.configuration.config")["service_announcement"]
+    if not announce["wsd"]:
+        return []
+
+    smb_config = middleware.call_sync("smb.config")
+    interfaces = smb_config["bindip"] or list(middleware.call_sync("smb.bindip_choices").values())
+
+    flags = []
+    if smb_config["netbiosname_local"]:
+        flags += ["-n", smb_config["netbiosname_local"]]
+    for interface in interfaces:
+        flags += ["-i", interface]
+
+    if flags:
+        yield f'wsdd_flags="{rc_conf_value(" ".join(flags))}"'
+
+    try:
+        realm = middleware.call_sync("smb.getparm", "realm", "GLOBAL")
+    except Exception:
+        middleware.logger.debug("Failed to read SMB realm for wsdd rc configuration", exc_info=True)
+        realm = None
+
+    if realm:
+        yield f'wsdd_domain="{rc_conf_value(realm)}"'
+    else:
+        yield f'wsdd_group="{rc_conf_value(smb_config["workgroup"])}"'
+
+
+def samba_daemons_config(middleware, context):
+    # samba_server rc.d reads smbd_enable / winbindd_enable / nmbd_enable to
+    # decide which of the three to launch. smbd + winbindd are always-on (the
+    # cifs service lifecycle is middleware-controlled via forcestart).
+    # nmbd_enable is emitted by service_announcement based on announce[netbios].
+    yield 'smbd_enable="YES"'
+    yield 'winbindd_enable="YES"'
+
+
 def services_config(middleware, context):
     services = middleware.call_sync('datastore.query', 'services.services', [], {'prefix': 'srv_'})
 
@@ -127,7 +205,10 @@ def services_config(middleware, context):
             'ftp': ['proftpd'],
             'openvpn_client': ['openvpn_client'],
             'openvpn_server': ['openvpn_server'],
+            'rar2fs': ['rar2fs'],
             'rsync': ['rsyncd'],
+            'wireguard': ['wireguard_server'],
+            'wireguard_client': ['wireguard_client'],
             'snmp': ['snmpd', 'snmp_agent'],
             'tftp': ['inetd'],
             'webdav': ['apache24'],
@@ -143,10 +224,12 @@ def services_config(middleware, context):
         3. On BOTH controllers in TrueNAS HA systems
     """
     mapping.update({
+        'cifs': ['samba_server'],
         'iscsitarget': ['ctld'],
         'lldp': ['ladvd'],
         'ssh': ['openssh'],
-        'cifs': ['samba_server', 'smbd', 'winbindd']
+        # Per-daemon smbd/winbindd rcvars are emitted by
+        # samba_daemons_config; nmbd_enable by service_announcement.
     })
 
     for service in services:
@@ -185,6 +268,8 @@ def nfs_config(middleware, context):
         lockd_flags += ['-p', str(nfs['rpclockd_port'])]
 
     nfs_server_flags = ['-t', '-n', str(nfs['servers'])]
+    if not (nfs['v4'] and nfs['v4_krb_enabled']):
+        nfs_server_flags.append('-S')
     if nfs['udp']:
         nfs_server_flags.append('-u')
 
@@ -219,6 +304,7 @@ def nfs_config(middleware, context):
 
     if nfs['v4']:
         yield 'nfsv4_server_enable="YES"'
+        _load_nfsd_module()
 
         if nfs['v4_krb_enabled']:
             if enabled:
@@ -231,11 +317,11 @@ def nfs_config(middleware, context):
         if nfs['v4_v3owner']:
             # Per RFC7530, sending NFSv3 style UID/GIDs across the wire is now allowed
             # You must have both of these sysctl's set to allow the desired functionality
-            sysctl.filter('vfs.nfsd.enable_stringtouid')[0].value = 1
-            sysctl.filter('vfs.nfs.enable_uidtostring')[0].value = 1
+            for oid, val in [('vfs.nfsd.enable_stringtouid', 1), ('vfs.nfs.enable_uidtostring', 1)]:
+                _set_sysctl(oid, val)
         else:
-            sysctl.filter('vfs.nfsd.enable_stringtouid')[0].value = 0
-            sysctl.filter('vfs.nfs.enable_uidtostring')[0].value = 0
+            for oid in ('vfs.nfsd.enable_stringtouid', 'vfs.nfs.enable_uidtostring'):
+                _set_sysctl(oid, 0)
             if nfs['v4_domain']:
                 nfsuserd_flags.append(f"-domain {nfs['v4_domain']}")
 
@@ -311,6 +397,12 @@ def snmp_config(middleware, context):
     yield 'snmpd_conffile="/etc/local/snmpd.conf"'
     loglevel = middleware.call_sync('snmp.config')['loglevel']
     yield f'snmpd_flags="-LS{loglevel}d"'
+    # net-snmp 5.9.5.2's rc.d script defaults snmpd_sugid=YES and then passes
+    # "-u snmpd -g snmpd", but the appliance has no snmpd account: builtin users
+    # come from the middleware DB, and the internal development record deliberately refused to add one there.
+    # 13.3 shipped net-snmp 5.9.1, whose rc.d script has no sugid handling at all,
+    # so snmpd ran as root. Keep that behaviour rather than diverging the user model.
+    yield 'snmpd_sugid="NO"'
 
 
 def staticroute_config(middleware, context):
@@ -343,8 +435,15 @@ def truenas_config(middleware, context):
         yield 'failover_enable="YES"'
 
 
-def truecommand_config(middleware, context):
-    return ['wireguard_interfaces="wg0"'] if middleware.call_sync('truecommand.config')['enabled'] else []
+# wireguard_config() used to live here as the sole owner of wireguard_interfaces,
+# emitting wg0 for the TrueCommand Cloud tunnel. TrueCommand Cloud is gone
+# (freecore/the internal development record) and wg0 with it (the internal development record), so nothing writes
+# wireguard_interfaces any more: wg1 is named by wireguard_server_interface and wg2
+# by wireguard_client_interface, each owned by its own rc script (the internal development record, the internal development record).
+# Do not reintroduce wireguard_interfaces to start wg1 or wg2 -- the
+# net/wireguard-tools rc script it feeds acts on every listed interface at once, so
+# it cannot give either one an independent lifecycle, and its start never returns on
+# FreeBSD 15.
 
 
 def tunable_config(middleware, context):
@@ -391,9 +490,10 @@ def _bmc_watchdog_is_broken():
 
 def watchdog_config(middleware, context):
     if context['is_freenas']:
-        # Bug #7337 -- blacklist AMD systems for now
-        model = sysctl.filter('hw.model')
-        if not model or 'AMD' not in model[0].value:
+        # Bug the internal development record -- blacklist AMD systems for now
+        model = _sysctl.filter('hw.model')
+        model_value = model[0].value if model else ''
+        if 'AMD' not in model_value:
             product = middleware.call_sync('system.dmidecode_info')['baseboard-product-name']
 
             if product in ('C2750D4I', 'C2550D4I') and _bmc_watchdog_is_broken():
@@ -423,6 +523,8 @@ def render(service, middleware):
     for i in (
         services_config,
         service_announcement,
+        wsdd_config,
+        samba_daemons_config,
         collectd_config,
         geli_config,
         host_config,
@@ -439,7 +541,6 @@ def render(service, middleware):
         snmp_config,
         staticroute_config,
         tftp_config,
-        truecommand_config,
         truenas_config,
         vmware_config,
         watchdog_config,

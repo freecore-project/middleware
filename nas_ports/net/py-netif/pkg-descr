@@ -1,0 +1,3 @@
+Python Cython bindings for FreeBSD network interface configuration.
+Provides VLAN, LAGG, CARP, bridge, and IPv4/IPv6 management via ioctls.
+Used by TrueNAS middleware for network configuration.

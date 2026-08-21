@@ -259,6 +259,17 @@ class SystemAdvancedService(ConfigService):
         config_data.update(data)
 
         verrors, config_data = await self.__validate_fields('advanced_settings_update', config_data)
+
+        if original_data['consolemenu'] != config_data['consolemenu'] and config_data['consolemenu']:
+            twofactor_auth = await self.middleware.call('auth.twofactor.config')
+            if twofactor_auth['enabled'] and twofactor_auth['services']['console']:
+                verrors.add(
+                    'advanced_settings_update.consolemenu',
+                    'The passwordless console menu cannot be enabled while console OTP '
+                    '(Two-Factor service "Console") is enforced — it would bypass the login '
+                    'prompt. Disable console OTP first.'
+                )
+
         if verrors:
             raise verrors
 
@@ -482,7 +493,7 @@ class SystemService(Service):
         """
         Returns name of the product we are using.
         """
-        return "TrueNAS"
+        return "FreeCORE"
 
     @accepts()
     def version(self):
@@ -935,13 +946,18 @@ class SystemGeneralService(ConfigService):
                 {'get': True}
             )
 
+        # freecore/the internal development record: both default to False now, not True. Neither
+        # has an endpoint left to talk to -- CrashReporting is inert and the
+        # usage plugin is gone -- so reporting True would just be the API
+        # claiming to send data it does not send. The columns stay (no
+        # migration) so an existing explicit setting round-trips unchanged.
         data['crash_reporting_is_set'] = data['crash_reporting'] is not None
         if data['crash_reporting'] is None:
-            data['crash_reporting'] = True
+            data['crash_reporting'] = False
 
         data['usage_collection_is_set'] = data['usage_collection'] is not None
         if data['usage_collection'] is None:
-            data['usage_collection'] = True
+            data['usage_collection'] = False
 
         data.pop('pwenc_check')
 
@@ -1328,7 +1344,7 @@ class SystemGeneralService(ConfigService):
         )
 
         if config['kbdmap'] != new_config['kbdmap']:
-            await self.middleware.call('service.restart', 'syscons')
+            await self.middleware.call('service.restart', 'vt')
 
         if config['timezone'] != new_config['timezone']:
             await self.middleware.call('zettarepl.update_config', {'timezone': new_config['timezone']})
@@ -1624,13 +1640,12 @@ async def firstboot(middleware):
             middleware.logger.error('Failed to create initial boot environment', exc_info=True)
         else:
             boot_pool = await middleware.call('boot.pool_name')
-            cp = await run(
-                'zfs', 'set', f'{"zectl" if osc.IS_LINUX else "beadm"}:keep=True',
-                os.path.join(boot_pool, 'ROOT/Initial-Install')
-            )
-            if cp.returncode != 0:
+            try:
+                await middleware.call('bootenv.set_attribute', initial_install_be, {'keep': True})
+            except Exception:
                 middleware.logger.error(
-                    'Failed to set keep attribute for Initial-Install boot environment: %s', cp.stderr.decode()
+                    'Failed to set keep attribute for Initial-Install boot environment',
+                    exc_info=True,
                 )
             if osc.IS_LINUX:
                 cp = await run(
@@ -1729,6 +1744,13 @@ async def setup(middleware):
                     f'{srv}.post_{event}',
                     update_timeout_value
                 )
+
+        # FB15 base rc.d motd renders /var/run/motd from /etc/motd.template early
+        # in boot, before middleware rewrites that template with TrueNAS branding +
+        # system.advanced.config['motd']. Refresh /var/run/motd so the first login
+        # sees the TrueNAS template, not the FreeBSD boilerplate captured pre-boot.
+        await middleware.call('etc.generate', 'motd')
+        await middleware.call('service.start', 'motd')
 
     middleware.event_subscribe('system', _event_system)
     middleware.register_event_source('system.health', SystemHealthEventSource)
