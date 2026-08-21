@@ -32,7 +32,6 @@ disable netatalk.service
 disable glusterd*
 disable docker*
 disable kubelet*
-disable openvpn*
 disable nvidia-*
 disable libvirt*
 

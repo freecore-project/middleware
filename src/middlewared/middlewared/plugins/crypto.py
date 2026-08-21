@@ -17,7 +17,7 @@ from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, Ref, Str
 from middlewared.service import CallError, CRUDService, job, periodic, private, Service, skip_arg, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.validators import Email, IpAddress, Range
-from middlewared.utils import osc
+
 
 from acme import client, errors, messages
 from OpenSSL import crypto, SSL
@@ -327,7 +327,7 @@ class CryptoKeyService(Service):
             )
 
             try:
-                context = SSL.Context(SSL.TLSv1_2_METHOD)
+                context = SSL.Context(SSL.TLS_METHOD)
                 context.use_certificate(public_key_obj)
                 context.use_privatekey(private_key_obj)
                 context.check_privatekey()
@@ -477,11 +477,12 @@ class CryptoKeyService(Service):
         cert = self.generate_builder({
             'crypto_subject_name': {
                 'country_name': 'US',
-                'organization_name': 'iXsystems',
+                'organization_name': 'FreeCORE',
                 'common_name': 'localhost',
-                'email_address': 'info@ixsystems.com',
-                'state_or_province_name': 'Tennessee',
-                'locality_name': 'Maryville',
+                'email_address': 'dev@freecore.org',
+                # No state/locality: FreeCORE has no legal address, and generate_builder
+                # skips falsy values, so omitting them simply leaves them out of the
+                # subject rather than asserting somebody else's. freecore/the internal development record.
             },
             'lifetime': NOT_VALID_AFTER_DEFAULT,
             'san': self.normalize_san(['localhost'])
@@ -872,7 +873,7 @@ class CryptoKeyService(Service):
         # for a revoked root CA in normal cases doesn't make sense as the thief can sign a
         # counter CRL saying that everything is fine. As our environment is controlled,
         # i think we are safe to create a crl for root CA as well which we can publish for
-        # services which make use of it i.e openvpn and they'll know that the certs/ca's have been
+        # services which make use of it and they'll know that the certs/ca's have been
         # compromised.
         #
         # `ca` is root ca from where the chain `certs` starts.
@@ -1043,68 +1044,6 @@ class CertificateService(CRUDService):
             'lifetime': NOT_VALID_AFTER_DEFAULT,
             'digest_algorithm': 'SHA256'
         },
-        'Openvpn Server Certificate': {
-            'cert_extensions': {
-                'BasicConstraints': {
-                    'enabled': True,
-                    'ca': False,
-                    'extension_critical': True
-                },
-                'AuthorityKeyIdentifier': {
-                    'enabled': True,
-                    'authority_cert_issuer': True,
-                    'extension_critical': False
-                },
-                'ExtendedKeyUsage': {
-                    'enabled': True,
-                    'extension_critical': True,
-                    'usages': [
-                        'SERVER_AUTH',
-                    ]
-                },
-                'KeyUsage': {
-                    'enabled': True,
-                    'extension_critical': True,
-                    'digital_signature': True,
-                    'key_encipherment': True
-                }
-            },
-            'key_length': 2048,
-            'key_type': 'RSA',
-            'lifetime': NOT_VALID_AFTER_DEFAULT,
-            'digest_algorithm': 'SHA256'
-        },
-        'Openvpn Client Certificate': {
-            'cert_extensions': {
-                'BasicConstraints': {
-                    'enabled': True,
-                    'ca': False,
-                    'extension_critical': True
-                },
-                'AuthorityKeyIdentifier': {
-                    'enabled': True,
-                    'authority_cert_issuer': True,
-                    'extension_critical': False
-                },
-                'ExtendedKeyUsage': {
-                    'enabled': True,
-                    'extension_critical': True,
-                    'usages': [
-                        'CLIENT_AUTH',
-                    ]
-                },
-                'KeyUsage': {
-                    'enabled': True,
-                    'extension_critical': True,
-                    'digital_signature': True,
-                    'key_agreement': True,
-                }
-            },
-            'key_length': 2048,
-            'key_type': 'RSA',
-            'lifetime': NOT_VALID_AFTER_DEFAULT,
-            'digest_algorithm': 'SHA256'
-        }
     }
 
     def __init__(self, *args, **kwargs):
@@ -1120,8 +1059,8 @@ class CertificateService(CRUDService):
     @accepts()
     async def profiles(self):
         """
-        Returns a dictionary of predefined options for specific use cases i.e openvpn client/server
-        configurations which can be used for creating certificates.
+        Returns a dictionary of predefined options for specific use cases i.e HTTPS server
+        certificates which can be used for creating certificates.
         """
         return self.PROFILES
 
@@ -1622,11 +1561,7 @@ class CertificateService(CRUDService):
         if not os.path.exists(dhparam_path) or os.stat(dhparam_path).st_size == 0:
             with open('/dev/console', 'wb') as console:
                 with open(dhparam_path, 'wb') as f:
-                    if osc.IS_FREEBSD:
-                        rand = '/dev/random'
-                    else:
-                        rand = '/dev/urandom'
-                    subprocess.run(['openssl', 'dhparam', '-rand', rand, '2048'], stdout=f, stderr=console, check=True)
+                    subprocess.run(['openssl', 'dhparam', '2048'], stdout=f, stderr=console, check=True)
 
     # CREATE METHODS FOR CREATING CERTIFICATES
     # "do_create" IS CALLED FIRST AND THEN BASED ON THE TYPE OF THE CERTIFICATE WHICH IS TO BE CREATED THE
@@ -1753,8 +1688,8 @@ class CertificateService(CRUDService):
                     "city": "Nashville",
                     "common": "domain1.com",
                     "country": "US",
-                    "email": "dev@ixsystems.com",
-                    "organization": "iXsystems",
+                    "email": "dev@freecore.org",
+                    "organization": "FreeCORE",
                     "state": "Tennessee",
                     "digest_algorithm": "SHA256",
                     "signedby": 4,
@@ -2198,37 +2133,6 @@ class CertificateAuthorityService(CRUDService):
         datastore_prefix = 'cert_'
 
     PROFILES = {
-        'Openvpn Root CA': {
-            'cert_extensions': {
-                'AuthorityKeyIdentifier': {
-                    'enabled': True,
-                    'authority_cert_issuer': True,
-                    'extension_critical': False
-                },
-                'KeyUsage': {
-                    'enabled': True,
-                    'key_cert_sign': True,
-                    'crl_sign': True,
-                    'extension_critical': True
-                },
-                'BasicConstraints': {
-                    'enabled': True,
-                    'ca': True,
-                    'extension_critical': True
-                },
-                'ExtendedKeyUsage': {
-                    'enabled': True,
-                    'extension_critical': False,
-                    'usages': [
-                        'SERVER_AUTH', 'CLIENT_AUTH',
-                    ]
-                }
-            },
-            'key_length': 2048,
-            'key_type': 'RSA',
-            'lifetime': NOT_VALID_AFTER_DEFAULT,
-            'digest_algorithm': 'SHA256'
-        },
         'CA': {
             'key_length': 2048,
             'key_type': 'RSA',
@@ -2266,8 +2170,8 @@ class CertificateAuthorityService(CRUDService):
     @accepts()
     async def profiles(self):
         """
-        Returns a dictionary of predefined options for specific use cases i.e OpenVPN certificate authority
-        configurations which can be used for creating certificate authorities.
+        Returns a dictionary of predefined options which can be used for creating
+        certificate authorities.
         """
         return self.PROFILES
 
@@ -2486,8 +2390,8 @@ class CertificateAuthorityService(CRUDService):
                     "city": "Nashville",
                     "common": "domain1.com",
                     "country": "US",
-                    "email": "dev@ixsystems.com",
-                    "organization": "iXsystems",
+                    "email": "dev@freecore.org",
+                    "organization": "FreeCORE",
                     "state": "Tennessee",
                     "digest_algorithm": "SHA256"
                     "create_type": "CA_CREATE_INTERNAL"
@@ -2859,8 +2763,6 @@ class CertificateAuthorityService(CRUDService):
 
         # Let's make sure we don't delete a ca which is being used by any service in the system
         for service_cert_id, text in [
-            ((await self.middleware.call('openvpn.server.config'))['root_ca'], 'OpenVPN Server'),
-            ((await self.middleware.call('openvpn.client.config'))['root_ca'], 'OpenVPN Client'),
             ((await self.middleware.call('system.advanced.config'))['syslog_tls_certificate_authority'],
              'Syslog TLS CA'),
         ]:

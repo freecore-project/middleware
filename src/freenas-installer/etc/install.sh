@@ -362,7 +362,7 @@ install_loader()
 	    mount -t msdosfs /dev/${_disk}p1 /tmp/efi
 	    # Copy the .efi file and create a fallback startup script
 	    mkdir -p /tmp/efi/efi/boot
-	    cp ${_mnt}/boot/boot1.efi /tmp/efi/efi/boot/BOOTx64.efi
+	    cp ${_mnt}/boot/loader.efi /tmp/efi/efi/boot/BOOTx64.efi
 	    echo "BOOTx64.efi" > /tmp/efi/efi/boot/startup.nsh
 	    umount /tmp/efi
 	else
@@ -905,7 +905,7 @@ menu_install()
         fi
 
         eval "dialog --title 'Choose destination media' \
-            --checklist 'Select one or more drives where $AVATAR_PROJECT should be installed (use arrow keys to navigate to the drive(s) for installation; select a drive with the spacebar).' \
+            --checklist 'Select drives: one creates a single-device boot pool; two or more create a mirrored boot pool for redundancy. All selected drives are erased and reserved for boot use. Use arrow keys to navigate and the spacebar to select.' \
             ${_menuheight} 60 ${_items} ${_list}" 2>${_tmpfile}
         [ $? -eq 0 ] || abort
     fi
@@ -1062,7 +1062,7 @@ menu_install()
 	chown -R www:www /tmp/data/data
     fi
 
-    local OS=TrueNAS
+    local OS=${AVATAR_PROJECT}
 
     # Tell it to look in /.mount for the packages.
     /usr/local/bin/freenas-install -P /.mount/${OS}/Packages -M /.mount/${OS}-MANIFEST /tmp/data

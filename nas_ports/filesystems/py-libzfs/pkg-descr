@@ -1,0 +1,2 @@
+Python Cython bindings for libzfs.
+Used by TrueNAS middleware for ZFS pool, dataset, snapshot, and replication operations.

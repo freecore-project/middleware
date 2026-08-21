@@ -80,9 +80,8 @@ class SMBPath(enum.Enum):
     LEGACYSTATE = ('/root/samba', 0o755, True)
     LEGACYPRIVATE = ('/root/samba/private', 0o700, True)
     MSG_SOCK = ('/var/db/system/samba4/private/msg.sock', 0o700, False)
-    RUNDIR = ('/var/run/samba4', True)
+    RUNDIR = ('/var/run/samba4', 0o755, True)
     CACHEDIR = ('/var/run/samba-cache', 0o755, True)
-    PASSDB_DIR = ('/var/run/samba-cache/private', 0o700, True)
     LOCKDIR = ('/var/run/samba4', 0o755, True)
     LOGDIR = ('/var/log/samba4', 0o755, True)
     IPCSHARE = ('/var/tmp', 0o1777, True)
@@ -171,6 +170,21 @@ class SMBSharePreset(enum.Enum):
             'worm:grace_period = 300',
         ])
     }}
+
+
+def preserved_creation_params(data, schema_attrs, preset_params):
+    """
+    Values the caller explicitly diverged from the schema defaults must survive
+    preset application (freecore/the internal development record) — apply_presets otherwise
+    silently discards them. A value equal to its schema default is
+    indistinguishable from an omitted one, so the preset keeps authority there.
+    `auxsmbconf` is excluded because apply_presets already merges it with
+    caller precedence.
+    """
+    return {
+        k: data[k] for k in preset_params
+        if k != 'auxsmbconf' and k in schema_attrs and k in data and data[k] != schema_attrs[k].default
+    }
 
 
 class SMBModel(sa.Model):
@@ -338,7 +352,7 @@ class SMBService(SystemServiceService):
         if not ldap['ldap_enable']:
             return True
 
-        set_pass = await run(['usr/local/bin/smbpasswd', '-w', ldap['ldap_bindpw']], check=False)
+        set_pass = await run([SMBCmd.SMBPASSWD.value, '-w', ldap['ldap_bindpw']], check=False)
         if set_pass.returncode != 0:
             self.logger.debug(f"Failed to set set ldap bindpw in secrets.tdb: {set_pass.stdout.decode()}")
             return False
@@ -833,7 +847,12 @@ class SharingSMBService(SharingService):
             except OSError as e:
                 raise CallError(f'Failed to create {path}: {e}')
 
+        preserved = preserved_creation_params(
+            data, self.do_create.accepts[0].attrs,
+            SMBSharePreset[data['purpose']].value['params'],
+        )
         await self.apply_presets(data)
+        data.update(preserved)
         await self.compress(data)
         vuid = await self.generate_vuid(data['timemachine'])
         data.update({'vuid': vuid})

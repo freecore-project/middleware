@@ -5,7 +5,7 @@
 # without the express permission of iXsystems.
 
 from collections import defaultdict
-from subprocess import Popen, PIPE
+import subprocess
 import itertools
 import json
 import os
@@ -85,4 +85,4 @@ block drop in quick proto udp from any to $ips\n''' % {
             'ips': ', '.join(ips),
         })
 
-    Popen(['pfctl', '-f', pf_block], stderr=PIPE, stdout=PIPE).communicate()
+    subprocess.run(['pfctl', '-f', pf_block], capture_output=True, timeout=30)
