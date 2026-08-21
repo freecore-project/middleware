@@ -8,8 +8,13 @@ from middlewared.utils.osc import set_thread_name
 
 def zfs_events(child_conn):
     with libzfs.ZFS() as zfs:
-        for event in zfs.zpool_events(blocking=True, skip_existing_events=True):
-            child_conn.send(event)
+        try:
+            for event in zfs.zpool_events(blocking=True, skip_existing_events=True):
+                child_conn.send(event)
+        except TypeError:
+            # OZ 2.4 may change zpool_events() signature; fall back without skip
+            for event in zfs.zpool_events(blocking=True):
+                child_conn.send(event)
 
 
 def setup_zfs_events_process(middleware):

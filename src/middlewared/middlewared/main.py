@@ -25,13 +25,11 @@ from collections import defaultdict
 import argparse
 import asyncio
 import binascii
-from collections import namedtuple
 import concurrent.futures
 import concurrent.futures.process
 import concurrent.futures.thread
 import contextlib
 import errno
-import fcntl
 import functools
 import inspect
 import itertools
@@ -40,12 +38,9 @@ import os
 import pickle
 import re
 import queue
-import select
 import setproctitle
 import signal
-import struct
 import sys
-import termios
 import threading
 import time
 import traceback
@@ -452,6 +447,8 @@ class FileApplication(object):
                 twofactor_auth = await self.middleware.call('auth.twofactor.config')
                 if twofactor_auth['enabled']:
                     return web.Response(status=401, body='HTTP Basic Auth is unavailable when OTP is enabled')
+                if (await self.middleware.call('auth.webauthn.config'))['enabled']:
+                    return web.Response(status=401, body='HTTP Basic Auth is unavailable when WebAuthn is enabled')
 
                 try:
                     auth = binascii.a2b_base64(auth[6:]).decode()
@@ -550,236 +547,6 @@ class FileApplication(object):
             body=json.dumps({'job_id': job.id}).encode(),
         )
         return resp
-
-
-ShellResize = namedtuple("ShellResize", ["cols", "rows"])
-
-
-class ShellWorkerThread(threading.Thread):
-    """
-    Worker thread responsible for forking and running the shell
-    and spawning the reader and writer threads.
-    """
-
-    def __init__(self, ws, input_queue, loop, options):
-        self.ws = ws
-        self.input_queue = input_queue
-        self.loop = loop
-        self.shell_pid = None
-        self.command = self.get_command(options)
-        self._die = False
-        super(ShellWorkerThread, self).__init__(daemon=True)
-
-    def get_command(self, options):
-        allowed_options = ('jail', 'vm_id')
-        if all(options.get(k) for k in allowed_options):
-            raise CallError(f'Only one option is supported from {", ".join(allowed_options)}')
-
-        if options.get('jail'):
-            return ['/usr/local/bin/iocage', 'console', '-f', options['jail']]
-        elif options.get('vm_id'):
-            return ['/usr/bin/cu', '-l', f'nmdm{options["vm_id"]}B']
-        else:
-            return ['/usr/bin/login', '-p', '-f', 'root']
-
-    def resize(self, cols, rows):
-        self.input_queue.put(ShellResize(cols, rows))
-
-    def run(self):
-
-        self.shell_pid, master_fd = os.forkpty()
-        if self.shell_pid == 0:
-            osc.close_fds(3)
-
-            os.chdir('/root')
-            os.execve(self.command[0], self.command, {
-                'TERM': 'xterm',
-                'HOME': '/root',
-                'LANG': 'en_US.UTF-8',
-                'PATH': '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:/root/bin',
-            })
-
-        # Terminal baudrate affects input queue size
-        attr = termios.tcgetattr(master_fd)
-        attr[4] = attr[5] = termios.B921600
-        termios.tcsetattr(master_fd, termios.TCSANOW, attr)
-
-        def reader():
-            """
-            Reader thread for reading from pty file descriptor
-            and forwarding it to the websocket.
-            """
-            while True:
-                read = os.read(master_fd, 1024)
-                if read == b'':
-                    break
-                asyncio.run_coroutine_threadsafe(
-                    self.ws.send_str(read.decode('utf8')), loop=self.loop
-                ).result()
-
-        def writer():
-            """
-            Writer thread for reading from input_queue and write to
-            the shell pty file descriptor.
-            """
-            while True:
-                try:
-                    get = self.input_queue.get(timeout=1)
-                    if isinstance(get, ShellResize):
-                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", get.rows, get.cols, 0, 0))
-                    else:
-                        os.write(master_fd, get)
-                except queue.Empty:
-                    # If we timeout waiting in input query lets make sure
-                    # the shell process is still alive
-                    try:
-                        os.kill(self.shell_pid, 0)
-                    except ProcessLookupError:
-                        break
-
-        t_reader = threading.Thread(target=reader, daemon=True)
-        t_reader.start()
-
-        t_writer = threading.Thread(target=writer, daemon=True)
-        t_writer.start()
-
-        # Wait for shell to exit
-        while True:
-            try:
-                pid, rv = os.waitpid(self.shell_pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if self._die:
-                return
-            if pid <= 0:
-                time.sleep(1)
-
-        t_reader.join()
-        t_writer.join()
-        asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
-
-    def die(self):
-        self._die = True
-
-
-class ShellConnectionData(object):
-    id = None
-    t_worker = None
-
-
-class ShellApplication(object):
-    shells = {}
-
-    def __init__(self, middleware):
-        self.middleware = middleware
-
-    async def ws_handler(self, request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        conndata = ShellConnectionData()
-        conndata.id = str(uuid.uuid4())
-
-        try:
-            await self.run(ws, request, conndata)
-        except Exception:
-            if conndata.t_worker:
-                await self.worker_kill(conndata.t_worker)
-        finally:
-            self.shells.pop(conndata.id, None)
-            return ws
-
-    async def run(self, ws, request, conndata):
-
-        # Each connection will have its own input queue
-        input_queue = queue.Queue()
-        authenticated = False
-
-        async for msg in ws:
-            if authenticated:
-                # Add content of every message received in input queue
-                try:
-                    input_queue.put(msg.data.encode())
-                except UnicodeEncodeError:
-                    # Should we handle Encode error?
-                    # xterm.js seems to operate with the websocket in text mode,
-                    pass
-            else:
-                try:
-                    data = json.loads(msg.data)
-                except json.decoder.JSONDecodeError:
-                    continue
-
-                token = data.get('token')
-                if not token:
-                    continue
-
-                token = await self.middleware.call('auth.get_token', token)
-                if not token:
-                    await ws.send_json({
-                        'msg': 'failed',
-                        'error': {
-                            'error': errno.EACCES,
-                            'reason': 'Invalid token',
-                        }
-                    })
-                    continue
-
-                authenticated = True
-                await ws.send_json({
-                    'msg': 'connected',
-                    'id': conndata.id,
-                })
-
-                options = data.get('options', {})
-                options['jail'] = data.get('jail') or options.get('jail')
-                conndata.t_worker = ShellWorkerThread(
-                    ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(), options=options
-                )
-                conndata.t_worker.start()
-
-                self.shells[conndata.id] = conndata.t_worker
-
-        # If connection was not authenticated, return earlier
-        if not authenticated:
-            return ws
-
-        if conndata.t_worker:
-            self.middleware.create_task(self.worker_kill(conndata.t_worker))
-
-        return ws
-
-    async def worker_kill(self, t_worker):
-        # If connection has been closed lets make sure shell is killed
-        if t_worker.shell_pid:
-
-            try:
-                kqueue = select.kqueue()
-                kevent = select.kevent(
-                    t_worker.shell_pid,
-                    select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ENABLE, select.KQ_NOTE_EXIT
-                )
-                kqueue.control([kevent], 0)
-
-                os.kill(t_worker.shell_pid, signal.SIGTERM)
-
-                # If process has not died in 2 seconds, try the big gun
-                events = await self.middleware.run_in_thread(kqueue.control, None, 1, 2)
-                if not events:
-                    os.kill(t_worker.shell_pid, signal.SIGKILL)
-
-                    # If process has not died even with the big gun
-                    # There is nothing else we can do, leave it be and
-                    # release the worker thread
-                    events = await self.middleware.run_in_thread(kqueue.control, None, 1, 2)
-                    if not events:
-                        t_worker.die()
-            except ProcessLookupError:
-                pass
-
-        # Wait thread join in yet another thread to avoid event loop blockage
-        # There may be a simpler/better way to do this?
-        await self.middleware.run_in_thread(t_worker.join)
 
 
 class PreparedCall:
@@ -1604,8 +1371,12 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         app.router.add_route('*', '/_download{path_info:.*}', self.fileapp.download)
         app.router.add_route('*', '/_upload{path_info:.*}', self.fileapp.upload)
 
-        shellapp = ShellApplication(self)
-        app.router.add_route('*', '/_shell{path_info:.*}', shellapp.ws_handler)
+        # The terminal endpoint. Replaced the legacy /_shell (ShellApplication
+        # + ShellWorkerThread, deleted here) once all four of its consumers ran
+        # on this one. See the internal development record.
+        from .plugins.webterminal import ShellApplication2
+        shellapp2 = ShellApplication2(self)
+        app.router.add_route('*', '/_webterminal{path_info:.*}', shellapp2.ws_handler)
 
         restful_api = RESTfulAPI(self, app)
         await restful_api.register_resources()
@@ -1710,7 +1481,7 @@ def main():
     args = parser.parse_args()
 
     pidpath = '/var/run/middlewared.pid'
-    startup_seq_path = '/tmp/middlewared_startup.seq'
+    startup_seq_path = '/var/run/middlewared_startup.seq'
 
     if args.restart:
         if os.path.exists(pidpath):

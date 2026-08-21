@@ -1,17 +1,19 @@
-import boto3
 import josepy as jose
 import json
 import requests
-import time
 
 from middlewared.schema import Bool, Dict, Int, Str, ValidationErrors
 from middlewared.service import accepts, CallError, CRUDService, private
+from middlewared.plugins.acme_.dns_authenticators import (
+    AUTHENTICATORS,
+    SECRET_MASK,
+    get_authenticator,
+    mask_attributes,
+)
 import middlewared.sqlalchemy as sa
 from middlewared.validators import validate_attributes
 
 from acme import client, messages
-from botocore import exceptions as boto_exceptions
-from botocore.errorfactory import BaseClientExceptions as boto_BaseClientException
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -52,13 +54,13 @@ class ACMERegistrationService(CRUDService):
 
     @private
     async def register_extend(self, data):
-        data['body'] = {
-            key: value for key, value in
-            (await self.middleware.call(
-                'datastore.query', 'system.acmeregistrationbody',
-                [['acme', '=', data['id']]], {'get': True}
-            )).items() if key != 'acme'
-        }
+        body = await self.middleware.call(
+            'datastore.query', 'system.acmeregistrationbody', [['acme', '=', data['id']]],
+        )
+        # A create interrupted between the two inserts leaves a registration with no body.
+        # Report that as an empty body rather than raising, so a caller can recognise the
+        # registration as unusable and discard it.
+        data['body'] = {key: value for key, value in body[0].items() if key != 'acme'} if body else {}
         return data
 
     @private
@@ -143,9 +145,10 @@ class ACMERegistrationService(CRUDService):
                 'Please specify root email address which will be used with the ACME server'
             )
 
-        if self.middleware.call_sync(
+        existing = self.middleware.call_sync(
             'acme.registration.query', [['directory', '=', data['acme_directory_uri']]]
-        ):
+        )
+        if existing and existing[0]['body']:
             verrors.add(
                 'acme_registration_create.acme_directory_uri',
                 'A registration with the specified directory uri already exists'
@@ -169,31 +172,50 @@ class ACMERegistrationService(CRUDService):
         # We have registered with the acme server
 
         # Save registration object
-        registration_id = self.middleware.call_sync(
-            'datastore.insert',
-            self._config.datastore,
-            {
-                'uri': register.uri,
-                'tos': register.terms_of_service,
-                'new_account_uri': directory.newAccount,
-                'new_nonce_uri': directory.newNonce,
-                'new_order_uri': directory.newOrder,
-                'revoke_cert_uri': directory.revokeCert,
-                'directory': data['acme_directory_uri']
-            }
-        )
+        registration = {
+            'uri': register.uri,
+            'tos': register.terms_of_service,
+            'new_account_uri': directory.newAccount,
+            'new_nonce_uri': directory.newNonce,
+            'new_order_uri': directory.newOrder,
+            'revoke_cert_uri': directory.revokeCert,
+            'directory': data['acme_directory_uri']
+        }
+        if existing:
+            # Repairing a registration left bodyless by an interrupted create. Reuse the
+            # row rather than replacing it: certificates carry a foreign key to it, so a
+            # delete is refused outright once anything has been issued.
+            registration_id = existing[0]['id']
+            self.middleware.call_sync(
+                'datastore.update', self._config.datastore, registration_id, registration,
+            )
+        else:
+            registration_id = self.middleware.call_sync(
+                'datastore.insert', self._config.datastore, registration,
+            )
 
         # Save registration body
-        self.middleware.call_sync(
-            'datastore.insert',
-            'system.acmeregistrationbody',
-            {
-                'contact': register.body.contact[0],
-                'status': register.body.status,
-                'key': key.json_dumps(),
-                'acme': registration_id
-            }
-        )
+        try:
+            self.middleware.call_sync(
+                'datastore.insert',
+                'system.acmeregistrationbody',
+                {
+                    # An ACME server is not obliged to echo the contact back, and Let's
+                    # Encrypt no longer does - it returns an empty contact list. An absent
+                    # contact is not an error, and must not abort a valid registration.
+                    'contact': register.body.contact[0] if register.body.contact else '',
+                    'status': register.body.status,
+                    'key': key.json_dumps(),
+                    'acme': registration_id
+                }
+            )
+        except Exception:
+            if not existing:
+                # A registration row is unusable without its body and no public API can
+                # remove it, so leaving a fresh one behind strands every later issuance
+                # against this directory. Only roll back what this call inserted.
+                self.middleware.call_sync('datastore.delete', self._config.datastore, registration_id)
+            raise
 
         return self.middleware.call_sync(f'{self._config.namespace}._get_instance', registration_id)
 
@@ -212,6 +234,7 @@ class DNSAuthenticatorService(CRUDService):
     class Config:
         namespace = 'acme.dns.authenticator'
         datastore = 'system.acmednsauthenticator'
+        datastore_extend = 'acme.dns.authenticator.extend'
 
     def __init__(self, *args, **kwargs):
         super(DNSAuthenticatorService, self).__init__(*args, **kwargs)
@@ -224,39 +247,58 @@ class DNSAuthenticatorService(CRUDService):
         required for connecting to them while validating a DNS Challenge
         """
         return [
-            {'schema': [v.to_json_schema() for v in value], 'key': key}
+            {
+                'schema': [
+                    dict(v.to_json_schema(), _name_=v.name, _private_=v.private)
+                    for v in value
+                ],
+                'key': key,
+            }
             for key, value in self.schemas.items()
         ]
 
     @staticmethod
     @private
     def initialize_authenticator_schemas():
-
         return {
-            f_n[len('update_txt_record_'):]: [
-                Str(arg, required=True)
-                for arg in list(getattr(DNSAuthenticatorService, f_n).__code__.co_varnames)
-                [4: getattr(DNSAuthenticatorService, f_n).__code__.co_argcount]
-            ]
-            for f_n in [
-                func for func in dir(DNSAuthenticatorService)
-                if callable(getattr(DNSAuthenticatorService, func)) and func.startswith('update_txt_record_')
-            ]
+            name: authenticator.SCHEMA
+            for name, authenticator in AUTHENTICATORS.items()
         }
 
     @private
-    async def common_validation(self, data, schema_name):
+    async def common_validation(self, data, schema_name, id=None):
         verrors = ValidationErrors()
+
+        await self._ensure_unique(verrors, schema_name, 'name', data['name'], id)
+
         if data['authenticator'] not in self.schemas:
             verrors.add(
                 f'{schema_name}.authenticator',
                 f'System does not support {data["authenticator"]} as an Authenticator'
             )
         else:
-            verrors = validate_attributes(self.schemas[data['authenticator']], data)
+            attributes_verrors = validate_attributes(self.schemas[data['authenticator']], data)
+            verrors.add_child(f'{schema_name}.attributes', attributes_verrors)
+            if not attributes_verrors:
+                credentials_verrors = await get_authenticator(data['authenticator']).validate_credentials(
+                    self.middleware, data['attributes'],
+                )
+                verrors.add_child(f'{schema_name}.attributes', credentials_verrors)
 
         if verrors:
             raise verrors
+
+    @private
+    async def extend(self, data):
+        data['attributes'] = mask_attributes(data['authenticator'], data['attributes'])
+        return data
+
+    @private
+    async def get_raw_instance(self, id):
+        return await self.middleware.call(
+            'datastore.query', self._config.datastore,
+            [['id', '=', id]], {'get': True},
+        )
 
     @accepts(
         Dict(
@@ -335,11 +377,20 @@ class DNSAuthenticatorService(CRUDService):
                 ]
             }
         """
-        old = await self._get_instance(id)
+        old = await self.get_raw_instance(id)
         new = old.copy()
-        new.update(data)
+        new.update({key: value for key, value in data.items() if key != 'attributes'})
 
-        await self.common_validation(new, 'dns_authenticator_update')
+        if 'attributes' in data:
+            authenticator = get_authenticator(old['authenticator'])
+            attributes = old['attributes'].copy()
+            for key, value in data['attributes'].items():
+                if key in authenticator.SECRET_FIELDS and value == SECRET_MASK:
+                    continue
+                attributes[key] = value
+            new['attributes'] = attributes
+
+        await self.common_validation(new, 'dns_authenticator_update', id)
 
         await self.middleware.call(
             'datastore.update',
@@ -390,99 +441,42 @@ class DNSAuthenticatorService(CRUDService):
     )
     @private
     def update_txt_record(self, data):
-
-        authenticator = self.middleware.call_sync('acme.dns.authenticator._get_instance', data['authenticator'])
-
-        return self.__getattribute__(
-            f'update_txt_record_{authenticator["authenticator"].lower()}'
-        )(
-            data['domain'],
-            messages.ChallengeBody.from_json(json.loads(data['challenge'])),
-            jose.JWKRSA.fields_from_json(json.loads(data['key'])),
-            **authenticator['attributes']
+        authenticator = self.middleware.call_sync(
+            'datastore.query', self._config.datastore,
+            [['id', '=', data['authenticator']]], {'get': True},
         )
+        domain, validation_name, validation_content = self.challenge_record(data)
+        return get_authenticator(authenticator['authenticator'])(
+            self.middleware, authenticator['attributes'],
+        ).perform(domain, validation_name, validation_content)
 
-    '''
-    Few rules for writing authenticator functions
-    1) The name must start with "update_txt_record_"
-    2) The authenticator name in function should be lowercase e.g "route53"
-    3) The first 3 arguments must be domain, challenge and key. Rest will be what the
-       credentials are required for authenticating and nothing else
-    4) In case update_txt_record is unsuccessful, CallError should be RAISED with appropriate
-       status/reason.
-    '''
-
+    @accepts(
+        Dict(
+            'cleanup_txt_record',
+            Int('authenticator', required=True),
+            Str('key', required=True, max_length=None),
+            Str('domain', required=True),
+            Str('challenge', required=True, max_length=None),
+        )
+    )
     @private
-    def update_txt_record_route53(self, domain, challenge, key, access_key_id, secret_access_key):
-        session = boto3.Session(
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key
+    def cleanup_txt_record(self, data):
+        authenticator = self.middleware.call_sync(
+            'datastore.query', self._config.datastore,
+            [['id', '=', data['authenticator']]], {'get': True},
         )
-        client = session.client('route53')
+        domain, validation_name, validation_content = self.challenge_record(data)
+        return get_authenticator(authenticator['authenticator'])(
+            self.middleware, authenticator['attributes'],
+        ).cleanup(domain, validation_name, validation_content)
 
-        # Finding zone id for the given domain
-        paginator = client.get_paginator('list_hosted_zones')
-        target_labels = domain.rstrip('.').split('.')
-        zones = []
-        try:
-            for page in paginator.paginate():
-                for zone in page['HostedZones']:
-                    if zone['Config']['PrivateZone']:
-                        continue
-
-                    candidate_labels = zone['Name'].rstrip('.').split('.')
-                    if candidate_labels == target_labels[-len(candidate_labels):]:
-                        zones.append((zone['Name'], zone['Id']))
-            if not zones:
-                raise CallError(
-                    f'Unable to find a Route53 hosted zone for {domain}'
-                )
-        except boto_exceptions.ClientError as e:
-            raise CallError(
-                f'Failed to get Hosted zones with provided credentials :{e}'
-            )
-
-        # Order the zones that are suffixes for our desired to domain by
-        # length, this puts them in an order like:
-        # ["foo.bar.baz.com", "bar.baz.com", "baz.com", "com"]
-        # And then we choose the first one, which will be the most specific.
-        zones.sort(key=lambda z: len(z[0]), reverse=True)
-        zone_id = zones[0][1]
-
-        try:
-            resp = client.change_resource_record_sets(
-                HostedZoneId=zone_id,
-                ChangeBatch={
-                    'Changes': [
-                        {
-                            'Action': 'UPSERT',
-                            'ResourceRecordSet': {
-                                'Name': challenge.validation_domain_name(domain),
-                                'ResourceRecords': [{'Value': f'"{challenge.validation(key)}"'}],
-                                'TTL': 3600,
-                                'Type': 'TXT'
-                            }
-                        }
-                    ],
-                    'Comment': f'{"Free" if self.middleware.call_sync("system.is_freenas") else "True"}'
-                               'NAS-dns-route53 certificate validation'
-                }
-            )
-        except boto_BaseClientException as e:
-            raise CallError(
-                f'Failed to update record sets : {e}'
-            )
-
-        """
-        Wait for a change to be propagated to all Route53 DNS servers.
-        https://docs.aws.amazon.com/Route53/latest/APIReference/API_GetChange.html
-        """
-        for unused_n in range(0, 120):
-            r = client.get_change(Id=resp['ChangeInfo']['Id'])
-            if r['ChangeInfo']['Status'] == 'INSYNC':
-                return resp['ChangeInfo']['Id']
-            time.sleep(5)
-
-        raise CallError(
-            f'Timed out waiting for Route53 change. Current status: {resp["ChangeInfo"]["Status"]}'
+    @staticmethod
+    @private
+    def challenge_record(data):
+        challenge = messages.ChallengeBody.from_json(json.loads(data['challenge']))
+        key = jose.JWKRSA.fields_from_json(json.loads(data['key']))
+        return (
+            data['domain'],
+            challenge.validation_domain_name(data['domain']),
+            challenge.validation(key),
         )

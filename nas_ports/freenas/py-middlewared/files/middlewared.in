@@ -24,7 +24,7 @@ middlewared_start() {
 	for o in ${middlewared_overlay_dirs}; do
 		overlay_dirs_arg="${overlay_dirs_arg} -o ${o}"
 	done
-	/sbin/ifconfig lo0 127.0.0.1 up
+	/sbin/ifconfig lo0 127.0.0.1/8 up
 	if checkyesno middlewared_debug; then
 		/usr/local/bin/tmux new-session -s middlewared -d
 		/usr/local/bin/tmux send -t middlewared "env PATH=$PATH:/usr/local/sbin:/usr/local/bin LC_ALL=en_US.UTF-8 /usr/local/bin/middlewared ${overlay_dirs_arg} -P" ENTER

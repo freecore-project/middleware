@@ -61,12 +61,13 @@ def test_06_wait_for_the_alert_and_get_the_alert_id(request):
         for line in GET("/alert/list/").json():
             if line['source'] == 'VolumeStatus':
                 alert_id = line['id']
-                assert True
                 break
         else:
+            # sleep here, not after the outer break where it was unreachable --
+            # otherwise this polls /alert/list/ flat out until the 120s timeout
+            sleep(1)
             continue
         break
-        sleep(1)
 
 
 def test_07_verify_degraded_pool_alert_list_exist(request):
@@ -137,8 +138,9 @@ def test_13_verify_the_pool_is_not_degraded(request):
 def test_14_wait_for_the_alert_to_dissapear(request):
     depends(request, ['degrade_pool'])
     while True:
-        if alert_id not in GET("/alert/list/").json():
-            assert True
+        # /alert/list/ returns a list of dicts, so `alert_id not in .json()`
+        # was always True and this test never waited for anything.
+        if alert_id not in [a['id'] for a in GET("/alert/list/").json()]:
             break
         sleep(1)
 
