@@ -32,12 +32,11 @@ class JobSharedLock(object):
     for this lock.
     """
 
-    def __init__(self, queue, name, *, loop=None):
+    def __init__(self, queue, name):
         self.queue = queue
         self.name = name
         self.jobs = set()
-        # Once we upgrade to python 3.10 and it starts crashing here, just revert a commit that introduced `loop=loop`
-        self.lock = asyncio.Lock(loop=loop)
+        self.lock = asyncio.Lock()
 
     def add_job(self, job):
         self.jobs.add(job)
@@ -111,7 +110,7 @@ class JobsQueue(object):
 
         lock = self.job_locks.get(name)
         if lock is None:
-            lock = JobSharedLock(self, name, loop=self.middleware.loop)
+            lock = JobSharedLock(self, name)
             self.job_locks[lock.name] = lock
 
         lock.add_job(job)
@@ -209,7 +208,7 @@ class Job(object):
     """
 
     def __init__(self, middleware, method_name, serviceobj, method, args, options, pipes, on_progress_cb):
-        self._finished = asyncio.Event(loop=middleware.loop)
+        self._finished = asyncio.Event()
         self.middleware = middleware
         self.method_name = method_name
         self.serviceobj = serviceobj
@@ -327,10 +326,22 @@ class Job(object):
         return self.result
 
     def abort(self):
+        if self.state in (State.SUCCESS, State.FAILED, State.ABORTED):
+            return
+
+        self.aborted = True
+        if self.state == State.WAITING:
+            return
+
+        if self.options.get('abortable'):
+            # The synchronous worker owns an external process tree.  Cancelling
+            # its asyncio wrapper would mark the job ABORTED and release its lock
+            # while that tree was still alive.  Let the worker observe the flag,
+            # reap its tree, and raise CancelledError itself.
+            return
+
         if self.loop is not None and self.future is not None:
             self.loop.call_soon_threadsafe(self.future.cancel)
-        elif self.state == State.WAITING:
-            self.aborted = True
 
     async def run(self, queue):
         """

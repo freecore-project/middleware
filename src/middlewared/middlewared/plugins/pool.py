@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from collections import deque
 import contextlib
 import enum
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 GELI_KEYPATH = '/data/geli'
 
-RE_HISTORY_ZPOOL_SCRUB_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+zpool (scrub|create)', re.MULTILINE)
+RE_HISTORY_ZPOOL_SCRUB_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+(py-libzfs: )?zpool (scrub|create)', re.MULTILINE)
 ZFS_CHECKSUM_CHOICES = [
     'ON', 'OFF', 'FLETCHER2', 'FLETCHER4', 'SHA256', 'SHA512', 'SKEIN',
 ]
@@ -57,6 +58,41 @@ ZFS_COMPRESSION_ALGORITHM_CHOICES = [
 ]
 ZPOOL_CACHE_FILE = '/data/zfs/zpool.cache'
 ZPOOL_KILLCACHE = '/data/zfs/killcache'
+
+
+# TrueNAS 13.3 supplied this ACL as the schema default for
+# ``pool.dataset.permission``.  Keep it scoped to SMB dataset creation: the internal development record
+# deliberately made an omitted ACL mean "no ACL update" for general callers.
+SMB_DATASET_DEFAULT_ACL = [
+    {
+        'tag': 'owner@',
+        'id': None,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'FULL_CONTROL'},
+        'flags': {'BASIC': 'INHERIT'},
+    },
+    {
+        'tag': 'group@',
+        'id': None,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'FULL_CONTROL'},
+        'flags': {'BASIC': 'INHERIT'},
+    },
+    {
+        'tag': 'GROUP',
+        'id': 545,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'MODIFY'},
+        'flags': {'BASIC': 'INHERIT'},
+    },
+    {
+        'tag': 'everyone@',
+        'id': None,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'TRAVERSE'},
+        'flags': {'BASIC': 'NOINHERIT'},
+    },
+]
 
 
 class ZfsDeadmanAlertClass(AlertClass, SimpleOneShotAlertClass):
@@ -252,8 +288,6 @@ class EncryptedDiskModel(sa.Model):
 
 class PoolService(CRUDService):
 
-    GELI_KEYPATH = '/data/geli'
-
     class Config:
         datastore = 'storage.volume'
         datastore_extend = 'pool.pool_extend'
@@ -352,11 +386,25 @@ class PoolService(CRUDService):
         except CallError:
             return False
 
-    @accepts(Int('id'))
+    @accepts(
+        Int('id'),
+        Dict(
+            'options',
+            Bool('confirm_rollback_loss', default=False),
+        ),
+    )
     @item_method
-    async def upgrade(self, oid):
+    async def upgrade(self, oid, options):
         """
         Upgrade pool of `id` to latest version with all feature flags.
+
+        Upgrading feature flags is irreversible, and while a return-to-13.3 rollback
+        window is open it is worse than that: 13.3 cannot import an upgraded data pool,
+        and cannot boot from an upgraded boot pool.  Rolling back afterwards would leave
+        the user on 13.3 unable to reach their data, so `confirm_rollback_loss` must be
+        set to proceed while a window is open (see the internal development record / the internal development record).
+        With no window open this is unchanged - no consent is required and nothing else
+        happens.
 
         .. examples(websocket)::
 
@@ -370,11 +418,27 @@ class PoolService(CRUDService):
                 "params": [1]
             }
         """
+        pool = await self.get_instance(oid)
+
+        rollback = await self.middleware.call('system.rollback.available')
+        if rollback['available'] and not options['confirm_rollback_loss']:
+            window = await self.middleware.call('system.rollback.config')
+            raise CallError(
+                f'Upgrading the feature flags on pool {pool["name"]!r} is irreversible and will end the '
+                f'rollback back to boot environment {window["origin_be"]!r}. TrueNAS 13.3 cannot import '
+                f'a pool whose '
+                f'feature flags have been upgraded, and cannot boot from an upgraded boot pool, so after '
+                f'this you will not be able to go back. Pass confirm_rollback_loss to proceed.'
+            )
+
         # Should we check first if upgrade is required ?
-        await self.middleware.call(
-            'zfs.pool.upgrade',
-            (await self.get_instance(oid))['name']
-        )
+        await self.middleware.call('zfs.pool.upgrade', pool['name'])
+
+        if rollback['available']:
+            # The window is now a promise we cannot keep - close it rather than leave it
+            # advertised, and let the close path release the pin and the snapshots.
+            await self.middleware.call('system.rollback.close', 'pool_upgraded')
+
         return True
 
     @private
@@ -445,6 +509,7 @@ class PoolService(CRUDService):
             pool.update({
                 'status': zpool['status'],
                 'scan': zpool['scan'],
+                'expand': zpool.get('expand'),
                 'topology': self.transform_topology(zpool['groups']),
                 'healthy': zpool['healthy'],
                 'status_detail': zpool['status_detail'],
@@ -454,6 +519,7 @@ class PoolService(CRUDService):
             pool.update({
                 'status': 'OFFLINE',
                 'scan': None,
+                'expand': None,
                 'topology': None,
                 'healthy': False,
                 'status_detail': None,
@@ -853,7 +919,7 @@ class PoolService(CRUDService):
                     'pool.convert_topology_to_vdevs', data['topology'], enc_options
                 )
                 if enc_options['enc_keypath']:
-                    # encrypt the disks
+                    # Encrypt disks added to existing GELI pools.
                     await self.middleware.call('pool.encrypt_disks', job, enc_disks, enc_options)
                 job.set_progress(90, 'Extending ZFS Pool')
 
@@ -864,7 +930,7 @@ class PoolService(CRUDService):
                     await self.middleware.call('pool.save_encrypteddisks', id, enc_disks, disks_cache)
 
                 if pool['encrypt'] >= 2:
-                    # FIXME: ask current passphrase and validate
+                    # Existing API does not ask for the current passphrase here.
                     await self.middleware.call('disk.geli_passphrase', pool, None)
                     await self.middleware.call(
                         'datastore.update', 'storage.volume', id, {'encrypt': 1}, {'prefix': 'vol_'},
@@ -1051,8 +1117,7 @@ class PoolService(CRUDService):
                 args = ('datastore.query', 'storage.encrypteddisk', [('encrypted_volume', '=', pool['id'])])
                 for prov in filter(lambda x: x['encrypted_provider'], (await self.middleware.call(*args))):
                     # Use encrypted_provider and not disk because a disk is not a guarantee
-                    # to point to correct device if its locked and its not in the system
-                    # (e.g. temporarily). See #50291
+                    # to point to correct device if it is locked or temporarily absent.
                     provider = prov['encrypted_provider']
                     if disk_name := await self.middleware.call('disk.label_to_disk', provider, False, cache):
                         for d in filter(lambda x: x['name'] == disk_name, disks_in_db):
@@ -1343,10 +1408,20 @@ class PoolService(CRUDService):
             with open('/sys/module/zfs/parameters/zfs_vdev_scrub_max_active', 'w') as f:
                 f.write(str(scrub_max_active))
         else:
-            sysctl.filter('vfs.zfs.resilver_min_time_ms')[0].value = resilver_min_time_ms
-            sysctl.filter('vfs.zfs.vdev.nia_credit')[0].value = nia_credit
-            sysctl.filter('vfs.zfs.vdev.nia_delay')[0].value = nia_delay
-            sysctl.filter('vfs.zfs.vdev.scrub_max_active')[0].value = scrub_max_active
+            self._set_zfs_sysctl('vfs.zfs.resilver_min_time_ms', 'vfs.zfs.resilver_min_time_ms', resilver_min_time_ms)
+            self._set_zfs_sysctl('vfs.zfs.vdev.nia_credit', 'vfs.zfs.vdev.nia_credit', nia_credit)
+            self._set_zfs_sysctl('vfs.zfs.vdev.nia_delay', 'vfs.zfs.vdev.nia_delay', nia_delay)
+            self._set_zfs_sysctl('vfs.zfs.vdev.scrub_max_active', 'vfs.zfs.vdev.scrub_max_active', scrub_max_active)
+
+    def _set_zfs_sysctl(self, new_name, old_name, value):
+        """Set a ZFS sysctl, trying the new dotted name first, then the old underscore name."""
+        result = sysctl.filter(new_name)
+        if not result:
+            result = sysctl.filter(old_name)
+        if result:
+            result[0].value = value
+        else:
+            self.logger.warning('ZFS sysctl not found: %s (or %s)', new_name, old_name)
 
     @accepts()
     @job()
@@ -1365,7 +1440,7 @@ class PoolService(CRUDService):
                 continue
             # Exclude pools with same guid as existing pools (in database)
             # It could be the pool is in the database but was exported/detached for some reason
-            # See #6808
+            # See the internal development record
             if pool['guid'] in existing_guids:
                 continue
             entry = {}
@@ -1854,6 +1929,21 @@ class PoolService(CRUDService):
 
         if os.path.exists(ZPOOL_CACHE_FILE):
             shutil.copy(ZPOOL_CACHE_FILE, zpool_cache_saved)
+
+        # The rollback capture has one safe point: data pools must be imported, but
+        # `.system` must not have been mounted by the pool-import checkpoint yet.
+        try:
+            self.middleware.call_sync('system.rollback.capture_on_boot')
+        except Exception:
+            # `capture_on_boot` consumes its marker and raises a visible one-shot alert.
+            # Losing rollback must not prevent the appliance itself from booting.
+            self.logger.error('Automatic captured-return creation failed', exc_info=True)
+
+        try:
+            self.middleware.call_sync('system.rollback.cleanup')
+        except Exception:
+            # Cleanup is idempotent and the hourly task will retry it.
+            self.logger.error('Captured-return cleanup failed during pool import', exc_info=True)
 
         self.middleware.call_sync('etc.generate_checkpoint', 'pool_import')
 
@@ -3155,7 +3245,9 @@ class PoolDatasetService(CRUDService):
         await self.middleware.call('zfs.dataset.mount', data['name'])
 
         if data['type'] == 'FILESYSTEM' and data['share_type'] == 'SMB':
-            await self.middleware.call('pool.dataset.permission', data['id'], {'mode': None})
+            await self.middleware.call('pool.dataset.permission', data['id'], {
+                'acl': copy.deepcopy(SMB_DATASET_DEFAULT_ACL),
+            })
 
         return await self.get_instance(data['id'])
 
@@ -3204,7 +3296,7 @@ class PoolDatasetService(CRUDService):
                 "msg": "method",
                 "method": "pool.dataset.update,
                 "params": ["tank/myuser", {
-                    "comments": "Dataset for myuser, UPDATE #1"
+                    "comments": "Dataset for myuser, UPDATE the internal development record"
                 }]
             }
         """
@@ -3502,36 +3594,7 @@ class PoolDatasetService(CRUDService):
                         ),
                     )
                 ],
-                default=[
-                    {
-                        "tag": "owner@",
-                        "id": None,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "FULL_CONTROL"},
-                        "flags": {"BASIC": "INHERIT"}
-                    },
-                    {
-                        "tag": "group@",
-                        "id": None,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "FULL_CONTROL"},
-                        "flags": {"BASIC": "INHERIT"}
-                    },
-                    {
-                        "tag": "GROUP",
-                        "id": 545,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "MODIFY"},
-                        "flags": {"BASIC": "INHERIT"}
-                    },
-                    {
-                        "tag": "everyone@",
-                        "id": None,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "TRAVERSE"},
-                        "flags": {"BASIC": "NOINHERIT"}
-                    },
-                ],
+                default=[],
             ),
             Dict(
                 'options',
