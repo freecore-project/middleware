@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import errno
 import pwd
@@ -120,6 +121,12 @@ class NISService(ConfigService):
         if state in ['EXITING', 'JOINING']:
             raise CallError(f'Current state of NIS service is: [{state}]. Wait until operation completes.', errno.EBUSY)
 
+        # Verify NIS/YP tools are available (may be absent in FreeBSD 15+)
+        for tool in ['/bin/domainname', '/usr/sbin/ypbind', '/usr/bin/ypwhich', '/usr/bin/ypcat']:
+            if not os.path.exists(tool):
+                await self.set_state(DSStatus['FAULTED'])
+                raise CallError(f'NIS requires {tool} which is not available on this system')
+
         await self.set_state(DSStatus['JOINING'])
         await self.middleware.call('etc.generate', 'rc')
         await self.middleware.call('etc.generate', 'pam')
@@ -151,7 +158,7 @@ class NISService(ConfigService):
         if mapname not in allowed_maps:
             raise CallError(f'{mapname}: not a supported map')
 
-        ypcat = subprocess.run(['ypcat', mapname.lower()], check=False, capture_output=True)
+        ypcat = subprocess.run(['/usr/bin/ypcat', mapname.lower()], check=False, capture_output=True)
         if ypcat.returncode != 0:
             raise CallError(f'{mapname}: failed to look up map: {ypcat.stderr.decode()}')
 
@@ -220,18 +227,37 @@ class NISService(ConfigService):
         await self.set_state(DSStatus['LEAVING'])
         ypbind = await run(['/usr/sbin/service', 'ypbind', 'onestop'], check=False)
         if ypbind.returncode != 0:
-            await self.set_state(DSStatus['FAULTED'])
             errmsg = ypbind.stderr.decode().strip()
             if 'ypbind not running' not in errmsg and 'no such process' not in errmsg:
+                await self.set_state(DSStatus['FAULTED'])
                 raise CallError(f'ypbind failed to stop: [{ypbind.stderr.decode().strip()}]')
 
+        domainname = await run(['/bin/domainname', ''], check=False)
+        if domainname.returncode != 0:
+            await self.set_state(DSStatus['FAULTED'])
+            raise CallError(f'Failed to clear NIS domain: [{domainname.stderr.decode().strip()}]')
+
         await self.middleware.call('cache.pop', 'NIS_State')
+        await self.middleware.call('cache.pop', 'NIS_cache')
+        try:
+            os.unlink('/var/db/system/.NIS_cache_backup')
+        except FileNotFoundError:
+            pass
+        except Exception:
+            self.logger.error(
+                'Failed to remove NIS cache backup. Non-existent users and groups may remain visible in webui '
+                'dropdown menus.',
+                exc_info=True,
+            )
+
+        # nsswitch.conf is state-sensitive. Mark NIS disabled before rendering it,
+        # otherwise the LEAVING state leaves stopped NIS lookups in the NSS path.
+        await self.set_state(DSStatus['DISABLED'])
+        await self.middleware.call('etc.generate', 'nss')
         await self.middleware.call('etc.generate', 'rc')
         await self.middleware.call('etc.generate', 'pam')
         await self.middleware.call('etc.generate', 'hostname')
-        await self.middleware.call('etc.generate', 'nss')
         await self.middleware.call('etc.generate', 'user')
-        await self.set_state(DSStatus['DISABLED'])
         self.logger.debug('NIS service successfully stopped. Setting state to DISABLED.')
         return True
 

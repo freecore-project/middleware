@@ -25,6 +25,8 @@ async def authenticate(middleware, req):
         twofactor_auth = await middleware.call('auth.twofactor.config')
         if twofactor_auth['enabled']:
             raise web.HTTPUnauthorized(text='HTTP Basic Auth is unavailable when OTP is enabled')
+        if (await middleware.call('auth.webauthn.config'))['enabled']:
+            raise web.HTTPUnauthorized(text='HTTP Basic Auth is unavailable when WebAuthn is enabled')
 
         try:
             username, password = base64.b64decode(auth[6:]).decode('utf8').split(':', 1)
@@ -182,6 +184,12 @@ class OpenAPIResource(object):
                 'type': 'http',
                 'scheme': 'basic'
             },
+            'api_key': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'description': 'FreeCORE API key. Paste the key without the Bearer prefix. '
+                               'Requests use the Authorization header.',
+            },
         }
 
     def add_path(self, path, operation, methodname, service_config):
@@ -327,13 +335,13 @@ class OpenAPIResource(object):
         result = {
             'openapi': '3.0.0',
             'info': {
-                'title': 'TrueNAS RESTful API',
+                'title': 'FreeCORE RESTful API',
                 'version': 'v2.0',
             },
             'paths': self._paths,
             'servers': servers,
             'components': self._components,
-            'security': [{'basic': []}],
+            'security': [{'basic': []}, {'api_key': []}],
         }
 
         resp = web.Response()
@@ -373,12 +381,21 @@ class Resource(object):
         if put:
             self.put = put
 
+        # aiohttp's default pattern for a `{name}` segment is `[^{}/]+`, and since
+        # 3.11 DynamicResource.resolve() matches it against the *decoded* path
+        # (`rel_url.path_safe`); 3.9 matched `rel_url.raw_path`, where a
+        # percent-encoded id carried no literal braces. Every disk identifier is
+        # `{serial}...` / `{serial_lunid}...` / `{uuid}...`, so on FB15 those ids
+        # stop matching and the request 404s before reaching a handler.
+        # Widen the router pattern only — `path` keeps `{id}` so the OpenAPI
+        # document and the `'{id}' in path` check in add_path() are unaffected.
+        route_path = path.replace('{id}', '{id:[^/]+}')
         for i in ('delete', 'get', 'post', 'put'):
             operation = getattr(self, i)
             if operation is None:
                 continue
-            self.rest.app.router.add_route(i.upper(), f'/api/v2.0/{path}', getattr(self, f'on_{i}'))
-            self.rest.app.router.add_route(i.upper(), f'/api/v2.0/{path}/', getattr(self, f'on_{i}'))
+            self.rest.app.router.add_route(i.upper(), f'/api/v2.0/{route_path}', getattr(self, f'on_{i}'))
+            self.rest.app.router.add_route(i.upper(), f'/api/v2.0/{route_path}/', getattr(self, f'on_{i}'))
             self.rest._openapi.add_path(path, i, operation, self.service_config)
             self.__map_method_params(operation)
 

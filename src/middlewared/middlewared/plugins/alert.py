@@ -80,24 +80,6 @@ class AlertSourceRunFailedOnBackupNodeAlertClass(AlertClass):
     exclude_from_list = True
 
 
-class AutomaticAlertFailedAlertClass(AlertClass, SimpleOneShotAlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "Failed to Notify iXsystems About Alert"
-    text = textwrap.dedent("""\
-        Creating an automatic alert for iXsystems about system %(serial)s failed: %(error)s.
-        Please contact iXsystems Support: https://www.ixsystems.com/support/
-
-        Alert:
-
-        %(alert)s
-    """)
-
-    exclude_from_list = True
-
-    deleted_automatically = False
-
-
 class TestAlertClass(AlertClass):
     category = AlertCategory.SYSTEM
     level = AlertLevel.CRITICAL
@@ -505,44 +487,6 @@ class AlertService(Service):
                     if alert.mail:
                         await self.middleware.call("mail.send", alert.mail)
 
-                if await self.middleware.call("system.is_enterprise"):
-                    new_proactive_support_alerts = [
-                        alert
-                        for alert in new_alerts
-                        if (
-                            alert.klass.proactive_support and
-                            (await as_.get_alert_class(alert)).get("proactive_support", True)
-                        )
-                    ]
-                    if new_proactive_support_alerts:
-                        if await self.middleware.call("support.is_available_and_enabled"):
-                            support = await self.middleware.call("support.config")
-                            msg = [f"* {alert.formatted}" for alert in new_proactive_support_alerts]
-
-                            serial = (await self.middleware.call("system.info"))["system_serial"]
-
-                            for name, verbose_name in await self.middleware.call("support.fields"):
-                                value = support[name]
-                                if value:
-                                    msg += ["", "{}: {}".format(verbose_name, value)]
-
-                            msg = "\n".join(msg)
-
-                            job = await self.middleware.call("support.new_ticket", {
-                                "title": "Automatic alert (%s)" % serial,
-                                "body": msg,
-                                "attach_debug": False,
-                                "category": "Hardware",
-                                "criticality": "Loss of Functionality",
-                                "environment": "Production",
-                                "name": "Automatic Alert",
-                                "email": "auto-support@ixsystems.com",
-                                "phone": "-",
-                            })
-                            await job.wait()
-                            if job.error:
-                                await self.middleware.call("alert.oneshot_create", "AutomaticAlertFailed",
-                                                           {"serial": serial, "alert": msg, "error": str(job.error)})
 
     def __uuid(self):
         return str(uuid.uuid4())
@@ -942,7 +886,7 @@ class AlertServiceService(CRUDService):
                     "enabled": true,
                     "type": "Mail",
                     "attributes": {
-                        "email": "dev@ixsystems.com"
+                        "email": "dev@freecore.org"
                     },
                     "settings": {
                         "VolumeVersion": "HOURLY"
@@ -1012,7 +956,7 @@ class AlertServiceService(CRUDService):
                     "enabled": true,
                     "type": "Mail",
                     "attributes": {
-                        "email": "dev@ixsystems.com"
+                        "email": "dev@freecore.org"
                     },
                     "settings": {}
                 }]

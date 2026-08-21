@@ -1,0 +1,4 @@
+PKG nginx
+SYSRC nginx_enable=YES
+CMD nginx -t
+SERVICE nginx restart

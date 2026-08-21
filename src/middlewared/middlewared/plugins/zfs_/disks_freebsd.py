@@ -13,7 +13,7 @@ class ZFSPoolService(Service, PoolDiskServiceBase):
     def get_disks(self, name):
         try:
             with ZFS() as zfs:
-                disks = [i.replace('/dev/', '').replace('.eli', '') for i in zfs.get(name).disks]
+                disks = [i.replace('/dev/', '').removesuffix('.eli') for i in zfs.get(name).disks]
         except Exception:
             self.logger.error('Failed to retrieve disks for %r', name, exc_info=True)
             return []

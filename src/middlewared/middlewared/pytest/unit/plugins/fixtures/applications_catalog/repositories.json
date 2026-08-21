@@ -1,0 +1,41 @@
+[
+  {
+    "name": "demo",
+    "owner": {"login": "daemonless"},
+    "html_url": "https://github.com/daemonless/demo",
+    "description": "A deterministic fixture application.",
+    "default_branch": "main",
+    "archived": false,
+    "disabled": false,
+    "private": false,
+    "visibility": "public",
+    "license": {"spdx_id": "BSD-2-Clause"},
+    "topics": ["container", "utilities"]
+  },
+  {
+    "name": "x86-demo",
+    "owner": {"login": "daemonless"},
+    "html_url": "https://github.com/daemonless/x86-demo",
+    "description": "An amd64-only fixture application.",
+    "default_branch": "main",
+    "archived": false,
+    "disabled": false,
+    "private": false,
+    "visibility": "public",
+    "license": {"spdx_id": "BSD-2-Clause"},
+    "topics": ["container", "utilities"]
+  },
+  {
+    "name": "base-demo",
+    "owner": {"login": "daemonless"},
+    "html_url": "https://github.com/daemonless/base-demo",
+    "description": "A non-installable base fixture.",
+    "default_branch": "main",
+    "archived": false,
+    "disabled": false,
+    "private": false,
+    "visibility": "public",
+    "license": {"spdx_id": "BSD-2-Clause"},
+    "topics": ["base", "container"]
+  }
+]
