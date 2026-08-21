@@ -6,6 +6,10 @@ from middlewared.alert.base import (AlertClass, AlertCategory, AlertLevel,
                                     Alert, ThreadedAlertSource, UnavailableException)
 
 
+def _get_kern_disks():
+    return sysctl.filter('kern.disks')[0].value
+
+
 class ReportingDbAlertClass(AlertClass):
     category = AlertCategory.REPORTING
     level = AlertLevel.WARNING
@@ -20,7 +24,7 @@ class ReportingDbAlertSource(ThreadedAlertSource):
         except FileNotFoundError:
             raise UnavailableException()
 
-        threshold = 1073741824 + len(sysctl.filter('kern.disks')[0].value.split()) * 1024 * 1024
+        threshold = 1073741824 + len(_get_kern_disks().split()) * 1024 * 1024
         if used > threshold:
             # zfs list reports in kibi/mebi/gibi(bytes) but
             # format_size() calculates in kilo/mega/giga by default

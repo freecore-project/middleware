@@ -190,7 +190,17 @@ def test_010_checking_to_see_if_nfs_service_is_running(request):
 def test_011_verify_smbclient_127_0_0_1_connection(request):
     depends(request, ["service_cifs_running", "ssh_password"], scope="session")
     cmd = 'smbclient -NL //127.0.0.1'
-    results = SSH_TEST(cmd, user, password, ip)
+    # Same smbd start-up race that protocols.SMB.connect() now retries: the cifs
+    # service reads RUNNING as soon as its rc script returns, seconds before
+    # smbd is listening, so this listing can come back empty. Observed passing
+    # on one 13.3 baseline run and failing on the next with an empty output and
+    # nothing on stderr but the ssh known-hosts warning. Retry the listing, then
+    # assert exactly as before -- a share that never appears still fails.
+    for _ in range(30):
+        results = SSH_TEST(cmd, user, password, ip)
+        if results['result'] and 'TestCifsSMB' in results['output']:
+            break
+        sleep(2)
     assert results['result'] is True, f'out: {results["output"]}, err: {results["stderr"]}'
     assert 'TestCifsSMB' in results['output'], f'out: {results["output"]}, err: {results["stderr"]}'
     assert 'My Test SMB Share' in results['output'], f'out: {results["output"]}, err: {results["stderr"]}'
@@ -506,6 +516,28 @@ def test_043_recyclebin_functional_test_subdir(request, smb_config):
                 assert val == b'boo'
 
 
+
+def win_dir_clock_24h(data_list):
+    """Normalize a Windows `dir` listing's time to 24-hour HH:MM.
+
+    `dir` prints a 12-hour clock with an AM/PM token on most locales
+    (['08/16/2026', '11:19', 'PM', ...]) and a bare 24-hour clock on
+    others. Convert only when the marker token is present, so both
+    locales compare correctly against strftime('%H:%M').
+    """
+    clock = data_list[1]
+    marker = data_list[2].upper() if len(data_list) > 2 else ''
+    if marker not in ('AM', 'PM'):
+        return clock
+    hh, mm = clock.split(':')
+    hh = int(hh)
+    if marker == 'PM' and hh != 12:
+        hh += 12
+    if marker == 'AM' and hh == 12:
+        hh = 0
+    return f'{hh:02d}:{mm}'
+
+
 @windows_host_cred
 def test_047_create_a_dir_and_a_file_in_windows(request):
     depends(request, ["service_cifs_running"], scope="session")
@@ -521,7 +553,7 @@ def test_047_create_a_dir_and_a_file_in_windows(request):
     regex = re.compile(r"^.*testfile.*", re.MULTILINE)
     data_list = regex.findall(results3['output'])[0].split()
     global created_time, created_date
-    created_time = data_list[1]
+    created_time = win_dir_clock_24h(data_list)
     created_date = data_list[0]
 
 
@@ -557,7 +589,7 @@ def test_048_mount_the_smb_share_robocopy_testdir_to_the_share_windows_mount(req
     regex = re.compile(r"^(?=.*testfile)(?!.*New).*", re.MULTILINE)
     data_list = regex.findall(cmd_results['output'])[0].split()
     global mounted_time, mounted_date
-    mounted_time = data_list[1]
+    mounted_time = win_dir_clock_24h(data_list)
     mounted_date = data_list[0]
 
 

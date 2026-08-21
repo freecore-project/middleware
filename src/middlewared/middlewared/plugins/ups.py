@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import datetime
 import dateutil.tz
@@ -6,8 +7,10 @@ import io
 import os
 import re
 import syslog
+import time
 import socket
 
+from middlewared.plugins.service_.services.base_freebsd import freebsd_service
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str
 from middlewared.service import private, SystemServiceService, ValidationErrors
 import middlewared.sqlalchemy as sa
@@ -22,6 +25,12 @@ elif osc.IS_LINUX:
 
 RE_TEST_IN_PROGRESS = re.compile(r'ups.test.result:\s*TestInProgress')
 RE_UPS_STATUS = re.compile(r'ups.status: (.*)')
+
+# the internal development record (Codeberg freecore#111): how long after system.ready the
+# UPS service keeps retrying a driver/upsd start that failed during rc, and how often.
+UPS_BOOT_RETRY_INTERVAL = 20
+UPS_BOOT_RETRY_DEADLINE = 600
+UPSMON_PIDFILE = '/var/db/nut/upsmon.pid'
 
 
 class UPSModel(sa.Model):
@@ -391,7 +400,78 @@ class UPSService(SystemServiceService):
         else:
             self.middleware.logger.debug(f'Unrecognized UPS notification event: {notify_type}')
 
+    @private
+    async def boot_retry_wanted(self):
+        """
+        Whether the half-started stack the internal development record heals is still there and
+        still ours to heal. Read again before every attempt, so disabling the service,
+        switching it to SLAVE or stopping it by hand during the retry window ends the
+        retries instead of being undone by them.
+        """
+        if not await self.middleware.call(
+            'datastore.query', 'services.services', [('srv_service', '=', 'ups'), ('srv_enable', '=', True)]
+        ):
+            return False
+        if (await self.config())['mode'] != 'MASTER':
+            return False
+        # rc starts upsmon at boot whatever the UPS does. If it is gone, the service was
+        # stopped by hand (or never started) and it is not ours to bring back.
+        upsmon = await run('pgrep', '-F', UPSMON_PIDFILE, 'upsmon', check=False)
+        return upsmon.returncode == 0
+
+    @private
+    async def boot_retry(self):
+        """
+        the internal development record (Codeberg freecore#111): at boot the rc `nut` script
+        starts the UPS driver in its precmd; a network UPS (snmp-ups, netxml-ups) that
+        is not reachable yet because the trunk is still negotiating makes that precmd
+        fail, rc then never starts upsd, and nothing retries once the network is up --
+        `upsmon` just logs "connect failed" every five seconds until someone restarts
+        the service by hand. Inherited from 13.3 unchanged. Keep trying to start `nut`
+        for a bounded time after system.ready; a healthy boot returns on the first
+        check without touching anything. Only `nut` (driver + upsd) is retried: upsmon
+        and upslog do not depend on the UPS being reachable and are left alone, and
+        `service.start` is not used because its before_start hook would dismiss the
+        COMMBAD alert upsmon has raised while the service is still broken.
+        """
+        deadline = time.monotonic() + UPS_BOOT_RETRY_DEADLINE
+        attempt = 0
+        while True:
+            if await self.middleware.call('service.started', 'ups'):
+                if attempt:
+                    self.logger.info('UPS service came up after %d retr%s', attempt, 'y' if attempt == 1 else 'ies')
+                return
+            if not await self.boot_retry_wanted():
+                if attempt:
+                    self.logger.info(
+                        'UPS boot retry stopped after %d attempt(s): the UPS service was stopped, '
+                        'disabled or switched to SLAVE', attempt,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                self.logger.error(
+                    'UPS service still not running %d s after boot (%d start attempts); giving up. '
+                    'Check that the UPS is reachable and start the UPS service.',
+                    UPS_BOOT_RETRY_DEADLINE, attempt,
+                )
+                return
+            attempt += 1
+            self.logger.info('UPS service is not running after boot; starting nut again (attempt %d)', attempt)
+            await freebsd_service('nut', 'onestart')
+            await asyncio.sleep(UPS_BOOT_RETRY_INTERVAL)
+
+
+async def _ups_system_ready(middleware, event_type, args):
+    if args['id'] != 'ready':
+        return
+    try:
+        await middleware.call('ups.boot_retry')
+    except Exception:
+        middleware.logger.error('UPS boot retry failed', exc_info=True)
+
 
 async def setup(middleware):
     # Let's delete all UPS related alerts when starting middlewared ensuring we don't have any leftovers
     await middleware.call('ups.dismiss_alerts')
+    # the internal development record: retry a UPS start that failed during rc once boot has finished.
+    middleware.event_subscribe('system', _ups_system_ready)

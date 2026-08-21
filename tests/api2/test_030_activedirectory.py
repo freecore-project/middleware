@@ -12,14 +12,20 @@ from auto_config import pool_name, ip, hostname, user, password
 from functions import GET, POST, PUT, DELETE, SSH_TEST, wait_on_job, cmd_test
 
 try:
-    from config import AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer
+    from config import (
+        AD_CREATECOMPUTER, AD_DOMAIN, AD_NETBIOS, ADPASSWORD, ADUSERNAME,
+        ADNameServer,
+    )
     # AD_USER is use for API call and CMD_AD_USER for command
     # r-string is use for raw string to stop pytest and flake8 complaining
     # about \
-    AD_USER = fr"AD02\{ADUSERNAME.lower()}"
-    CMD_AD_USER = fr"AD02\\{ADUSERNAME.lower()}"
+    AD_USER = fr"{AD_NETBIOS}\{ADUSERNAME.lower()}"
+    CMD_AD_USER = fr"{AD_NETBIOS}\\{ADUSERNAME.lower()}"
 except ImportError:
-    Reason = 'ADNameServer AD_DOMAIN, ADPASSWORD, or/and ADUSERNAME are missing in config.py"'
+    Reason = (
+        'ADNameServer, AD_DOMAIN, ADPASSWORD, ADUSERNAME, AD_NETBIOS, '
+        'or/and AD_CREATECOMPUTER are missing in config.py'
+    )
     pytestmark = pytest.mark.skip(reason=Reason)
 else:
     from auto_config import dev_test
@@ -139,6 +145,7 @@ def test_10_enabling_activedirectory(request):
         "bindname": ADUSERNAME,
         "domainname": AD_DOMAIN,
         "netbiosname": hostname,
+        "createcomputer": AD_CREATECOMPUTER,
         "dns_timeout": 15,
         "verbose_logging": True,
         "enable": True
@@ -409,6 +416,7 @@ def test_42_re_enable_activedirectory(request):
         "bindname": ADUSERNAME,
         "domainname": AD_DOMAIN,
         "netbiosname": hostname,
+        "createcomputer": AD_CREATECOMPUTER,
         "enable": True
     }
     results = PUT("/activedirectory/", payload)

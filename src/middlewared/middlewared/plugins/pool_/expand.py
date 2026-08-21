@@ -1,7 +1,12 @@
 import shutil
 import subprocess
 
-import sysctl
+try:
+    import sysctl
+    HAS_SYSCTL = True
+except ImportError:
+    HAS_SYSCTL = False
+
 from middlewared.job import Pipes
 from middlewared.service import CallError, item_method, job, Service
 from middlewared.schema import accepts, Dict, Int, Str
@@ -39,8 +44,9 @@ class PoolService(Service):
 
         all_partitions = {p['name']: p for p in await self.middleware.call('disk.list_all_partitions')}
 
+        original_debugflags = self._get_geom_debugflags()
         try:
-            sysctl.filter('kern.geom.debugflags')[0].value = 16
+            self._set_geom_debugflags(original_debugflags | 0x10)
             geli_resize = []
             vdevs = []
             try:
@@ -83,7 +89,7 @@ class PoolService(Service):
                 if geli_resize:
                     await self.__geli_resize(pool, geli_resize, options)
         finally:
-            sysctl.filter('kern.geom.debugflags')[0].value = 0
+            self._set_geom_debugflags(original_debugflags)
 
         # spare/cache devices cannot be expanded
         # We resize them anyways, for cache devices, whenever we are going to import the pool
@@ -100,6 +106,10 @@ class PoolService(Service):
 
     async def _resize_disk(self, part_data, encrypted_pool, geli_resize):
         partition_number = part_data['partition_number']
+        geli_autoresize = False
+        if encrypted_pool and part_data['encrypted_provider']:
+            geli_autoresize = await self.__geli_autoresize_enabled(part_data['encrypted_provider'])
+
         if part_data['disk'].startswith(('da', 'ada', 'nda', 'sdda', 'cd')):
             try:
                 await run('camcontrol', 'reprobe', part_data['disk'])
@@ -110,7 +120,12 @@ class PoolService(Service):
         await run('gpart', 'recover', part_data['disk'])
         await run('gpart', 'resize', '-a', '4k', '-i', str(partition_number), part_data['disk'])
 
-        if encrypted_pool:
+        if encrypted_pool and geli_autoresize:
+            self.logger.info(
+                'GELI provider %r has AUTORESIZE enabled; skipping offline geli resize',
+                part_data['encrypted_provider']
+            )
+        elif encrypted_pool:
             geli_resize_cmd = ('geli', 'resize', '-a', '4k', '-s', str(part_data['size']), part_data['name'])
             rollback_cmd = (
                 'gpart', 'resize', '-a', '4k', '-i', str(partition_number),
@@ -123,6 +138,38 @@ class PoolService(Service):
             )
             self.logger.warning('Or to resize provider back: %r', join_commandline(rollback_cmd))
             geli_resize.append((geli_resize_cmd, rollback_cmd))
+
+    def _get_geom_debugflags(self):
+        if HAS_SYSCTL:
+            return int(sysctl.filter('kern.geom.debugflags')[0].value)
+
+        cp = subprocess.run(
+            ['sysctl', '-n', 'kern.geom.debugflags'],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return int(cp.stdout.strip())
+
+    def _set_geom_debugflags(self, value):
+        if HAS_SYSCTL:
+            sysctl.filter('kern.geom.debugflags')[0].value = int(value)
+        else:
+            subprocess.run(['sysctl', f'kern.geom.debugflags={int(value)}'], check=True)
+
+    async def __geli_autoresize_enabled(self, provider):
+        cp = await run('geli', 'list', provider, check=False, encoding='utf-8', errors='ignore')
+        if cp.returncode != 0:
+            self.logger.debug('Unable to query GELI flags for %r: %s', provider, cp.stderr.strip())
+            return False
+
+        for line in cp.stdout.splitlines():
+            key, _, value = line.partition(':')
+            if key.strip() == 'Flags':
+                return 'AUTORESIZE' in value.replace(',', ' ').split()
+
+        return False
 
     async def __geli_resize(self, pool, geli_resize, options):
         failed_rollback = []

@@ -10,8 +10,32 @@
 . /etc/rc.freenas
 
 readonly UPDATE_FAILED_LOG="/data/update.failed"
-HBA_FIRMWARE_UPDATE="/data/.hba_firmware_update"
+readonly ROLLBACK_ARRIVAL_SENTINEL="/data/system-rollback.arrival"
 REBOOT_REQUIRED=0
+
+
+record_rollback_arrival()
+{
+	local arrival recorded_at temporary
+
+	arrival="unknown"
+	if [ -f "$CD_UPGRADE_SENTINEL" ]; then
+		arrival="cd_upgrade"
+	fi
+	if ! recorded_at=$(/bin/date +%s); then
+		return 1
+	fi
+
+	temporary="${ROLLBACK_ARRIVAL_SENTINEL}.$$"
+	if ! (umask 077 && printf '%s %s\n' "$arrival" "$recorded_at" > "$temporary"); then
+		rm -f "$temporary"
+		return 1
+	fi
+	if ! mv -f "$temporary" "$ROLLBACK_ARRIVAL_SENTINEL"; then
+		rm -f "$temporary"
+		return 1
+	fi
+}
 
 
 db_update_real()
@@ -59,6 +83,7 @@ handle_error()
 	echo "Reverting to previous state"
 
 	rm -f $NEED_UPDATE_SENTINEL
+	rm -f $ROLLBACK_ARRIVAL_SENTINEL
 	mv ${FREENAS_CONFIG}.bak ${FREENAS_CONFIG}
 	if [ -f /data/pwenc_secret.bak ]; then
 		mv /data/pwenc_secret.bak /data/pwenc_secret
@@ -84,38 +109,6 @@ EOF
 
 db_update()
 {
-	if [ -f ${HBA_FIRMWARE_UPDATE} ]; then
-		mount -uw /
-		if [ -f /usr/local/sbin/firmware_update.py ]; then
-			LD_LIBRARY_PATH=/usr/local/lib /usr/local/bin/python /usr/local/sbin/firmware_update.py
-			if [ $? -eq 0 ]; then
-				# Users often wonder why a 3rd reboot occurs on their system
-				# when they upgrade their box. This is the reason why.
-				# To keep the long, drawn out story as short as possible
-				# and to maintain the fickle state that my mind is in
-				# after troubleshooting upgrade code for an entire day,
-				# /update-scripts gets created on upgrade by default
-				# in the Installer.py code (freenas-update).
-				# ix-update-scripts runs before this script and reboots
-				# the box before this rc script gets called.
-				# So a 2nd reboot occurs, and if the system that is being
-				# upgraded also has a SAS HBA card that received a
-				# firmware upgrade, then we set this variable to 1. As
-				# you may already guess, a 3rd reboot occurs. This will
-				# make you drink, if you don't already and/or step away
-				# from the computer and make you question your life choices.
-				REBOOT_REQUIRED=1
-			fi
-		else
-			# The auto firmware update tool is only in TrueNAS
-			# FreeNAS users will mostly be happy that FreeNAS doesn't
-			# muck with their HBA firmware...because the chance of bricking
-			# a random card is a non-zero number.  (Besides, tracking down
-			# the firmware for every embedded Avago card out there is not
-			# realistic.)
-			rm ${HBA_FIRMWARE_UPDATE}
-		fi
-	fi
 			
 	if [ ! -f $NEED_UPDATE_SENTINEL ]; then
 		if [ ${REBOOT_REQUIRED} -eq 1 ]; then
@@ -152,6 +145,13 @@ db_update()
 	if [ $is_upload -eq 1 ]; then
 		/usr/local/bin/sqlite3 ${FREENAS_CONFIG} "REPLACE INTO system_keyvalue (key, value) VALUES ('run_migration', 'true')"
 		/usr/local/bin/sqlite3 ${FREENAS_CONFIG} "UPDATE system_update SET upd_train = ''"
+	else
+		# Preserve the update kind across the reboot that consumes need-update.
+		# Config restores also use need-update, but do not create a boot environment
+		# and must never open an automatic rollback window.
+		if ! record_rollback_arrival; then
+			echo "WARNING: could not record automatic rollback arrival path"
+		fi
 	fi
 
 	rm -f $NEED_UPDATE_SENTINEL

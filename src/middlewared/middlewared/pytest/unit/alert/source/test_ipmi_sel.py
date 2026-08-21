@@ -2,11 +2,12 @@ import asyncio
 from datetime import datetime
 import textwrap
 
-from mock import ANY, Mock
+from mock import ANY, AsyncMock, Mock, patch
 import pytest
 
 from middlewared.alert.source.ipmi_sel import (
-    IPMISELRecord, parse_ipmitool_output, parse_sel_information, remove_deasserted_records,
+    IPMISELRecord, IpmiTool, parse_ipmitool_output, parse_ipmi_sel_datetime, parse_sel_information,
+    remove_deasserted_records,
     IPMISELAlertClass, IPMISELSpaceLeftAlertClass,
     IPMISELAlertSource, IPMISELSpaceLeftAlertSource,
     Alert
@@ -36,6 +37,98 @@ def test__parse_ipmitool_output():
         direction="Asserted",
         verbose="Reading 144 > Threshold 81 degrees C"
     )
+
+
+def test__parse_ipmitool_output__ipmitool_1_8_19():
+    # ipmitool 1.8.19 formats the date with strftime "%x" and the time with "%X %Z": the time carries
+    # a zone name, and the year has four digits (en_US.UTF-8) or two (C locale, which is what the
+    # alert source pins). 1.8.18 printed the bare "MM/DD/YYYY" / "HH:MM:SS" shape above.
+    events = parse_ipmitool_output(textwrap.dedent("""\
+        1ce,07/15/2026,21:02:53 CEST,Battery CMOS Battery,Failed,Deasserted
+        1ff,08/15/26,23:45:40 UTC,Power Supply Status,Power Supply AC lost,Asserted
+        200,08/16/26,01:45:40 CEST,Memory Mem ECC Warning,Transition to Critical from less severe,Asserted,Verbose text
+    """))
+
+    assert events == [
+        IPMISELRecord(
+            id=0x1ce,
+            datetime=datetime(2026, 7, 15, 21, 2, 53),
+            sensor="Battery CMOS Battery",
+            event="Failed",
+            direction="Deasserted",
+            verbose=None,
+        ),
+        IPMISELRecord(
+            id=0x1ff,
+            datetime=datetime(2026, 8, 15, 23, 45, 40),
+            sensor="Power Supply Status",
+            event="Power Supply AC lost",
+            direction="Asserted",
+            verbose=None,
+        ),
+        IPMISELRecord(
+            id=0x200,
+            datetime=datetime(2026, 8, 16, 1, 45, 40),
+            sensor="Memory Mem ECC Warning",
+            event="Transition to Critical from less severe",
+            direction="Asserted",
+            verbose="Verbose text",
+        ),
+    ]
+
+
+def test__parse_ipmitool_output__skips_malformed_rows():
+    events = parse_ipmitool_output(textwrap.dedent("""\
+        1,Pre-Init,0000000001,Event Logging Disabled SEL,Log area reset/cleared,Asserted
+        2,not a date,23:45:40 UTC,Power Supply Status,Power Supply AC lost,Asserted
+        3,08/15/2026,23:45:41 UTC,Power Supply Status,Power Supply AC lost,Deasserted
+    """))
+
+    assert [e.id for e in events] == [3]
+
+
+@pytest.mark.parametrize("date,time,result", [
+    ("08/15/2026", "23:45:40", datetime(2026, 8, 15, 23, 45, 40)),
+    ("08/15/2026", "23:45:40 UTC", datetime(2026, 8, 15, 23, 45, 40)),
+    ("08/15/26", "23:45:40 UTC", datetime(2026, 8, 15, 23, 45, 40)),
+    ("08/16/2026", "01:45:40 CEST", datetime(2026, 8, 16, 1, 45, 40)),
+    (" 08/15/2026", " 23:45:40 UTC", datetime(2026, 8, 15, 23, 45, 40)),
+])
+def test__parse_ipmi_sel_datetime(date, time, result):
+    assert parse_ipmi_sel_datetime(date, time) == result
+
+
+@pytest.mark.parametrize("date,time", [
+    ("15/08/2026", "23:45:40 UTC"),
+    ("08/15/2026", "23:45"),
+    ("Pre-Init", "0000000001"),
+])
+def test__parse_ipmi_sel_datetime__rejects(date, time):
+    with pytest.raises(ValueError):
+        parse_ipmi_sel_datetime(date, time)
+
+
+@pytest.mark.asyncio
+async def test_ipmi_sel_alert_source__runs_ipmitool_in_utc():
+    middleware = Mock()
+    middleware.run_in_thread = AsyncMock(return_value=True)
+
+    source = IPMISELAlertSource(middleware)
+    source._produce_alerts_for_ipmitool_output = AsyncMock(return_value=[])
+
+    with patch("middlewared.alert.source.ipmi_sel.ipmitool", AsyncMock(return_value="")) as ipmitool:
+        await source.check()
+
+    ipmitool.assert_called_once_with(["-Z", "-c", "sel", "elist"])
+
+
+@pytest.mark.asyncio
+async def test_ipmitool__pins_the_locale():
+    with patch("middlewared.alert.source.ipmi_sel.run", AsyncMock(return_value=Mock(returncode=0, stdout=""))) as run:
+        await IpmiTool()(["-Z", "-c", "sel", "elist"])
+
+    assert run.call_args.args[0] == ["ipmitool", "-Z", "-c", "sel", "elist"]
+    assert run.call_args.kwargs["env"]["LC_ALL"] == "C"
 
 
 def test__parse_sel_information():

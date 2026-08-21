@@ -15,7 +15,7 @@ from middlewared.client import Client
 
 
 def get_Kstat():
-    Kstats = ["kstat.zfs.misc.arcstats", "vfs.zfs.version.spa"]
+    Kstats = ["kstat.zfs.misc.arcstats"]
     Kstat = {}
     for kstat in Kstats:
         for s in sysctl.filter(kstat):
@@ -27,36 +27,35 @@ def get_Kstat():
     return Kstat
 
 
+def kstat_get(kstat_dict, key, fallback_key=None, default=Decimal(0)):
+    """Safely get a kstat value with optional fallback key for OpenZFS compat."""
+    if key in kstat_dict:
+        return kstat_dict[key]
+    if fallback_key and fallback_key in kstat_dict:
+        return kstat_dict[fallback_key]
+    return default
+
+
 def get_arc_efficiency(Kstat):
     output = {}
 
-    if "vfs.zfs.version.spa" not in Kstat:
-        return
+    if "kstat.zfs.misc.arcstats.hits" not in Kstat:
+        return {}
 
-    arc_hits = Kstat["kstat.zfs.misc.arcstats.hits"]
-    arc_misses = Kstat["kstat.zfs.misc.arcstats.misses"]
-    demand_data_hits = Kstat["kstat.zfs.misc.arcstats.demand_data_hits"]
-    demand_data_misses = Kstat["kstat.zfs.misc.arcstats.demand_data_misses"]
-    demand_metadata_hits = Kstat[
-        "kstat.zfs.misc.arcstats.demand_metadata_hits"
-    ]
-    demand_metadata_misses = Kstat[
-        "kstat.zfs.misc.arcstats.demand_metadata_misses"
-    ]
-    mfu_ghost_hits = Kstat["kstat.zfs.misc.arcstats.mfu_ghost_hits"]
-    mfu_hits = Kstat["kstat.zfs.misc.arcstats.mfu_hits"]
-    mru_ghost_hits = Kstat["kstat.zfs.misc.arcstats.mru_ghost_hits"]
-    mru_hits = Kstat["kstat.zfs.misc.arcstats.mru_hits"]
-    prefetch_data_hits = Kstat["kstat.zfs.misc.arcstats.prefetch_data_hits"]
-    prefetch_data_misses = Kstat[
-        "kstat.zfs.misc.arcstats.prefetch_data_misses"
-    ]
-    prefetch_metadata_hits = Kstat[
-        "kstat.zfs.misc.arcstats.prefetch_metadata_hits"
-    ]
-    prefetch_metadata_misses = Kstat[
-        "kstat.zfs.misc.arcstats.prefetch_metadata_misses"
-    ]
+    arc_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.hits")
+    arc_misses = kstat_get(Kstat, "kstat.zfs.misc.arcstats.misses")
+    demand_data_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.demand_data_hits")
+    demand_data_misses = kstat_get(Kstat, "kstat.zfs.misc.arcstats.demand_data_misses")
+    demand_metadata_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.demand_metadata_hits")
+    demand_metadata_misses = kstat_get(Kstat, "kstat.zfs.misc.arcstats.demand_metadata_misses")
+    mfu_ghost_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.mfu_ghost_hits")
+    mfu_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.mfu_hits")
+    mru_ghost_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.mru_ghost_hits")
+    mru_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.mru_hits")
+    prefetch_data_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.prefetch_data_hits")
+    prefetch_data_misses = kstat_get(Kstat, "kstat.zfs.misc.arcstats.prefetch_data_misses")
+    prefetch_metadata_hits = kstat_get(Kstat, "kstat.zfs.misc.arcstats.prefetch_metadata_hits")
+    prefetch_metadata_misses = kstat_get(Kstat, "kstat.zfs.misc.arcstats.prefetch_metadata_misses")
 
     anon_hits = arc_hits - (
         mfu_hits + mru_hits + mfu_ghost_hits + mru_ghost_hits
@@ -205,8 +204,8 @@ def calculate_allocation_units(*args):
 
 
 def get_zfs_arc_miss_percent(kstat):
-    arc_hits = kstat["kstat.zfs.misc.arcstats.hits"]
-    arc_misses = kstat["kstat.zfs.misc.arcstats.misses"]
+    arc_hits = kstat_get(kstat, "kstat.zfs.misc.arcstats.hits")
+    arc_misses = kstat_get(kstat, "kstat.zfs.misc.arcstats.misses")
     arc_read = arc_hits + arc_misses
     if arc_read > 0:
         hit_percent = float(100 * arc_hits / arc_read)
@@ -369,10 +368,13 @@ class ZpoolIoThread(threading.Thread):
 
 
 def readZilOpsCount() -> int:
-    return (
-        sysctl.filter("kstat.zfs.misc.zil.zil_itx_metaslab_normal_count")[0].value +
-        sysctl.filter("kstat.zfs.misc.zil.zil_itx_metaslab_slog_count")[0].value
-    )
+    total = 0
+    for name in ("kstat.zfs.misc.zil.zil_itx_metaslab_normal_count",
+                 "kstat.zfs.misc.zil.zil_itx_metaslab_slog_count"):
+        result = sysctl.filter(name)
+        if result:
+            total += result[0].value
+    return total
 
 
 class ZilstatThread(threading.Thread):
@@ -623,21 +625,23 @@ if __name__ == "__main__":
             kstat = get_Kstat()
             arc_efficiency = get_arc_efficiency(kstat)
 
-            zfs_arc_size.update(kstat["kstat.zfs.misc.arcstats.size"] / 1024)
-            zfs_arc_meta.update(kstat["kstat.zfs.misc.arcstats.arc_meta_used"] / 1024)
-            zfs_arc_data.update(kstat["kstat.zfs.misc.arcstats.data_size"] / 1024)
-            zfs_arc_hits.update(kstat["kstat.zfs.misc.arcstats.hits"] % 2 ** 32)
-            zfs_arc_misses.update(kstat["kstat.zfs.misc.arcstats.misses"] % 2 ** 32)
-            zfs_arc_c.update(kstat["kstat.zfs.misc.arcstats.c"] / 1024)
+            zfs_arc_size.update(kstat_get(kstat, "kstat.zfs.misc.arcstats.size") / 1024)
+            # OpenZFS 2.2+ renamed arc_meta_used to metadata_size
+            zfs_arc_meta.update(kstat_get(kstat, "kstat.zfs.misc.arcstats.metadata_size",
+                                          "kstat.zfs.misc.arcstats.arc_meta_used") / 1024)
+            zfs_arc_data.update(kstat_get(kstat, "kstat.zfs.misc.arcstats.data_size") / 1024)
+            zfs_arc_hits.update(kstat_get(kstat, "kstat.zfs.misc.arcstats.hits") % 2 ** 32)
+            zfs_arc_misses.update(kstat_get(kstat, "kstat.zfs.misc.arcstats.misses") % 2 ** 32)
+            zfs_arc_c.update(kstat_get(kstat, "kstat.zfs.misc.arcstats.c") / 1024)
             zfs_arc_miss_percent.update(str(get_zfs_arc_miss_percent(kstat)).encode("ascii"))
             zfs_arc_cache_hit_ratio.update(str(arc_efficiency["cache_hit_ratio"]["per"][:-1]).encode("ascii"))
             zfs_arc_cache_miss_ratio.update(str(arc_efficiency["cache_miss_ratio"]["per"][:-1]).encode("ascii"))
 
-            zfs_l2arc_hits.update(int(kstat["kstat.zfs.misc.arcstats.l2_hits"] % 2 ** 32))
-            zfs_l2arc_misses.update(int(kstat["kstat.zfs.misc.arcstats.l2_misses"] % 2 ** 32))
-            zfs_l2arc_read.update(int(kstat["kstat.zfs.misc.arcstats.l2_read_bytes"] / 1024 % 2 ** 32))
-            zfs_l2arc_write.update(int(kstat["kstat.zfs.misc.arcstats.l2_write_bytes"] / 1024 % 2 ** 32))
-            zfs_l2arc_size.update(int(kstat["kstat.zfs.misc.arcstats.l2_asize"] / 1024))
+            zfs_l2arc_hits.update(int(kstat_get(kstat, "kstat.zfs.misc.arcstats.l2_hits") % 2 ** 32))
+            zfs_l2arc_misses.update(int(kstat_get(kstat, "kstat.zfs.misc.arcstats.l2_misses") % 2 ** 32))
+            zfs_l2arc_read.update(int(kstat_get(kstat, "kstat.zfs.misc.arcstats.l2_read_bytes") / 1024 % 2 ** 32))
+            zfs_l2arc_write.update(int(kstat_get(kstat, "kstat.zfs.misc.arcstats.l2_write_bytes") / 1024 % 2 ** 32))
+            zfs_l2arc_size.update(int(kstat_get(kstat, "kstat.zfs.misc.arcstats.l2_asize") / 1024))
 
             if zilstat_1_thread:
                 zfs_zilstat_ops1.update(zilstat_1_thread.value)

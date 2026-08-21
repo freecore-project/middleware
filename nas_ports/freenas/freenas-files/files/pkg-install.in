@@ -16,23 +16,14 @@ post-install()
                 mkdir -p /data
         fi
 
-        env FREENAS_INSTALL=yes /usr/local/sbin/migrate93 -f /data/freenas-v1.db
-        # Lets be evil here and kill pkg(8) if this fails
-        # because pkg does not check return code of POST-INSTALL script
-        if [ $? -ne 0 ]; then
-                /usr/bin/procstat -h $$|awk '{print $2}'|xargs kill -9
-        fi
-
-        env FREENAS_INSTALL=yes /usr/local/sbin/migrate113 -f /data/freenas-v1.db
-        # Same as before
-        if [ $? -ne 0 ]; then
-                /usr/bin/procstat -h $$|awk '{print $2}'|xargs kill -9
-        fi
-
+        # TrueNAS 15.0 is fresh-install only (no 13.x upgrade path). Legacy
+        # migrate93 / migrate113 (Py2 + Django 1.x) have been removed.
+        # /usr/local/sbin/migrate builds the factory DB from SQLAlchemy
+        # models and stamps alembic HEAD.
         env FREENAS_INSTALL=yes /usr/local/sbin/migrate
-        # Same as before
         if [ $? -ne 0 ]; then
-                /usr/bin/procstat -h $$|awk '{print $2}'|xargs kill -9
+                echo "migrate script failed - aborting POST-INSTALL" >&2
+                exit 1
         fi
 
         cp /data/freenas-v1.db /data/factory-v1.db

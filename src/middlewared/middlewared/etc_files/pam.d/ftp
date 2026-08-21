@@ -8,8 +8,6 @@
         dsp = pam.getDirectoryServicePam(middleware=middleware, file='ftp')
 %>
 # auth
-auth		sufficient	pam_opie.so		no_warn no_fake_prompts
-auth		requisite	pam_opieaccess.so	no_warn allow_local
 % if dsp.enabled() and dsp.name() != 'NIS':
 ${dsp.pam_auth()}
 % endif

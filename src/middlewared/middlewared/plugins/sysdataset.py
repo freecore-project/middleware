@@ -10,6 +10,23 @@ import uuid
 from pathlib import Path
 
 SYSDATASET_PATH = '/var/db/system'
+RSYNC_VANISHED = 24
+COPY_ATTEMPTS = 3
+
+
+async def copy_system_dataset(src, dst, logger, attempts=COPY_ATTEMPTS):
+    """
+    rsync `src` into `dst` for a system dataset move. Exit 24 only means a source file vanished during the copy:
+    newsyslog (cron) still rotates the logs under the system dataset after syslogd is stopped, renaming a file the
+    copy had already listed. Copy again so the rotated file arrives under its new name; any other failure, or
+    files still vanishing after `attempts` passes, is returned to the caller unchanged.
+    """
+    for attempt in range(1, attempts + 1):
+        cp = await run('rsync', '-az', f'{src}/', dst, check=False)
+        if cp.returncode != RSYNC_VANISHED or attempt == attempts:
+            return cp
+        logger.warning('Moving the system dataset: files vanished during the copy (rsync exit %d), copying again '
+                       '(pass %d of %d)', RSYNC_VANISHED, attempt + 1, attempts)
 
 
 class SystemDatasetModel(sa.Model):
@@ -456,7 +473,7 @@ class SystemDatasetService(ConfigService):
                 await self.middleware.call('service.stop', i)
 
             if _from:
-                cp = await run('rsync', '-az', f'{SYSDATASET_PATH}/', '/tmp/system.new', check=False)
+                cp = await copy_system_dataset(SYSDATASET_PATH, '/tmp/system.new', self.logger)
                 if cp.returncode == 0:
                     await self.__umount(_from, config['uuid'])
                     await self.__umount(_to, config['uuid'])

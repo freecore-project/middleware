@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# SFTP-only login shell.
+#
+# Takes the place of shells/scponly, which was removed from the image as
+# abandoned (last release 2011), at the path TrueNAS 13.3 accounts already
+# reference.  On FreeBSD, sshd starts the SFTP subsystem through the user's
+# shell as `<shell> -c "<Subsystem command>"`.  This shell runs sftp-server
+# for exactly that request and refuses everything else: interactive logins,
+# remote commands, ~/.ssh/rc, forced commands, legacy scp and rsync.
+# Modern scp clients (OpenSSH 9+) transfer over SFTP and keep working.
+#
+# Only `-l LEVEL` and `-f FACILITY` are passed on, the two options the
+# middleware's sshd_config puts on the Subsystem line.  Nothing is eval'd.
+#
+
+SFTP_SERVER=/usr/local/libexec/sftp-server
+
+PATH=/bin:/usr/bin
+export PATH
+# Unset IFS splits on space, tab and newline (POSIX default).
+unset IFS
+set -f
+
+deny()
+{
+	echo "This account is restricted to SFTP." >&2
+	exit 1
+}
+
+[ "$#" -eq 2 ] && [ "$1" = "-c" ] || deny
+
+set -- $2
+[ "$1" = "$SFTP_SERVER" ] || deny
+shift
+
+args=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-l|-f) ;;
+	*) deny ;;
+	esac
+	[ "$#" -ge 2 ] || deny
+	case "$2" in
+	''|*[!A-Z0-9]*) deny ;;
+	esac
+	args="$args $1 $2"
+	shift 2
+done
+
+exec "$SFTP_SERVER" $args
