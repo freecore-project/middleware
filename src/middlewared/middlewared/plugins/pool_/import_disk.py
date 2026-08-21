@@ -1,5 +1,4 @@
 import asyncio
-import async_timeout
 import os
 import logging
 import re
@@ -9,6 +8,7 @@ from middlewared.job import JobProgressBuffer
 from middlewared.schema import Dict, Str
 from middlewared.service import accepts, CallError, job, Service
 from middlewared.utils import Popen
+from middlewared.utils import osc
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ class PoolService(Service):
                                 logger.warning("Terminating rsync")
                                 rsync_proc.terminate()
                                 try:
-                                    async with async_timeout.timeout(10):
+                                    async with asyncio.timeout(10):
                                         await rsync_proc.wait()
                                 except asyncio.TimeoutError:
                                     logger.warning("Timeout waiting for rsync to terminate, killing it")
@@ -127,6 +127,27 @@ class PoolService(Service):
                 "params": ["/dev/da0"]
             }
         """
+        if osc.IS_FREEBSD:
+            # blkid is Linux-only; on FreeBSD use file(1) to detect filesystem type
+            proc = subprocess.run(
+                ["file", "-s", device], capture_output=True, encoding="utf-8"
+            )
+            if proc.returncode != 0:
+                raise CallError(f"file failed with code {proc.returncode}: {proc.stderr.strip()}")
+
+            output = proc.stdout.strip()
+            if "Unix Fast File system" in output:
+                return "ufs"
+            if "FAT" in output:
+                return "msdosfs"
+            if "NTFS" in output:
+                return "ntfs"
+            if "ext2" in output or "ext3" in output or "ext4" in output:
+                return "ext2fs"
+
+            self.logger.info("Unknown FS from file(1): %s", output)
+            return None
+
         proc = subprocess.Popen(["blkid", device], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8")
         output = proc.communicate()[0].strip()
 

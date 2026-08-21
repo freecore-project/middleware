@@ -1,0 +1,38 @@
+{
+  "catalog_name": "Daemonless Apps",
+  "fjord_version": "0.1",
+  "maintainer": "https://daemonless.io",
+  "icon": "icon.svg",
+  "generated": "2026-09-30T14:26:15Z",
+  "apps": [
+    {
+      "id": "demo",
+      "name": "Demo Service Pro",
+      "category": "Monitoring",
+      "class": "service",
+      "icon": "icons/demo.svg",
+      "description": "The fjord description of the demo.",
+      "upstream_url": "https://github.com/example/demo",
+      "web_url": "https://example.com/demo",
+      "image": "ghcr.io/daemonless/demo",
+      "manifest_url": "manifests/demo.yaml",
+      "version": "v1.2.4",
+      "architectures": ["amd64"],
+      "variants": [{"id": "latest", "label": "Latest", "default": true, "image": "ghcr.io/daemonless/demo:latest", "version": "v1.2.4"}]
+    },
+    {
+      "id": "x86-demo",
+      "name": "X86 Demo Stack",
+      "category": "Something New",
+      "class": "stack",
+      "icon": "icons/x86-demo.png",
+      "description": "A multi-service stack.",
+      "manifest_url": "manifests/x86-demo.yaml",
+      "variants": []
+    },
+    {"id": "absolute", "name": "Absolute", "class": "service", "manifest_url": "https://example.org/manifests/absolute.yaml"},
+    {"id": "elsewhere", "name": "Elsewhere", "class": "service", "manifest_url": "manifests/other.yaml"},
+    {"id": "../escape", "name": "Escape", "class": "service", "manifest_url": "manifests/../escape.yaml"},
+    "not-a-mapping"
+  ]
+}

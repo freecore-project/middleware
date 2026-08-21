@@ -1,0 +1,63 @@
+{
+  "app": "radarr",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Radarr",
+  "comment": "Radarr keeps everything in one data directory (-data=): database, config.xml, backups. The FreeBSD package's rc.d script and the LinuxServer image both point it at one directory; the Daemonless image runs it with -data=/config.",
+  "target": {
+    "catalog_id": "daemonless:radarr",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 7878
+  },
+  "sources": {
+    "jail": {
+      "pkg": "radarr",
+      "rc_script": "radarr",
+      "rc_data_var": "radarr_data_dir",
+      "detect": [
+        "usr/local/etc/rc.d/radarr"
+      ],
+      "data": "usr/local/radarr",
+      "uid": 352
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/radarr",
+        "ghcr.io/linuxserver/radarr",
+        "docker.io/linuxserver/radarr",
+        "ghcr.io/hotio/radarr"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/radarr",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

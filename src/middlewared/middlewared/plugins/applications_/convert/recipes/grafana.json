@@ -1,0 +1,221 @@
+{
+  "app": "grafana",
+  "recipe_version": 1,
+  "kind": "grafana",
+  "status": "proven",
+  "title": "Grafana",
+  "target": {
+    "catalog_id": "daemonless:grafana",
+    "assert_labels": {
+      "io.daemonless.pkg-name": "grafana"
+    },
+    "volume": "config",
+    "layout": {
+      "data": "data",
+      "plugins": "plugins",
+      "provisioning": "provisioning",
+      "ini": "grafana.ini"
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 3000,
+    "health_path": "/api/health"
+  },
+  "sources": {
+    "jail": {
+      "pkg": "grafana",
+      "detect": [
+        "usr/local/etc/grafana/grafana.ini",
+        "var/db/grafana/grafana.db"
+      ],
+      "data": "var/db/grafana",
+      "ini": "usr/local/etc/grafana/grafana.ini",
+      "provisioning": "usr/local/etc/grafana/provisioning",
+      "uid": 904
+    },
+    "linux": {
+      "images": [
+        "docker.io/grafana/grafana",
+        "docker.io/grafana/grafana-oss",
+        "grafana/grafana",
+        "grafana/grafana-oss"
+      ],
+      "refuse_images": [
+        {
+          "match": "grafana/grafana-enterprise",
+          "because": "Grafana Enterprise is a different edition"
+        }
+      ],
+      "data": "/var/lib/grafana",
+      "ini": "/etc/grafana/grafana.ini",
+      "provisioning": "/etc/grafana/provisioning",
+      "uid": 472,
+      "env_prefix": "GF_",
+      "export": {
+        "image": "docker.io/grafana/grafana",
+        "tag_template": "{version}",
+        "user": "user",
+        "volumes": [
+          {
+            "from": "data",
+            "target": "/var/lib/grafana"
+          },
+          {
+            "from": "grafana.ini",
+            "target": "/etc/grafana/grafana.ini"
+          },
+          {
+            "from": "provisioning",
+            "target": "/etc/grafana/provisioning",
+            "optional": true
+          }
+        ],
+        "drop": [
+          "plugins: backend plugins are FreeBSD builds; reinstall them from the plugin catalog on the Linux host"
+        ]
+      }
+    }
+  },
+  "config": {
+    "format": "ini",
+    "allow": [
+      "security.secret_key",
+      "security.admin_user",
+      "security.cookie_secure",
+      "security.cookie_samesite",
+      "security.disable_gravatar",
+      "server.root_url",
+      "server.domain",
+      "server.serve_from_sub_path",
+      "smtp.*",
+      "emails.*",
+      "auth.*",
+      "auth",
+      "users.*",
+      "database.*",
+      "analytics.reporting_enabled",
+      "analytics.check_for_updates",
+      "date_formats.*",
+      "feature_toggles.*",
+      "dashboards.*",
+      "explore.*",
+      "panels.*",
+      "plugins.allow_loading_unsigned_plugins",
+      "snapshots.*",
+      "external_image_storage.*"
+    ],
+    "deny": [
+      "paths.*",
+      "alerting.*",
+      "unified_alerting.*",
+      "server.http_port",
+      "server.http_addr",
+      "server.protocol",
+      "server.cert_file",
+      "server.cert_key",
+      "server.socket",
+      "log.*",
+      "grpc_server.*",
+      "security.admin_password"
+    ]
+  },
+  "carry": [
+    {
+      "from": "{data}/grafana.db",
+      "to": "{layout.data}/grafana.db",
+      "required": true
+    },
+    {
+      "from": "{data}/png",
+      "to": "{layout.data}/png",
+      "optional": true
+    },
+    {
+      "from": "{data}/csv",
+      "to": "{layout.data}/csv",
+      "optional": true
+    },
+    {
+      "from": "{data}/pdf",
+      "to": "{layout.data}/pdf",
+      "optional": true
+    },
+    {
+      "from": "{data}/file-collections",
+      "to": "{layout.data}/file-collections",
+      "optional": true
+    },
+    {
+      "from": "{provisioning}",
+      "to": "{layout.provisioning}",
+      "optional": true
+    }
+  ],
+  "plugins": {
+    "from": "{data}/plugins",
+    "to": "{layout.plugins}",
+    "carry": "frontend_only",
+    "drop_because": "backend plugins are Linux or FreeBSD-13 binaries; reinstall them from the plugin catalog"
+  },
+  "preflights": [
+    {
+      "id": "target_not_older",
+      "refuse": true
+    },
+    {
+      "id": "external_database",
+      "then": "carry_config_skip_data"
+    },
+    {
+      "id": "legacy_alerts_present",
+      "then": "hop"
+    },
+    {
+      "id": "angular_panels",
+      "then": "note_rewrite"
+    }
+  ],
+  "hops": [
+    {
+      "when": "legacy_alerts_present",
+      "image": "docker.io/grafana/grafana-oss:10.4.19",
+      "purpose": "migrate legacy dashboard alerts to Grafana Alerting (upgrade_on_start); Grafana 11+ cannot",
+      "uid": 472,
+      "gid": 0,
+      "data_target": "/var/lib/grafana",
+      "env": {
+        "GF_UNIFIED_ALERTING_ENABLED": "true",
+        "GF_ALERTING_ENABLED": "false",
+        "GF_PATHS_DATA": "/var/lib/grafana",
+        "GF_PATHS_PLUGINS": "/var/lib/grafana/plugins",
+        "GF_SERVER_HTTP_ADDR": "127.0.0.1",
+        "GF_ANALYTICS_CHECK_FOR_UPDATES": "false",
+        "GF_ANALYTICS_REPORTING_ENABLED": "false",
+        "GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED": "true",
+        "GF_UNIFIED_ALERTING_UPGRADE_ON_START": "true"
+      },
+      "ready_log": "HTTP Server Listen",
+      "timeout": 300
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries and rc.conf settings of the jail",
+    "sidecar packages installed beside the application",
+    "compose sidecar services",
+    "TLS certificate files (re-supply them on the new instance)",
+    "the jail's or container's network identity: address, ports and reverse-proxy rules change"
+  ],
+  "verify": {
+    "health": {
+      "container_port": 3000,
+      "path": "/api/health"
+    },
+    "state_diff": [
+      "/api/search",
+      "/api/datasources",
+      "/api/orgs",
+      "/api/users"
+    ]
+  }
+}

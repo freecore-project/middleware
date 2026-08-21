@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/local/bin/python3
 # Copyright (c) 2015 iXsystems, Inc.
 # All rights reserved.
 #
@@ -30,7 +30,7 @@
 # Also removes freenas:state properties used by the old replicator
 
 import argparse
-import os
+import subprocess
 
 
 def main(no_delete, hold, dataset, skipstate):
@@ -41,14 +41,21 @@ def main(no_delete, hold, dataset, skipstate):
     # dataset is a string that must match the beginning of the snapname
     # It can be used to  "root" the list eg: -d tank/whatever would only
     # operate on snapshots in the tank/whatever dataset or it's descendants
-    snaplist = os.popen("zfs list -t snapshot | awk '{print $1}'").readlines()
-    snaplist = [x for x in snaplist[1:] if not x.startswith("freenas-boot")]
+    ret = subprocess.run(
+        ["zfs", "list", "-t", "snapshot", "-H", "-o", "name"],
+        capture_output=True, text=True
+    )
+    snaplist = [x + "\n" for x in ret.stdout.splitlines()]
+    snaplist = [x for x in snaplist if not x.startswith("freenas-boot")]
     if dataset:
         snaplist = [x for x in snaplist if x.startswith(dataset)]
     print("Checking for holds")
     hold_delete = False
     for snap in snaplist:
-        ret = os.popen("zfs holds %s" % snap).readlines()
+        ret = subprocess.run(
+            ["zfs", "holds", snap.strip()],
+            capture_output=True, text=True
+        ).stdout.splitlines(keepends=True)
         if len(ret) > 1:
             for item in ret[1:]:
                 if item.split()[1] == hold:
@@ -56,7 +63,9 @@ def main(no_delete, hold, dataset, skipstate):
                         print("%s hold found on %s" % (hold, snap))
                     else:
                         print("Destroying %s hold on %s" % (hold, snap))
-                        ret = os.system("zfs release %s %s" % (item.split()[1], snap))
+                        ret = subprocess.run(
+                            ["zfs", "release", item.split()[1], snap.strip()]
+                        ).returncode
                         if ret != 0:
                             print("Error releasing hold on %s" % snap)
                         else:
@@ -65,12 +74,17 @@ def main(no_delete, hold, dataset, skipstate):
         print("No holds found")
 
     if not skipstate:
-        poollist = os.popen("zpool list -H | awk '{print $1}'").readlines()
+        poollist = subprocess.run(
+            ["zpool", "list", "-H", "-o", "name"],
+            capture_output=True, text=True
+        ).stdout.splitlines(keepends=True)
         for pool in poollist:
             pool = pool.strip()
             if pool != "freenas-boot":
                 print("Removing freenas:state on %s" % pool)
-                ret = os.system("zfs inherit -r freenas:state %s" % pool)
+                ret = subprocess.run(
+                    ["zfs", "inherit", "-r", "freenas:state", pool]
+                ).returncode
                 if ret != 0:
                     print("Error removing freenas:state on %s" % pool)
 
