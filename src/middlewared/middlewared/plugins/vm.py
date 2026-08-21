@@ -1,5 +1,10 @@
 from middlewared.async_validators import check_path_resides_within_volume
 from middlewared.common.attachment import FSAttachmentDelegate
+from middlewared.plugins.vm_.arc import arc_max_reject_reason, effective_arc_min, minimum_valid_arc_max
+from middlewared.plugins.vm_.bootloader import (
+    classify_grubconfig, grub_bootloader_reject_reason, grub_vm_report, GRUB_BHYVE_BINARY,
+    GRUB_BOOTLOADER,
+)
 from middlewared.plugins.vm_.connection import LibvirtConnectionMixin
 from middlewared.schema import accepts, Error, Int, Str, Dict, List, Bool, Patch
 from middlewared.service import (
@@ -38,8 +43,56 @@ try:
     import sysctl
 except ImportError:
     sysctl = None
-import time
 import threading
+import time
+
+
+def _sysctl_val(name):
+    """Read a sysctl value, falling back to subprocess if py-bsd unavailable."""
+    if sysctl is not None:
+        result = sysctl.filter(name)
+        return result[0].value if result else None
+    try:
+        r = subprocess.run(['/sbin/sysctl', '-n', name], capture_output=True, text=True, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                return int(r.stdout.strip())
+            except ValueError:
+                return r.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _sysctl_int(name):
+    value = _sysctl_val(name)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sysctl_set(name, value):
+    """Set a sysctl value, falling back to subprocess if py-bsd unavailable."""
+    if sysctl is not None:
+        sysctl.filter(name)[0].value = value
+        return
+    try:
+        r = subprocess.run(['/sbin/sysctl', f'{name}={value}'], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if r.returncode != 0:
+            raise OSError(errno.EINVAL, r.stderr.strip() or r.stdout.strip() or 'sysctl failed')
+
+
+def _arc_max_context():
+    all_memory = _sysctl_int('hw.physmem') or _sysctl_int('hw.realmem')
+    return {
+        'arc_min': _sysctl_int('vfs.zfs.arc.min'),
+        'arc_c_min': _sysctl_int('kstat.zfs.misc.arcstats.c_min'),
+        'all_memory': all_memory,
+    }
 
 from abc import ABC, abstractmethod
 from xml.etree import ElementTree as etree
@@ -806,13 +859,11 @@ class NIC(Device):
         self.bridge = self.bridge_created = None
 
     def identity(self):
-        nic_attach = self.data['attributes'].get('nic_attach')
-        if not nic_attach:
-            nic_attach = netif.RoutingTable().default_route_ipv4.interface
-        return nic_attach
+        return self.data['attributes'].get('nic_attach')
 
     def is_available(self):
-        return self.identity() in netif.list_interfaces()
+        nic_attach = self.identity()
+        return bool(nic_attach) and nic_attach in netif.list_interfaces()
 
     @staticmethod
     def random_mac():
@@ -823,21 +874,20 @@ class NIC(Device):
 
     def pre_start_vm(self, *args, **kwargs):
         nic_attach = self.data['attributes'].get('nic_attach')
+        if not nic_attach:
+            raise CallError(
+                'VM NIC device requires nic_attach to be set explicitly. Falling back '
+                'to the host default route interface silently bridges the management '
+                'NIC into the VM bridge and breaches VLAN isolation.'
+            )
         interfaces = netif.list_interfaces()
         bridge = None
-        if nic_attach and nic_attach not in interfaces:
+        if nic_attach not in interfaces:
             raise CallError(f'{nic_attach} not found.')
-        elif nic_attach and nic_attach.startswith('bridge'):
+        elif nic_attach.startswith('bridge'):
             bridge = interfaces[nic_attach]
         else:
-            if not nic_attach:
-                try:
-                    nic_attach = netif.RoutingTable().default_route_ipv4.interface
-                    nic = netif.get_interface(nic_attach)
-                except Exception as e:
-                    raise CallError(f'Unable to retrieve default interface: {e}')
-            else:
-                nic = netif.get_interface(nic_attach)
+            nic = netif.get_interface(nic_attach)
 
             if netif.InterfaceFlags.UP not in nic.flags:
                 nic.up()
@@ -932,6 +982,16 @@ class VNC(Device):
         split_port = int(str(vnc_port)[:2]) - 1
         return int(str(split_port) + str(vnc_port)[2:])
 
+    # A wildcard is a valid address to *listen* on and never a valid address to
+    # *connect* to. FreeBSD 13.3 quietly substituted a local address when asked
+    # to connect to one; FreeBSD 15 returns ENETUNREACH, which websockify only
+    # reports to the browser as a 1011 close.
+    WILDCARD_DIAL_TARGETS = {'0.0.0.0': '127.0.0.1', '::': '::1'}
+
+    @classmethod
+    def get_vnc_dial_target(cls, vnc_bind, vnc_port):
+        return f'{cls.WILDCARD_DIAL_TARGETS.get(vnc_bind, vnc_bind)}:{vnc_port}'
+
     def post_start_vm(self, *args, **kwargs):
         vnc_port = self.data['attributes']['vnc_port']
         vnc_bind = self.data['attributes']['vnc_bind']
@@ -940,8 +1000,9 @@ class VNC(Device):
         web_bind = f':{vnc_web_port}' if vnc_bind == '0.0.0.0' else f'{vnc_bind}:{vnc_web_port}'
         self.web_process = subprocess.Popen(
             [
-                '/usr/local/libexec/novnc/utils/websockify/run', '--web',
-                '/usr/local/libexec/novnc/', '--wrap-mode=ignore', web_bind, f'{vnc_bind}:{vnc_port}'
+                '/usr/local/bin/websockify', '--web',
+                '/usr/local/libexec/novnc/', '--wrap-mode=ignore', web_bind,
+                self.get_vnc_dial_target(vnc_bind, vnc_port)
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
@@ -993,26 +1054,52 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         self.vms = {}
 
     @accepts()
+    def grub_inventory(self):
+        """
+        Read-only inventory of every VM still configured with the deprecated GRUB bootloader.
+
+        the internal security review Phase 1.  `grub2-bhyve` cannot be removed until this reports `count` 0, and
+        migrating a guest to UEFI is only safe once its own boot media has been checked, so this
+        deliberately reports rather than changes anything.  It reads stored configuration only and
+        never inspects guest disk contents.
+        """
+        binary_present = os.path.exists(GRUB_BHYVE_BINARY)
+        vms = []
+        for vm in self.middleware.call_sync('vm.query', [['bootloader', '=', GRUB_BOOTLOADER]]):
+            kind, path = classify_grubconfig(vm.get('grubconfig'))
+            vms.append(grub_vm_report(
+                vm, binary_present, os.path.exists(path) if kind == 'path' else None
+            ))
+
+        return {
+            'bootloader_binary': GRUB_BHYVE_BINARY,
+            'bootloader_binary_present': binary_present,
+            'count': len(vms),
+            'removal_safe': not vms,
+            'vms': vms,
+        }
+
+    @accepts()
     def flags(self):
         """Returns a dictionary with CPU flags for bhyve."""
         data = {}
-        intel = True if 'Intel' in sysctl.filter('hw.model')[0].value else \
-            False
+        hw_model = _sysctl_val('hw.model')
+        intel = True if hw_model and 'Intel' in hw_model else False
 
-        vmx = sysctl.filter('hw.vmm.vmx.initialized')
-        data['intel_vmx'] = True if vmx and vmx[0].value else False
+        vmx = _sysctl_val('hw.vmm.vmx.initialized')
+        data['intel_vmx'] = True if vmx else False
 
-        ug = sysctl.filter('hw.vmm.vmx.cap.unrestricted_guest')
-        data['unrestricted_guest'] = True if ug and ug[0].value else False
+        ug = _sysctl_val('hw.vmm.vmx.cap.unrestricted_guest')
+        data['unrestricted_guest'] = True if ug else False
 
         # If virtualisation is not supported on AMD, the sysctl value will be -1 but as an unsigned integer
         # we should make sure we check that accordingly.
-        rvi = sysctl.filter('hw.vmm.svm.features')
-        data['amd_rvi'] = True if rvi and rvi[0].value != 0xffffffff and not intel \
+        rvi = _sysctl_val('hw.vmm.svm.features')
+        data['amd_rvi'] = True if rvi is not None and rvi != 0xffffffff and not intel \
             else False
 
-        asids = sysctl.filter('hw.vmm.svm.num_asids')
-        data['amd_asids'] = True if asids and asids[0].value != 0 else False
+        asids = _sysctl_val('hw.vmm.svm.num_asids')
+        data['amd_asids'] = True if asids and asids != 0 else False
 
         return data
 
@@ -1025,9 +1112,11 @@ class VMService(CRUDService, LibvirtConnectionMixin):
                 bool: True if compatible otherwise False.
         """
         compatible_hp = ('VMwareVMware', 'Microsoft Hv', 'KVMKVMKVM', 'bhyve bhyve')
-        identify_hp = sysctl.filter('hw.hv_vendor')[0].value.strip()
+        identify_hp = _sysctl_val('hw.hv_vendor')
+        if identify_hp is None:
+            return False
 
-        if identify_hp in compatible_hp:
+        if identify_hp.strip() in compatible_hp:
             return True
         return False
 
@@ -1165,11 +1254,15 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         # swap used space is accounted for used physical memory because
         # 1. processes (including VMs) can be swapped out
         # 2. we want to avoid using swap
-        swap_used = psutil.swap_memory().used * sysctl.filter('hw.pagesize')[0].value
+        pagesize = _sysctl_int('hw.pagesize') or 4096
+        swap_used = psutil.swap_memory().used * pagesize
 
         # Difference between current ARC total size and the minimum allowed
-        arc_total = sysctl.filter('kstat.zfs.misc.arcstats.size')[0].value
-        arc_min = sysctl.filter('vfs.zfs.arc.min')[0].value
+        arc_total = _sysctl_int('kstat.zfs.misc.arcstats.size') or 0
+        arc_min = effective_arc_min(
+            _sysctl_int('vfs.zfs.arc.min'),
+            _sysctl_int('kstat.zfs.misc.arcstats.c_min'),
+        )
         arc_shrink = max(0, arc_total - arc_min)
 
         vms_memory_used = 0
@@ -1208,15 +1301,31 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         if memory_bytes > memory_available:
             return False
 
-        arc_max = sysctl.filter('vfs.zfs.arc.max')[0].value
-        arc_min = sysctl.filter('vfs.zfs.arc.min')[0].value
+        arc_max = _sysctl_int('vfs.zfs.arc.max')
+        if arc_max in (None, 0):
+            return True
 
-        if arc_max > arc_min:
-            new_arc_max = max(arc_min, arc_max - memory_bytes)
+        arc_max_context = _arc_max_context()
+        minimum_arc_max = minimum_valid_arc_max(**arc_max_context)
+        if minimum_arc_max is None:
+            self.logger.warning('===> Not reserving guest memory because there is no valid ARC max value')
+            return True
+
+        new_arc_max = max(minimum_arc_max, arc_max - memory_bytes)
+        if new_arc_max < arc_max:
+            if reason := arc_max_reject_reason(new_arc_max, **arc_max_context):
+                self.logger.warning(f'===> Not reserving guest memory by setting ARC max: {reason}')
+                return True
+
             self.logger.info(
                 f'===> Setting ARC FROM: {arc_max} TO: {new_arc_max}'
             )
-            sysctl.filter('vfs.zfs.arc.max')[0].value = new_arc_max
+            try:
+                _sysctl_set('vfs.zfs.arc.max', new_arc_max)
+            except OSError as e:
+                if e.errno != errno.EINVAL:
+                    raise
+                self.logger.warning(f'===> Failed to reserve guest memory by setting ARC max: {e}')
         return True
 
     @private
@@ -1331,6 +1440,13 @@ class VMService(CRUDService, LibvirtConnectionMixin):
             raise e
 
     async def __common_validation(self, verrors, schema_name, data, old=None):
+
+        grub_reject_reason = grub_bootloader_reject_reason(
+            old.get('bootloader') if old else None,
+            data['bootloader'],
+        )
+        if grub_reject_reason:
+            verrors.add(f'{schema_name}.bootloader', grub_reject_reason)
 
         vcpus = data['vcpus'] * data['cores'] * data['threads']
         if vcpus:
@@ -1657,20 +1773,32 @@ class VMService(CRUDService, LibvirtConnectionMixin):
 
         vm = await self.middleware.call('datastore.query', 'vm.vm', [('id', '=', id)])
         guest_memory = vm[0].get('memory', 0) * 1024 * 1024
-        arc_max = sysctl.filter('vfs.zfs.arc.max')[0].value
-        arc_min = sysctl.filter('vfs.zfs.arc.min')[0].value
+        arc_max = _sysctl_int('vfs.zfs.arc.max')
+        if arc_max is None:
+            return
+
+        if arc_max == 0:
+            return
+        initial_arc_max = await self.middleware.call('vm.get_initial_arc_max')
+        if initial_arc_max is None:
+            return
+
         new_arc_max = min(
-            await self.middleware.call('vm.get_initial_arc_max'),
+            initial_arc_max,
             arc_max + guest_memory
         )
         if arc_max != new_arc_max:
-            if new_arc_max > arc_min:
-                self.logger.debug(f'===> Give back guest memory to ARC: {new_arc_max}')
-                sysctl.filter('vfs.zfs.arc.max')[0].value = new_arc_max
+            arc_max_context = _arc_max_context()
+            if reason := arc_max_reject_reason(new_arc_max, **arc_max_context):
+                self.logger.warning(f'===> Not giving back guest memory to ARC: {reason}')
             else:
-                self.logger.warn(
-                    f'===> Not giving back memory to ARC because new arc_max ({new_arc_max}) <= arc_min ({arc_min})'
-                )
+                self.logger.debug(f'===> Giving back guest memory to ARC: {new_arc_max}')
+                try:
+                    _sysctl_set('vfs.zfs.arc.max', new_arc_max)
+                except OSError as e:
+                    if e.errno != errno.EINVAL:
+                        raise
+                    self.logger.warning(f'===> Failed to give back guest memory to ARC: {e}')
 
     @item_method
     @accepts(Int('id'))
@@ -1773,6 +1901,8 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         If not provided it will append the next number available to the VM name.
         """
         vm = await self.get_instance(id)
+        if grub_reject_reason := grub_bootloader_reject_reason(None, vm['bootloader']):
+            raise CallError(grub_reject_reason, errno.EINVAL)
 
         origin_name = vm['name']
         del vm['id']
@@ -2296,11 +2426,11 @@ class VMDeviceService(CRUDService):
             elif path and not os.path.exists(path):
                 verrors.add('attributes.path', f'Disk path {path} does not exist.', errno.ENOENT)
 
-            if path and len(path) > 63:
-                # SPECNAMELEN is not long enough (63) in 12, 13 will be 255
+            if path and len(path) > 255:
+                # SPECNAMELEN increased from 63 (FB12/13) to 255 (FB14+)
                 verrors.add(
                     'attributes.path',
-                    f'Disk path {path} is too long, reduce to less than 63'
+                    f'Disk path {path} is too long, reduce to less than 255'
                     ' characters',
                     errno.ENAMETOOLONG
                 )
@@ -2395,10 +2525,18 @@ class VMDeviceService(CRUDService):
 
 async def kmod_load():
     kldstat = (await (await Popen(['/sbin/kldstat'], stdout=subprocess.PIPE)).communicate())[0].decode()
+    # On FB15 vmm/nmdm may be compiled into the kernel rather than loadable modules.
+    # kldload returns non-zero if already loaded or built-in, so ignore errors.
     if 'vmm.ko' not in kldstat:
-        await Popen(['/sbin/kldload', 'vmm'])
+        try:
+            await run(['/sbin/kldload', 'vmm'], check=False)
+        except Exception:
+            pass
     if 'nmdm.ko' not in kldstat:
-        await Popen(['/sbin/kldload', 'nmdm'])
+        try:
+            await run(['/sbin/kldload', 'nmdm'], check=False)
+        except Exception:
+            pass
 
 
 async def __event_system_ready(middleware, event_type, args):
@@ -2414,7 +2552,7 @@ async def __event_system_ready(middleware, event_type, args):
 
     if args['id'] == 'ready':
         global ZFS_ARC_MAX_INITIAL
-        ZFS_ARC_MAX_INITIAL = sysctl.filter('vfs.zfs.arc.max')[0].value
+        ZFS_ARC_MAX_INITIAL = _sysctl_val('vfs.zfs.arc.max')
 
         await middleware.call('vm.initialize_vms')
 
@@ -2491,8 +2629,7 @@ class VMFSAttachmentDelegate(FSAttachmentDelegate):
 
 async def setup(middleware):
     global ZFS_ARC_MAX_INITIAL
-    if sysctl:
-        ZFS_ARC_MAX_INITIAL = sysctl.filter('vfs.zfs.arc.max')[0].value
+    ZFS_ARC_MAX_INITIAL = _sysctl_val('vfs.zfs.arc.max')
     if osc.IS_FREEBSD:
         middleware.create_task(kmod_load())
     middleware.create_task(middleware.call('pool.dataset.register_attachment_delegate',

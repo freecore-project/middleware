@@ -174,10 +174,17 @@ async def rclone(middleware, job, cloud_sync, dry_run=False):
         path = cloud_sync["path"]
         if cloud_sync["direction"] == "PUSH":
             if cloud_sync["snapshot"]:
-                dataset, recursive = get_dataset_recursive(
-                    await middleware.call("zfs.dataset.query", [["type", "=", "FILESYSTEM"]]),
-                    cloud_sync["path"],
-                )
+                # `zfs.dataset.query`'s serialized path has no top-level `mountpoint` key:
+                # py-libzfs 3b100a9 ("Do not treat mountpoint specially") removed it, while
+                # 13.3's shipped py39-libzfs still emitted it. Same delta as #288 -- read the
+                # value out of `properties` so `get_dataset_recursive` keeps the input shape it
+                # was written against. 'none' maps to None, exactly as the old top-level key did.
+                datasets = []
+                for ds in await middleware.call("zfs.dataset.query", [["type", "=", "FILESYSTEM"]]):
+                    mountpoint = ds["properties"].get("mountpoint", {}).get("value")
+                    datasets.append(dict(ds, mountpoint=None if mountpoint == "none" else mountpoint))
+
+                dataset, recursive = get_dataset_recursive(datasets, cloud_sync["path"])
                 snapshot_name = (
                     f"cloud_sync-{cloud_sync.get('id', 'onetime')}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
                 )
@@ -268,7 +275,7 @@ async def run_script(job, env, hook, script_name):
         return
 
     if not hook.startswith("#!"):
-        hook = f"#!/bin/bash\n{hook}"
+        hook = f"#!/usr/bin/env bash\n{hook}"
 
     fd, name = tempfile.mkstemp()
     os.close(fd)

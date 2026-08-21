@@ -1,8 +1,41 @@
+import logging
 import subprocess
 import uuid
 
 import sysctl
 from middlewared.service import private, Service
+
+logger = logging.getLogger(__name__)
+
+KLDLOAD = "/sbin/kldload"
+SYSCTL = "/sbin/sysctl"
+
+
+def _load_nfsd_module():
+    # FreeBSD's mountd/nfsd rc scripts do this before touching vfs.nfsd.*.
+    subprocess.run(
+        [KLDLOAD, "nfsd"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _set_sysctl(oid, value):
+    """Set a sysctl value via py-sysctl, falling back to subprocess on failure."""
+    try:
+        sysctl.filter(oid)[0].value = value
+        return
+    except (IndexError, OSError):
+        pass
+    cp = subprocess.run(
+        [SYSCTL, f"{oid}={value}"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if cp.returncode != 0:
+        logger.warning("Failed to set sysctl %r to %r using %s", oid, value, SYSCTL)
 
 
 class NFSService(Service):
@@ -17,10 +50,12 @@ class NFSService(Service):
     def setup_v4(self):
         config = self.middleware.call_sync("nfs.config")
 
-        if config["v4_krb_enabled"]:
+        if config["v4"] and config["v4_krb_enabled"]:
             subprocess.run(["service", "gssd", "onerestart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.run(["service", "gssd", "forcestop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        _load_nfsd_module()
 
         if config["v4"]:
             if self.middleware.call_sync("failover.licensed"):
@@ -46,24 +81,24 @@ class NFSService(Service):
                     )
 
                 # setting these to the same value works for our implementation
-                sysctl.filter("vfs.nfsd.scope")[0].value = owner_major
-                sysctl.filter("vfs.nfsd.owner_major")[0].value = owner_major
+                _set_sysctl("vfs.nfsd.scope", owner_major)
+                _set_sysctl("vfs.nfsd.owner_major", owner_major)
 
-            sysctl.filter("vfs.nfsd.server_max_nfsvers")[0].value = 4
+            _set_sysctl("vfs.nfsd.server_max_nfsvers", 4)
             if config["v4_v3owner"]:
                 # Per RFC7530, sending NFSv3 style UID/GIDs across the wire is now allowed
                 # You must have both of these sysctl"s set to allow the desired functionality
-                sysctl.filter("vfs.nfsd.enable_stringtouid")[0].value = 1
-                sysctl.filter("vfs.nfs.enable_uidtostring")[0].value = 1
+                _set_sysctl("vfs.nfsd.enable_stringtouid", 1)
+                _set_sysctl("vfs.nfs.enable_uidtostring", 1)
                 subprocess.run(["service", "nfsuserd", "forcestop"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
             else:
-                sysctl.filter("vfs.nfsd.enable_stringtouid")[0].value = 0
-                sysctl.filter("vfs.nfs.enable_uidtostring")[0].value = 0
+                _set_sysctl("vfs.nfsd.enable_stringtouid", 0)
+                _set_sysctl("vfs.nfs.enable_uidtostring", 0)
                 subprocess.run(["service", "nfsuserd", "onerestart"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
         else:
-            sysctl.filter("vfs.nfsd.server_max_nfsvers")[0].value = 3
+            _set_sysctl("vfs.nfsd.server_max_nfsvers", 3)
             if config["userd_manage_gids"]:
                 subprocess.run(["service", "nfsuserd", "onerestart"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)

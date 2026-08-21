@@ -36,6 +36,21 @@ RE_RTSOLD_INTERFACE = re.compile(r'Interface (.+)')
 RE_RTSOLD_NUMBER_OF_VALID_RAS = re.compile(r'number of valid RAs: ([0-9]+)')
 
 
+def dhcp_gateway_from_leases(leases):
+    """Return the first valid IPv4 router from the newest DHCP lease."""
+    lease_blocks = re.findall(r'(?ms)^lease\s*\{(.*?)^\}', leases or '')
+    lease = lease_blocks[-1] if lease_blocks else leases or ''
+    match = re.search(r'(?m)^\s*option routers\s+([^;]+);', lease)
+    if not match:
+        return None
+
+    router = re.split(r'[,\s]+', match.group(1).strip())[0]
+    try:
+        return str(ipaddress.IPv4Address(router))
+    except ipaddress.AddressValueError:
+        return None
+
+
 class NetworkConfigurationModel(sa.Model):
     __tablename__ = 'network_globalconfiguration'
 
@@ -53,7 +68,7 @@ class NetworkConfigurationModel(sa.Model):
     gc_netwait_ip = sa.Column(sa.String(300))
     gc_hosts = sa.Column(sa.Text(), default='')
     gc_domains = sa.Column(sa.Text(), default='')
-    gc_service_announcement = sa.Column(sa.JSON(type=dict), default={'mdns': True, 'wsdd': True, "netbios": False})
+    gc_service_announcement = sa.Column(sa.JSON(type=dict), default={'mdns': True, 'wsd': True, "netbios": False})
     gc_hostname_virtual = sa.Column(sa.String(120), nullable=True)
 
 
@@ -69,6 +84,14 @@ class NetworkConfigurationService(ConfigService):
         # hostname_local will be used when the hostname of the current machine
         # needs to be used so it works with either FreeNAS or TrueNAS
         data['hostname_local'] = data['hostname']
+        service_announcement = data.get('service_announcement') or {}
+        if 'wsd' not in service_announcement and 'wsdd' in service_announcement:
+            service_announcement['wsd'] = service_announcement['wsdd']
+        service_announcement.pop('wsdd', None)
+        for key, default in {'mdns': True, 'wsd': True, 'netbios': False}.items():
+            service_announcement.setdefault(key, default)
+        data['service_announcement'] = {key: service_announcement[key] for key in ANNOUNCE_SRV}
+
         if self.middleware.call_sync('system.is_freenas'):
             data.pop('hostname_b')
             data.pop('hostname_virtual')
@@ -365,10 +388,14 @@ class NetworkConfigurationService(ConfigService):
         # default gateways changed
         ipv4gw_changed = config['ipv4gateway'] != new_config['ipv4gateway']
         ipv6gw_changed = config['ipv6gateway'] != new_config['ipv6gateway']
+        reacquire_dhcp_gateway = bool(config['ipv4gateway'] and not new_config['ipv4gateway'])
         if ipv4gw_changed or ipv6gw_changed:
             local_actions[1].add('route.sync')
             local_actions[2].add('rc')
-            local_actions[3].add(('restart', 'routing'))
+            if not reacquire_dhcp_gateway:
+                # route.sync installs the newly acquired DHCP route.  A later
+                # routing restart with no explicit defaultrouter removes it.
+                local_actions[3].add(('restart', 'routing'))
             if licensed:
                 remote_actions[1].add('route.sync')
                 remote_actions[2].add('rc')
@@ -413,6 +440,26 @@ class NetworkConfigurationService(ConfigService):
 
                 local_actions[3].add((verb, service_name))
 
+        if reacquire_dhcp_gateway:
+            try:
+                # The database now permits DHCP router options.  Render that
+                # configuration and reacquire one before route.sync is allowed
+                # to remove the still-working explicit route.
+                await self.middleware.call('etc.generate', 'network')
+                if await self._reacquire_dhcp_gateway():
+                    local_actions[1].add('dns.sync')
+            except Exception:
+                # Keep remote administration recoverable if DHCP cannot supply
+                # a replacement route.  Restore only the gateway changed by
+                # this transition, then put its route/config back in service.
+                await self.middleware.call(
+                    'datastore.update', 'network.globalconfiguration', config['id'],
+                    {'ipv4gateway': config['ipv4gateway']}, {'prefix': 'gc_'},
+                )
+                await self.middleware.call('etc.generate', 'network')
+                await self.middleware.call('route.sync')
+                raise
+
         # finally, we need to iterate over the `local_actions` and `remote_actions`
         # and perform the necessary operations. Since they're a `OrderedDict`, we
         # guaranteed the order of operatiosn is what we want
@@ -441,6 +488,33 @@ class NetworkConfigurationService(ConfigService):
             await self.middleware.call("smb.synchronize_group_mappings")
 
         return new_config
+
+    async def _reacquire_dhcp_gateway(self):
+        """Rebind active DHCP clients and require a usable router option."""
+        interfaces = await self.middleware.call('datastore.query', 'network.interfaces')
+        if interfaces:
+            interfaces = [interface['int_interface'] for interface in interfaces if interface['int_dhcp']]
+        else:
+            interfaces = [
+                interface
+                for interface in netif.list_interfaces().keys()
+                if not (re.match(r'^(bridge|epair|ipfw|lo)[0-9]+', interface) or ':' in interface)
+            ]
+
+        rebound = []
+        for interface in interfaces:
+            if await self.middleware.call('interface.dhclient_rebind', interface):
+                rebound.append(interface)
+
+        if not rebound:
+            return False
+
+        for interface in rebound:
+            leases = await self.middleware.call('interface.dhclient_leases', interface)
+            if dhcp_gateway_from_leases(leases):
+                return True
+
+        raise CallError('DHCP did not supply an IPv4 gateway after the client was rebound')
 
 
 class NetworkAliasModel(sa.Model):
@@ -2011,15 +2085,23 @@ class InterfaceService(CRUDService):
             if name.startswith(internal_interfaces):
                 continue
 
-            # bridge0/bridge1 are special, may be used by Jails/VM
-            if name in ('bridge0', 'bridge1'):
+            # bridge0/bridge1 are special, may be used by Jails/VM. Runtime
+            # bridges with epair/tap/vnet members are also owned by running
+            # jails/VMs, even when they are not in the network database.
+            if name in ('bridge0', 'bridge1') or self.__bridge_has_transient_members(name, iface):
                 continue
 
             # If there are no interfaces configured we start DHCP on all
+            # physical interfaces.  Unmanaged cloned interfaces still need to
+            # be removed here, otherwise rolling back the last configured
+            # bridge/VLAN leaves it alive in the OS but hidden from middleware.
             if not interfaces:
-                dhclient_aws.append(asyncio.ensure_future(
-                    self.middleware.call('interface.autoconfigure', iface, wait_dhcp)
-                ))
+                if iface.cloned:
+                    await self.middleware.call('interface.unconfigure', iface, cloned_interfaces, parent_interfaces)
+                else:
+                    dhclient_aws.append(asyncio.ensure_future(
+                        self.middleware.call('interface.autoconfigure', iface, wait_dhcp)
+                    ))
             else:
                 # Destroy interfaces which are not in database
 
@@ -2059,6 +2141,17 @@ class InterfaceService(CRUDService):
         )
 
         await self.middleware.call('interface.configure', data, aliases, wait_dhcp, options)
+
+    def __bridge_has_transient_members(self, name, iface):
+        if not name.startswith('bridge'):
+            return False
+
+        try:
+            members = iface.members
+        except AttributeError:
+            return False
+
+        return any(member.startswith(('epair', 'tap', 'vnet')) for member in members)
 
     @accepts(
         Dict(
@@ -2172,7 +2265,7 @@ class RouteService(Service):
         config = await self.middleware.call('datastore.query', 'network.globalconfiguration', [], {'get': True})
 
         # Generate dhclient.conf so we can ignore routes (def gw) option
-        # in case there is one explictly set in network config
+        # in case there is one explicitly set in network config
         await self.middleware.call('etc.generate', 'network')
 
         ipv4_gateway = config['gc_ipv4gateway'] or None
@@ -2190,10 +2283,9 @@ class RouteService(Service):
                 dhclient_running, dhclient_pid = await self.middleware.call('interface.dhclient_status', interface)
                 if dhclient_running:
                     leases = await self.middleware.call('interface.dhclient_leases', interface)
-                    reg_routers = re.search(r'option routers (.+);', leases or '')
-                    if reg_routers:
-                        # Make sure to get first route only
-                        ipv4_gateway = reg_routers.group(1).split(' ')[0]
+                    dhcp_gateway = dhcp_gateway_from_leases(leases)
+                    if dhcp_gateway:
+                        ipv4_gateway = dhcp_gateway
                         break
         routing_table = netif.RoutingTable()
         if ipv4_gateway:
@@ -2227,15 +2319,18 @@ class RouteService(Service):
             ipv6_gateway = netif.Route('::', '::', ipaddress.ip_address(str(ipv6_gateway)), ipv6_gateway_interface)
             ipv6_gateway.flags.add(netif.RouteFlags.STATIC)
             ipv6_gateway.flags.add(netif.RouteFlags.GATEWAY)
+            current_ipv6_gateway = routing_table.default_route_ipv6
             # If there is a gateway but there is none configured, add it
             # Otherwise change it
-            if not routing_table.default_route_ipv6:
+            if not current_ipv6_gateway:
                 self.logger.info('Adding IPv6 default route to {}'.format(ipv6_gateway.gateway))
                 routing_table.add(ipv6_gateway)
-            elif ipv6_gateway != routing_table.default_route_ipv6:
+            elif ipv6_gateway != current_ipv6_gateway or (
+                ipv6_gateway.interface and ipv6_gateway.interface != current_ipv6_gateway.interface
+            ):
                 self.logger.info(
                     'Changing IPv6 default route from {} to {}'.format(
-                        routing_table.default_route_ipv6.gateway, ipv6_gateway.gateway
+                        current_ipv6_gateway.gateway, ipv6_gateway.gateway
                     )
                 )
                 routing_table.change(ipv6_gateway)
@@ -2638,6 +2733,92 @@ async def __activate_service_announcements(middleware, event_type, args):
         await middleware.call("network.configuration.toggle_announcement", srv)
 
 
+# Backstop for the ntpq probe below. ntpq bounds its own reads (ntpq.c:
+# DEFTIMEOUT 5s for the first packet, DEFSTIMEOUT 3s per retry), so in the
+# ordinary not-answering case it returns well inside this. The ceiling exists
+# because middlewared.utils.run() awaits proc.communicate() with no timeout of
+# its own, and this probe runs somewhere a stall is unusually expensive -- see
+# _ntpd_is_synchronised.
+NTPQ_PROBE_TIMEOUT = 10
+
+
+async def _ntpd_is_synchronised(middleware):
+    # `ntpq -c rv` prints `stratum=<n>` for the system peer: < 16 means
+    # synchronised, 16 means not. If ntpd is not answering (not running yet, or
+    # mid-restart) treat it as not synchronised so we start/kick it.
+    #
+    # Bounded deliberately: this runs from interface.post_sync, i.e. at the tail
+    # of interface.sync(), and interface.commit() awaits sync() *inline* and only
+    # arms its rollback timer once sync() returns. So a probe that blocks here
+    # stalls interface reconfiguration at the one point where the rollback
+    # safety net does not yet exist -- a box that loses connectivity mid-apply
+    # would stay that way instead of reverting after checkin_timeout.
+    #
+    # asyncio.TimeoutError is a builtin TimeoutError on 3.11, so the existing
+    # `except Exception` already covers the timeout: an unanswered probe reads as
+    # "not synchronised", which is the same conclusion the old code drew.
+    try:
+        cp = await asyncio.wait_for(
+            run('ntpq', '-c', 'rv', encoding='utf-8', errors='ignore', check=False),
+            timeout=NTPQ_PROBE_TIMEOUT,
+        )
+    except Exception:
+        return False
+    if cp.returncode != 0:
+        return False
+    m = re.search(r'stratum=(\d+)', cp.stdout)
+    return bool(m) and int(m.group(1)) < 16
+
+
+async def ntpd_interface_post_sync(middleware):
+    # the internal development record: FreeBSD 15's ntpd (4.2.8p18) never recovers from an
+    # early-boot network disruption where 13.3 (ntpd 4.2.8p16) did. At boot ntpd
+    # runs (rc: REQUIRE DAEMON ntpdate) and resolves its `server <pool>.ntp.org`
+    # hostnames exactly once -- before this network setup has written a usable
+    # /etc/resolv.conf on a static-IP box -- so resolution fails and the
+    # associations are left unresolved (.POOL., stratum 16); and even once
+    # resolved, the interface coming up resets them (.XFAC., reach 0). Either
+    # way ntpd stays permanently unsynchronised though DNS and the network are
+    # fine within a minute -- reproduced stuck 7+ min with the pool resolving on
+    # every probe -- and only a restart recovers it. interface.post_sync fires
+    # once the interface is configured, routes are set and resolv.conf is written
+    # (a known-stable point), so restart ntpd here when it is not synchronised.
+    # No-op on a healthy box: this hook only fires on interface syncs, and only
+    # restarts when ntpd is actually stuck (so it also heals a later interface
+    # edit that trips the same reset).
+    #
+    # the internal development record: never do this while the system is still booting.
+    # interface.sync runs several times during boot, before /etc/rc has reached
+    # ntpd (ntpd_enable="YES"), and "ntpd not answering" then only means "not
+    # started yet".  Restarting here started a second ntpd that raced rc's for
+    # [::]:123 on every boot ("unable to bind to wildcard address ::" /
+    # "failed to start ntpd").  The boot case is handled once, after
+    # system.ready, by _ntpd_system_ready below.
+    if not await middleware.call('system.ready'):
+        return
+    if not await _ntpd_is_synchronised(middleware):
+        middleware.create_task(middleware.call('service.restart', 'ntpd'))
+
+
+# Seconds to give rc's ntpd after system.ready before deciding it is stuck.  The
+# #237 failure mode is permanent (associations never resolve), so waiting costs
+# nothing on a healthy box and avoids restarting an ntpd that is merely young.
+NTPD_READY_GRACE = 90
+
+
+async def _ntpd_system_ready(middleware, event_type, args):
+    if args['id'] != 'ready':
+        return
+    await asyncio.sleep(NTPD_READY_GRACE)
+    if await _ntpd_is_synchronised(middleware):
+        return
+    middleware.logger.info(
+        'ntpd is not synchronised %d s after system ready; restarting it (the internal development record)',
+        NTPD_READY_GRACE,
+    )
+    await middleware.call('service.restart', 'ntpd')
+
+
 async def setup(middleware):
     middleware.event_register('network.config', 'Sent on network configuration changes.')
 
@@ -2648,6 +2829,11 @@ async def setup(middleware):
     # Listen to IFNET events so we can sync on interface attach
     middleware.register_hook('devd.ifnet', devd_ifnet_hook)
     middleware.event_subscribe('system', __activate_service_announcements)
+
+    # the internal development record: restart ntpd once the network is fully settled if
+    # it has not synchronised -- FreeBSD 15's ntpd does not self-heal a boot race.
+    middleware.register_hook('interface.post_sync', ntpd_interface_post_sync)
+    middleware.event_subscribe('system', _ntpd_system_ready)
 
     # Only run DNS sync in the first run. This avoids calling the routine again
     # on middlewared restart.

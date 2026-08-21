@@ -23,8 +23,9 @@ if __name__ == "__main__":
     c.execute("SELECT * FROM system_advanced")
     advanced = {k.replace("adv_", ""): v for k, v in c.fetchone().items()}
 
+    distributor = "TrueNAS" if osc.IS_FREEBSD else "TrueNAS Scale"
     config = [
-        'GRUB_DISTRIBUTOR="TrueNAS Scale"',
+        f'GRUB_DISTRIBUTOR="{distributor}"',
         'GRUB_CMDLINE_LINUX_DEFAULT=""',
     ]
 
