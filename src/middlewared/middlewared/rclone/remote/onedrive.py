@@ -4,13 +4,16 @@ import json
 import os
 
 import bidict
-import onedrivesdk
-import onedrivesdk.session
+try:
+    import onedrivesdk
+    import onedrivesdk.session
+except ImportError:
+    onedrivesdk = None
 import pytz
 
 from middlewared.rclone.base import BaseRcloneRemote
 from middlewared.schema import Dict, Str
-from middlewared.service import accepts
+from middlewared.service import CallError, accepts
 
 DRIVES_TYPES = bidict.bidict({
     "PERSONAL": "personal",
@@ -19,24 +22,27 @@ DRIVES_TYPES = bidict.bidict({
 })
 
 
-class RcloneTokenSession(onedrivesdk.session.Session):
-    @staticmethod
-    def load_session(**load_session_kwargs):
-        client_id = load_session_kwargs["client_id"]
-        client_secret = load_session_kwargs["client_secret"]
-        token = json.loads(load_session_kwargs["token"])
+if onedrivesdk is not None:
+    class RcloneTokenSession(onedrivesdk.session.Session):
+        @staticmethod
+        def load_session(**load_session_kwargs):
+            client_id = load_session_kwargs["client_id"]
+            client_secret = load_session_kwargs["client_secret"]
+            token = json.loads(load_session_kwargs["token"])
 
-        return RcloneTokenSession(
-            token["token_type"],
-            (datetime.now(pytz.timezone(os.environ["TZ"])) - isodate.parse_datetime(token["expiry"])).total_seconds(),
-            token["scope"],
-            token["access_token"],
-            client_id,
-            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-            None,
-            token["refresh_token"],
-            client_secret,
-        )
+            return RcloneTokenSession(
+                token["token_type"],
+                (datetime.now(pytz.timezone(os.environ["TZ"])) - isodate.parse_datetime(token["expiry"])).total_seconds(),
+                token["scope"],
+                token["access_token"],
+                client_id,
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                None,
+                token["refresh_token"],
+                client_secret,
+            )
+else:
+    RcloneTokenSession = None
 
 
 class OneDriveRcloneRemote(BaseRcloneRemote):
@@ -90,6 +96,13 @@ class OneDriveRcloneRemote(BaseRcloneRemote):
 
             [{"drive_type": "PERSONAL", "drive_id": "6bb903a25ad65e46"}]
         """
+
+        if onedrivesdk is None:
+            raise CallError(
+                "OneDrive drive listing requires the py-onedrivesdk package, which is no "
+                "longer distributed on FreeBSD 15 (upstream-abandoned). Configure the "
+                "cloud-sync task with drive_id=root or use rclone configure manually."
+            )
 
         if not credentials["client_id"]:
             credentials["client_id"] = "b15665d9-eda6-4092-8539-0eec376afd59"

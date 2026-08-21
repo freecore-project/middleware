@@ -6,6 +6,11 @@ import time
 
 from middlewared.service import lock, private, Service
 
+from .utils import reconcile_hostname_link
+
+
+FUTURE_RRD_GRACE_SECONDS = 300
+
 
 def get_members(tar, prefix):
     for tarinfo in tar.getmembers():
@@ -17,11 +22,80 @@ def get_members(tar, prefix):
 class ReportingService(Service):
 
     @private
+    def remove_future_rrds(self, rrd_dir):
+        """
+        RRD refuses updates older than a database's last update timestamp.
+        If the system clock is corrected backwards after early boot, any RRDs
+        created before the correction can spam collectd until wall time catches
+        up. Drop only those future-dated files and let collectd recreate them.
+        """
+        rrdtool = shutil.which('rrdtool')
+        if rrdtool is None:
+            self.middleware.logger.debug('Skipping future RRD check: rrdtool is not available')
+            return 0
+
+        now = int(time.time())
+        removed = 0
+        max_skew = 0
+        localhost_dir = os.path.join(rrd_dir, 'localhost')
+        if not os.path.isdir(localhost_dir):
+            return 0
+
+        for dirpath, _dirnames, filenames in os.walk(localhost_dir):
+            for filename in filenames:
+                if not filename.endswith('.rrd'):
+                    continue
+
+                path = os.path.join(dirpath, filename)
+                try:
+                    cp = subprocess.run(
+                        [rrdtool, 'last', path],
+                        capture_output=True,
+                        check=False,
+                        text=True,
+                        timeout=5,
+                    )
+                    if cp.returncode != 0:
+                        self.middleware.logger.debug(
+                            'Failed to read RRD last update for %s: %s', path, cp.stderr.strip()
+                        )
+                        continue
+
+                    last_update = int(cp.stdout.strip())
+                except Exception:
+                    self.middleware.logger.debug('Failed to inspect RRD timestamp for %s', path, exc_info=True)
+                    continue
+
+                skew = last_update - now
+                if skew <= FUTURE_RRD_GRACE_SECONDS:
+                    continue
+
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    self.middleware.logger.warning('Failed to remove future-dated RRD %s', path, exc_info=True)
+                    continue
+
+                removed += 1
+                max_skew = max(max_skew, skew)
+
+        if removed:
+            self.middleware.logger.warning(
+                'Removed %d reporting RRD files with timestamps up to %d seconds in the future',
+                removed,
+                max_skew,
+            )
+
+        return removed
+
+    @private
     @lock('reporting.setup')
     def setup(self):
         systemdatasetconfig = self.middleware.call_sync('systemdataset.config')
         if not systemdatasetconfig['path']:
-            self.middleware.logger.error('System dataset is not mounted')
+            self.middleware.logger.debug('System dataset not yet mounted — reporting.setup deferred')
             return False
 
         rrd_mount = f'{systemdatasetconfig["path"]}/rrd-{systemdatasetconfig["uuid"]}'
@@ -72,29 +146,9 @@ class ReportingService(Service):
                     )
             shutil.move(os.path.join(pwd, hostname), os.path.join(pwd, 'localhost'))
 
-        for item in os.listdir(pwd):
-            if item == 'localhost' or item.startswith('localhost.bak.'):
-                continue
+        reconcile_hostname_link(pwd, hostname)
 
-            path = os.path.join(pwd, item)
-
-            if os.path.islink(path):
-                # Remove all symlinks (that are stale if hostname was changed)
-                os.unlink(path)
-            elif os.path.isdir(path):
-                # Remove all directories except "localhost" and its backups (that may be erroneously created by
-                # running collectd before this script)
-                subprocess.run(['rm', '-rfx', path])
-            else:
-                os.unlink(path)
-
-        # Create "localhost" directory if it does not exist
-        if not os.path.exists(os.path.join(pwd, 'localhost')):
-            os.makedirs(os.path.join(pwd, 'localhost'))
-
-        # Create "${hostname}" -> "localhost" symlink if necessary
-        if hostname != 'localhost':
-            os.symlink(os.path.join(pwd, 'localhost'), os.path.join(pwd, hostname))
+        self.remove_future_rrds(pwd)
 
         # Let's return a positive value to indicate that necessary collectd operations were performed successfully
         return True

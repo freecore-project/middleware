@@ -76,6 +76,9 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
               "params": ["account.bsdusers", [ ["username", "=", "root" ] ], {"get": true}]
             }
         """
+        stub = await self.middleware.call('datastore.stub.handle_removed_tables', name, filters, options)
+        if stub is not None:
+            return stub
         table = self._get_table(name)
 
         # We do not want to make changes to original options
