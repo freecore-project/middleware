@@ -1,0 +1,63 @@
+{
+  "app": "lidarr",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Lidarr",
+  "comment": "Lidarr keeps everything in one data directory (-data=): database, config.xml, backups. The FreeBSD package's rc.d script and the LinuxServer image both point it at one directory; the Daemonless image runs it with -data=/config.",
+  "target": {
+    "catalog_id": "daemonless:lidarr",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8686
+  },
+  "sources": {
+    "jail": {
+      "pkg": "lidarr",
+      "rc_script": "lidarr",
+      "rc_data_var": "lidarr_data_dir",
+      "detect": [
+        "usr/local/etc/rc.d/lidarr"
+      ],
+      "data": "usr/local/lidarr",
+      "uid": 356
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/lidarr",
+        "ghcr.io/linuxserver/lidarr",
+        "docker.io/linuxserver/lidarr",
+        "ghcr.io/hotio/lidarr"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/lidarr",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

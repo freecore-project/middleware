@@ -21,7 +21,7 @@ class InterfaceService(Service):
             iface = netif.get_interface(vlan['vlan_vint'])
 
         if disable_capabilities:
-            self.middleware.call('interface.disable_capabilities', vlan['vlan_vint'])
+            self.middleware.call_sync('interface.disable_capabilities', vlan['vlan_vint'])
 
         if iface.parent != vlan['vlan_pint'] or iface.tag != vlan['vlan_tag'] or iface.pcp != vlan['vlan_pcp']:
             iface.unconfigure()

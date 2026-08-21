@@ -16,7 +16,9 @@ run_kw = dict(check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encodi
 
 class UpdateService(Service):
     @private
-    def install_scale(self, mounted, progress_callback):
+    def install_scale(self, mounted, progress_callback, old_root="/"):
+        # `old_root` is where the update file's installer copies /data, /root and the hostid from
+        # (the internal development record hands it a staged root with the database SCALE accepts).
         with open(os.path.join(mounted, "manifest.json")) as f:
             manifest = json.load(f)
 
@@ -32,16 +34,20 @@ class UpdateService(Service):
             if our_checksum != checksum:
                 raise CallError(f"Checksum mismatch for {file!r}: {our_checksum} != {checksum}")
 
+        disks = self.middleware.call_sync("boot.get_disks")
         command = {
-            "disks": self.middleware.call_sync("boot.get_disks"),
+            "disks": disks,
             "json": True,
-            "old_root": "/",
+            "old_root": old_root,
             "pool_name": boot_pool_name,
             "src": mounted,
         }
 
         if osc.IS_FREEBSD:
-            command["devices"] = self.middleware.call_sync("zfs.pool.get_devices", boot_pool_name)
+            devices = self.middleware.call_sync("zfs.pool.get_devices", boot_pool_name)
+            command["devices"] = devices
+            # Log device names to aid debugging NVMe nvd->nda naming transition on FB14+
+            logger.info("Boot pool %r devices: %s, disks: %s", boot_pool_name, devices, disks)
 
         p = subprocess.Popen(
             ["python3", "-m", "truenas_install"], cwd=mounted, stdin=subprocess.PIPE,

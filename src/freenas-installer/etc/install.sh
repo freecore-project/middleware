@@ -362,7 +362,7 @@ install_loader()
 	    mount -t msdosfs /dev/${_disk}p1 /tmp/efi
 	    # Copy the .efi file and create a fallback startup script
 	    mkdir -p /tmp/efi/efi/boot
-	    cp ${_mnt}/boot/boot1.efi /tmp/efi/efi/boot/BOOTx64.efi
+	    cp ${_mnt}/boot/loader.efi /tmp/efi/efi/boot/BOOTx64.efi
 	    echo "BOOTx64.efi" > /tmp/efi/efi/boot/startup.nsh
 	    umount /tmp/efi
 	else
@@ -589,9 +589,20 @@ partition_disks()
     else
 	_mirror=""
     fi
+    # the internal development record: ashift 12, as TrueNAS SCALE's installer sets it. Left to itself ZFS follows the
+    # physical sector size, and a disk reporting 16 KiB (a VM disk on a 16K zvol) made an ashift-14 boot pool
+    # that GRUB -- which the in-place move to SCALE installs -- cannot read. A disk whose logical sector is
+    # larger than 4 KiB refuses ashift 12, so such a disk keeps the automatic choice.
+    _ashift="-o ashift=12"
+    for _disk in ${_disks}; do
+	if [ "$(diskinfo ${_disk} | cut -f 2)" -gt 4096 ]; then
+	    _ashift=""
+	fi
+    done
+
     # Regardless of upgrade/fresh installation, if we are creating a new pool, it's going to be named after value of NEW_BOOT_POOL
     BOOT_POOL=${NEW_BOOT_POOL}
-    zpool create -f -o cachefile=/tmp/zpool.cache -o compatibility=grub2 -O mountpoint=none -O atime=off -O canmount=off ${BOOT_POOL} ${_mirror} ${_disksparts}
+    zpool create -f ${_ashift} -o cachefile=/tmp/zpool.cache -o compatibility=grub2 -O mountpoint=none -O atime=off -O canmount=off ${BOOT_POOL} ${_mirror} ${_disksparts}
     zfs set compression=on ${BOOT_POOL}
     zfs create -o canmount=off ${BOOT_POOL}/ROOT
     zfs create -o mountpoint=legacy ${BOOT_POOL}/ROOT/${BENAME}
@@ -790,10 +801,15 @@ cleanup()
     zpool export -f ${NEW_BOOT_POOL}
 }
 
+# the internal development record: taken by menu_install, released there or in abort()
+# below, which exits the script from inside the install flow.
+INSTALL_LOCK=/tmp/.install-running
+
 abort()
 {
     set +e +x
     trap - EXIT
+    rmdir "${INSTALL_LOCK}" 2> /dev/null
     exit 1
 }
 
@@ -813,7 +829,25 @@ doing_upgrade()
     test -d /tmp/data_preserved
 }
 
+# the internal development record: the installer now runs on every console, so the
+# install itself must run on one of them at a time.  mkdir(1) is the atomic
+# primitive the ISO carries (/rescue has no lockf).
 menu_install()
+{
+    local _rc
+
+    if ! mkdir "${INSTALL_LOCK}" 2> /dev/null; then
+	dialog --title "$AVATAR_PROJECT $AVATAR_VERSION" --msgbox \
+	    "An installation is already running on another console." 5 60
+	return 1
+    fi
+    menu_install_locked "$@"
+    _rc=$?
+    rmdir "${INSTALL_LOCK}" 2> /dev/null
+    return ${_rc}
+}
+
+menu_install_locked()
 {
     local _action
     local _disklist
@@ -891,11 +925,17 @@ menu_install()
         done
 	    
         _tmpfile="/tmp/answer"
+        # dialog(1) draws 6 rows of chrome (outer border, list frame and
+        # button row) and wraps the prompt below to 5 lines at width 60;
+        # every row the box height falls short of chrome + prompt + items
+        # is taken from the drive list, which then scrolls one drive at a
+        # time behind a percentage indicator (the internal development record).
+        # 13.3 budgeted 9 + items for its 3-line prompt.
         if [ ${_items} -ge 10 ]; then
             _items=10
-            _menuheight=20
+            _menuheight=22
         else
-            _menuheight=9
+            _menuheight=11
             _menuheight=$((${_menuheight} + ${_items}))
         fi
         if [ "${_items}" -eq 0 ]; then
@@ -905,7 +945,7 @@ menu_install()
         fi
 
         eval "dialog --title 'Choose destination media' \
-            --checklist 'Select one or more drives where $AVATAR_PROJECT should be installed (use arrow keys to navigate to the drive(s) for installation; select a drive with the spacebar).' \
+            --checklist 'Select drives: one creates a single-device boot pool; two or more create a mirrored boot pool for redundancy. All selected drives are erased and reserved for boot use. Use arrow keys to navigate and the spacebar to select.' \
             ${_menuheight} 60 ${_items} ${_list}" 2>${_tmpfile}
         [ $? -eq 0 ] || abort
     fi
@@ -1062,7 +1102,7 @@ menu_install()
 	chown -R www:www /tmp/data/data
     fi
 
-    local OS=TrueNAS
+    local OS=${AVATAR_PROJECT}
 
     # Tell it to look in /.mount for the packages.
     /usr/local/bin/freenas-install -P /.mount/${OS}/Packages -M /.mount/${OS}-MANIFEST /tmp/data

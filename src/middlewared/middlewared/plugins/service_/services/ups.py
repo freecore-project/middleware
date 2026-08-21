@@ -7,6 +7,9 @@ import psutil
 from middlewared.utils import run
 
 from .base import SimpleService
+from .base_state import ServiceState
+
+UPSD_PIDFILE = "/var/db/nut/upsd.pid"
 
 
 class UPSService(SimpleService):
@@ -20,6 +23,27 @@ class UPSService(SimpleService):
     freebsd_procname = "upsmon"
 
     systemd_unit = "nut-monitor"
+
+    async def _get_state_freebsd(self):
+        # the internal development record (Codeberg freecore#111): upsmon alone is not a
+        # working UPS service. In MASTER mode the rc `nut` script starts the driver in
+        # its precmd and upsd as its command; when the driver cannot reach the UPS at
+        # boot (a network UPS behind a LACP trunk that is still negotiating, a USB UPS
+        # that enumerates late) the precmd fails, rc skips upsd, and `nut_upsmon` /
+        # `nut_upslog` start anyway because rcorder only orders them after `nut`. The
+        # inherited 13.3 state check then reports RUNNING on the upsmon pid while
+        # nothing listens on 3493 and every upsc query is refused. Require upsd too, so
+        # the state (and `service.start`'s return value, which is this state) is honest.
+        # SLAVE mode has no local upsd and keeps the upsmon-only check.
+        state = await super()._get_state_freebsd()
+        if not state.running:
+            return state
+        if (await self.middleware.call("ups.config"))["mode"] != "MASTER":
+            return state
+        upsd = await run("pgrep", "-F", UPSD_PIDFILE, "upsd", check=False, encoding="utf-8")
+        if upsd.returncode != 0:
+            return ServiceState(False, [])
+        return ServiceState(True, state.pids + [int(i) for i in upsd.stdout.split() if i.isdigit()])
 
     async def before_start(self):
         await self.middleware.call("ups.dismiss_alerts")

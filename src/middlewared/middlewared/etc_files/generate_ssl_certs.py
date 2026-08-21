@@ -26,7 +26,13 @@ def write_certificates(certs, cacerts):
     """
     if not cacerts:
         if osc.IS_FREEBSD:
-            ca_root_path = '/usr/local/share/certs/ca-root-nss.crt'
+            for ca_root_path in (
+                '/usr/local/share/certs/ca-root-nss.crt',
+                '/etc/ssl/cert.pem',
+                '/usr/share/certs/ca-root-nss.crt',
+            ):
+                if os.path.exists(ca_root_path):
+                    break
         elif osc.IS_LINUX:
             ca_root_path = '/etc/ssl/certs/ca-certificates.crt'
         else:
@@ -36,7 +42,7 @@ def write_certificates(certs, cacerts):
         with open('/etc/ssl/truenas_cacerts.pem', 'w') as f:
             f.write('## USER PROVIDED CA CERTIFICATES ##\n')
             for c in cacerts:
-                if cert['chain_list']:
+                if c['chain_list']:
                     f.write('\n'.join(c['chain_list']))
                     f.write('\n\n')
 

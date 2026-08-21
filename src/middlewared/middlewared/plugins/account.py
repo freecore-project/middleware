@@ -9,7 +9,8 @@ from middlewared.validators import Email
 from middlewared.plugins.smb import SMBBuiltin
 
 import binascii
-import crypt
+import ctypes
+import ctypes.util
 import errno
 import glob
 import hashlib
@@ -19,6 +20,8 @@ import shlex
 import shutil
 import string
 import stat
+import struct
+import threading
 import time
 from pathlib import Path
 from contextlib import suppress
@@ -56,17 +59,99 @@ def pw_checkname(verrors, attribute, name):
         )
 
 
+_libcrypt_path = ctypes.util.find_library('crypt')
+if _libcrypt_path is None:
+    # On FreeBSD 15, /usr/lib/libcrypt.so is an ld linker script (not ELF)
+    # and ctypes.util.find_library can't validate it. Use the versioned
+    # SONAME directly — ld.so resolves it via ldconfig to /lib/libcrypt.so.5.
+    # (Note: crypt(3) is NOT in libc on FB15 — moved entirely into libcrypt.)
+    _libcrypt_path = 'libcrypt.so.5'
+_libcrypt = ctypes.CDLL(_libcrypt_path)
+_libcrypt.crypt.restype = ctypes.c_char_p
+_libcrypt.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_crypt_lock = threading.Lock()
+
+
+def _crypt(word, salt):
+    """Call crypt(3) directly via ctypes (replacement for removed Python crypt module)."""
+    with _crypt_lock:
+        result = _libcrypt.crypt(word.encode('utf-8'), salt.encode('utf-8'))
+    if result is None:
+        raise OSError('crypt() returned NULL')
+    return result.decode('utf-8')
+
+
 def crypted_password(cleartext):
     """
     Generates an unix hash from `cleartext`.
     """
-    return crypt.crypt(cleartext, '$6$' + ''.join([
+    return _crypt(cleartext, '$6$' + ''.join([
         random.choice(string.ascii_letters + string.digits) for _ in range(16)]
     ))
 
 
+def _md4(data: bytes) -> bytes:
+    """Pure-Python MD4 (RFC 1320) for NT hash computation.
+
+    OpenSSL 3 (FB15 base) moved MD4 to the legacy provider, which is not
+    loaded by default, so hashlib.new('md4', ...) raises ValueError. CPython
+    has no built-in MD4, so we fall back to this implementation. Only used
+    when OpenSSL refuses md4; FB13's OpenSSL 1.1 still serves md4 directly.
+    """
+    h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]
+    msg = bytearray(data)
+    orig_len_bits = (8 * len(data)) & 0xFFFFFFFFFFFFFFFF
+    msg.append(0x80)
+    while len(msg) % 64 != 56:
+        msg.append(0)
+    msg += struct.pack('<Q', orig_len_bits)
+
+    mask = 0xFFFFFFFF
+
+    def f(x, y, z):
+        return (x & y) | ((~x) & z & mask)
+
+    def g(x, y, z):
+        return (x & y) | (x & z) | (y & z)
+
+    def hh(x, y, z):
+        return x ^ y ^ z
+
+    def lrot(v, n):
+        v &= mask
+        return ((v << n) | (v >> (32 - n))) & mask
+
+    r1_idx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    r1_sh = [3, 7, 11, 19] * 4
+    r2_idx = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]
+    r2_sh = [3, 5, 9, 13] * 4
+    r3_idx = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]
+    r3_sh = [3, 9, 11, 15] * 4
+
+    for chunk_off in range(0, len(msg), 64):
+        X = list(struct.unpack('<16I', bytes(msg[chunk_off:chunk_off + 64])))
+        A, B, C, D = h
+        for i, s in zip(r1_idx, r1_sh):
+            A = lrot(A + f(B, C, D) + X[i], s)
+            A, D, C, B = D, C, B, A
+        for i, s in zip(r2_idx, r2_sh):
+            A = lrot(A + g(B, C, D) + X[i] + 0x5A827999, s)
+            A, D, C, B = D, C, B, A
+        for i, s in zip(r3_idx, r3_sh):
+            A = lrot(A + hh(B, C, D) + X[i] + 0x6ED9EBA1, s)
+            A, D, C, B = D, C, B, A
+        h = [(h[0] + A) & mask, (h[1] + B) & mask,
+             (h[2] + C) & mask, (h[3] + D) & mask]
+
+    return struct.pack('<4I', *h)
+
+
 def nt_password(cleartext):
-    nthash = hashlib.new('md4', cleartext.encode('utf-16le')).digest()
+    encoded = cleartext.encode('utf-16le')
+    try:
+        nthash = hashlib.new('md4', encoded, usedforsecurity=False).digest()
+    except (ValueError, TypeError):
+        nthash = _md4(encoded)
     return binascii.hexlify(nthash).decode().upper()
 
 
@@ -177,6 +262,21 @@ class UserService(CRUDService):
         if 'id_type_both' in user:
             user.pop('id_type_both')
         return user
+
+    @private
+    async def sync_smb_username_map(self, microsoft_account_before, microsoft_account_after):
+        """
+        the internal development record: smb4.conf names the username map only while some user is a
+        Microsoft account, and a user change reloads the `user` etc group, which renders the
+        map file but not smb4.conf. When the flag changes, reload SMB so smbd follows now
+        instead of at its next reload. A stopped SMB service renders the current state when
+        it starts.
+        """
+        if bool(microsoft_account_before) == bool(microsoft_account_after):
+            return
+
+        if await self.middleware.call('service.started', 'cifs'):
+            await self.middleware.call('service.reload', 'cifs')
 
     @filterable
     async def query(self, filters=None, options=None):
@@ -372,6 +472,7 @@ class UserService(CRUDService):
             raise
 
         await self.middleware.call('service.reload', 'user')
+        await self.sync_smb_username_map(False, data['microsoft_account'])
 
         if data['smb']:
             gm_job = await self.middleware.call('smb.synchronize_passdb')
@@ -493,6 +594,8 @@ class UserService(CRUDService):
         else:
             home_copy = False
 
+        microsoft_account_before = user['microsoft_account']
+
         # After this point user dict has values from data
         user.update(data)
 
@@ -571,6 +674,7 @@ class UserService(CRUDService):
         await self.middleware.call('datastore.update', 'account.bsdusers', pk, user, {'prefix': 'bsdusr_'})
 
         await self.middleware.call('service.reload', 'user')
+        await self.sync_smb_username_map(microsoft_account_before, user['microsoft_account'])
         if user['smb'] and must_change_pdb_entry:
             gm_job = await self.middleware.call('smb.synchronize_passdb')
             await gm_job.wait()
@@ -639,6 +743,7 @@ class UserService(CRUDService):
 
         await self.middleware.call('datastore.delete', 'account.bsdusers', pk)
         await self.middleware.call('service.reload', 'user')
+        await self.sync_smb_username_map(user['microsoft_account'], False)
 
         return pk
 
