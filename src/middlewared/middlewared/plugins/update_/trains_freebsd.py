@@ -3,10 +3,70 @@ import re
 
 import requests
 
-from freenasOS import Configuration, Train
-from freenasOS.Update import CheckForUpdates, GetServiceDescription
+try:
+    from freenasOS import Configuration, Train
+    from freenasOS.Exceptions import UpdateNetworkFileNotFoundException
+    from freenasOS.Update import CheckForUpdates, GetServiceDescription
+except ImportError:
+    from middlewared.utils.freenasOS import Configuration, Train
+    from middlewared.utils.freenasOS.Exceptions import UpdateNetworkFileNotFoundException
+    from middlewared.utils.freenasOS.Update import CheckForUpdates, GetServiceDescription
 
 from middlewared.service import private, Service
+
+from .utils import can_update
+
+
+FREECORE_UPDATE_SERVER = 'https://updates.freecore.org/FreeCORE'
+
+
+def manifest_build_time(manifest):
+    try:
+        value = manifest.dict().get('BuildTime')
+    except Exception:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def manifest_train(manifest):
+    try:
+        return manifest.dict().get('Train')
+    except Exception:
+        return None
+
+
+def manifest_is_newer(current, latest):
+    """Is `latest` an upgrade over `current`?
+
+    BuildTime orders builds within ONE train.  It cannot order two trains:
+    the 15.0 and 15.1 lines are built on independent schedules, so a 15.0
+    maintenance release cut after a 15.1 candidate carries the larger
+    BuildTime while being the older product.  Comparing them refuses a
+    legitimate cross-train upgrade -- and would refuse it for every future
+    15.0 update, permanently stranding those systems on 15.0.
+
+    the internal development record, which added this gate, was about a Nightlies
+    train serving an older MASTER than the installed one.  That is the
+    same-train case, where BuildTime is meaningful, and it is preserved
+    below.  Across trains, defer to can_update() -- the same comparison
+    install_freebsd.py applies before anything is written, so the check now
+    agrees with what the installer will actually permit.
+    """
+    current_train = manifest_train(current)
+    latest_train = manifest_train(latest)
+    if current_train and latest_train and current_train != latest_train:
+        return can_update(current.Version(), latest.Version())
+
+    current_build_time = manifest_build_time(current)
+    latest_build_time = manifest_build_time(latest)
+    if current_build_time is None or latest_build_time is None:
+        return True
+
+    return latest_build_time > current_build_time
 
 
 class CheckUpdateHandler(object):
@@ -116,9 +176,13 @@ class UpdateService(Service):
                 'sequence': train.LastSequence(),
             }
 
-        if not self.middleware.call_sync('system.is_enterprise'):
-            scale_trains = self.middleware.call_sync('update.get_scale_trains_data')
-            trains.update(**scale_trains['trains'])
+        master_update_server = (conf.UpdateServerMaster() or '').rstrip('/')
+        if not self.middleware.call_sync('system.is_enterprise') and master_update_server != FREECORE_UPDATE_SERVER:
+            try:
+                scale_trains = self.middleware.call_sync('update.get_scale_trains_data')
+                trains.update(**scale_trains['trains'])
+            except Exception:
+                self.logger.warning('Failed to retrieve SCALE trains', exc_info=True)
 
         return {
             'trains': trains,
@@ -155,13 +219,26 @@ class UpdateService(Service):
             return self.middleware.call_sync('update.get_scale_update', train, old_version)
 
         handler = CheckUpdateHandler()
-        manifest = CheckForUpdates(
-            diff_handler=handler.diff_call,
-            handler=handler.call,
-            train=train,
-        )
+        try:
+            manifest = CheckForUpdates(
+                diff_handler=handler.diff_call,
+                handler=handler.call,
+                train=train,
+            )
+        except UpdateNetworkFileNotFoundException as e:
+            self.logger.debug('FreeBSD update train %r has no latest manifest: %s', train, e)
+            return {'status': 'UNAVAILABLE'}
 
         if not manifest:
+            return {'status': 'UNAVAILABLE'}
+
+        conf = Configuration.Configuration()
+        sys_mani = conf.SystemManifest()
+        if sys_mani and not manifest_is_newer(sys_mani, manifest):
+            self.logger.debug(
+                'FreeBSD update train %r latest manifest %r is not newer than system manifest %r',
+                train, manifest.Version(), sys_mani.Version(),
+            )
             return {'status': 'UNAVAILABLE'}
 
         data = {
@@ -171,8 +248,6 @@ class UpdateService(Service):
             'notes': manifest.Notes(),
         }
 
-        conf = Configuration.Configuration()
-        sys_mani = conf.SystemManifest()
         if sys_mani:
             sequence = sys_mani.Sequence()
         else:
