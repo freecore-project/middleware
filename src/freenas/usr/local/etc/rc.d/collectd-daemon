@@ -21,6 +21,7 @@ rcvar=collectd_daemon_enable
 load_rc_config collectd_daemon
 
 : ${collectd_daemon_enable:="NO"}
+: ${collectd_daemon_stop_timeout:="30"}
 
 pidfile=${collectd_daemon_pidfile:="/var/run/collectd-daemon.pid"}
 
@@ -37,7 +38,7 @@ collectd_daemon_start()
 
 collectd_daemon_stop()
 {
-    local collectd_pid d_pid
+    local collectd_pid d_pid left_pids
 
     collectd_pid="$(check_pidfile "/var/run/collectd.pid" "/usr/local/sbin/collectd")"
     d_pid="$(check_pidfile ${pidfile} ${command})"
@@ -70,8 +71,23 @@ collectd_daemon_stop()
 	return 0
     fi
 
+    # collectd may not exit on SIGTERM while a write plugin is blocked (e.g. write_graphite
+    # connecting to a host that does not answer), and neither daemon(8) nor wait_for_pids
+    # gives up on it, so every caller of stop would hang. Bound the wait, then SIGKILL.
+    left_pids="$(pwait -t "${collectd_daemon_stop_timeout}" -p $collectd_pid $d_pid 2>/dev/null)"
+    if [ -n "${left_pids}" ]; then
+        echo "collectd-daemon did not stop within ${collectd_daemon_stop_timeout}s, killing pids:" ${left_pids}
+        kill -KILL ${left_pids}
+    fi
+
     wait_for_pids "$collectd_pid" "$d_pid"
-    return $?
+    _rv=$?
+
+    # Remove stale pidfiles so the next start of daemon(8) doesn't abort
+    # with "process already running, pid: -1" on an empty pidfile left behind.
+    rm -f "/var/run/collectd.pid" "${pidfile}"
+
+    return $_rv
 }
 
 run_rc_command "$1"

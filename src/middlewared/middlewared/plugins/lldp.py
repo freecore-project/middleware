@@ -45,7 +45,8 @@ class LLDPService(SystemServiceService):
         new.update(data)
 
         verrors = ValidationErrors()
-        if new['country'] not in await self.country_choices():
+        # An empty country is the default and means no LLDP location support (ladvd runs without -c).
+        if new['country'] and new['country'] not in await self.country_choices():
             verrors.add('lldp_update.country', f'{new["country"]} not in countries recognized by the system.')
         verrors.check()
 

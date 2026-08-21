@@ -1,5 +1,7 @@
+import errno
 import os
 import shutil
+import stat
 import textwrap
 
 from middlewared.client.utils import Struct
@@ -8,6 +10,38 @@ from middlewared.plugins.afp import AFPLogLevel
 
 DEFAULT_CNID_DB_PATH = '/var/db/system/netatalk/CNID'
 APPLEDB_FILE = '.AppleDB'
+
+
+def write_owned_file(dir_fd, name, content, uid, gid):
+    """
+    Write `content` to `name` in the directory `dir_fd` as root, then make it 0644 and owned by uid:gid,
+    without ever following a symlink or writing through a hard link (the internal development record).
+
+    The share root belongs to the share's user, who controls every name in it: a symlink in place of the
+    file is removed (unlink never follows it) and the file created anew; a FIFO, a directory or a file with
+    a second link is refused (OSError), so nothing outside the share is touched and the render never blocks.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, 0o644, dir_fd=dir_fd)
+    except OSError as e:
+        # FreeBSD answers EMLINK for O_NOFOLLOW on a symlink, Linux ELOOP.
+        if e.errno not in (errno.EMLINK, errno.ELOOP):
+            raise
+        os.unlink(name, dir_fd=dir_fd)
+        fd = os.open(name, flags | os.O_EXCL, 0o644, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(errno.EPERM, f'{name}: not a plain file with a single link')
+        os.ftruncate(fd, 0)
+        data = content.encode()
+        while data:
+            data = data[os.write(fd, data):]
+        os.fchmod(fd, 0o644)
+        os.fchown(fd, uid, gid)
+    finally:
+        os.close(fd)
 
 
 def get_interface(middleware, ipaddress):
@@ -237,42 +271,35 @@ def render(service, middleware):
         timemachine_quota_plist_managed_flag = os.path.join(share.afp_path,
                                                             ".com.apple.TimeMachine.quota.plist.FreeNAS-managed")
         if share.afp_timemachine and share.afp_timemachine_quota:
+            quota_plist = textwrap.dedent("""\
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                    <dict>
+                        <key>GlobalQuota</key>
+                        <integer>%d</integer>
+                    </dict>
+                </plist>
+            """ % (share.afp_timemachine_quota * 1024 * 1024 * 1024))
+            # Each file is created and handed to the share root's owner through a descriptor relative to the share
+            # root, never through a path a user can redirect (the internal development record).
             try:
-                with open(timemachine_supported_path, "w"):
-                    pass
-            except IOError:
-                pass
-
-            try:
-                with open(timemachine_quota_plist_path, "w") as f:
-                    f.write(textwrap.dedent("""\
-                        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                        <plist version="1.0">
-                            <dict>
-                                <key>GlobalQuota</key>
-                                <integer>%d</integer>
-                            </dict>
-                        </plist>
-                    """ % (share.afp_timemachine_quota * 1024 * 1024 * 1024)))
-            except IOError:
-                pass
-
-            try:
-                with open(timemachine_quota_plist_managed_flag, "w") as f:
-                    pass
-            except IOError:
-                pass
-
-            try:
-                stat = os.stat(share.afp_path)
-                os.chmod(timemachine_supported_path, 0o644)
-                os.chown(timemachine_supported_path, stat.st_uid, stat.st_gid)
-                os.chmod(timemachine_quota_plist_path, 0o644)
-                os.chown(timemachine_quota_plist_path, stat.st_uid, stat.st_gid)
-                os.chmod(timemachine_quota_plist_managed_flag, 0o644)
-                os.chown(timemachine_quota_plist_managed_flag, stat.st_uid, stat.st_gid)
-            except IOError:
-                pass
+                dir_fd = os.open(share.afp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    root_stat = os.fstat(dir_fd)
+                    for path, content in (
+                        (timemachine_supported_path, ''),
+                        (timemachine_quota_plist_path, quota_plist),
+                        (timemachine_quota_plist_managed_flag, ''),
+                    ):
+                        try:
+                            write_owned_file(dir_fd, os.path.basename(path), content, root_stat.st_uid, root_stat.st_gid)
+                        except OSError:
+                            pass
+                finally:
+                    os.close(dir_fd)
         else:
             if os.path.exists(timemachine_quota_plist_managed_flag):
                 try:

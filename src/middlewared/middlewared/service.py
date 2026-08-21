@@ -15,7 +15,6 @@ from subprocess import run
 import ipaddress
 
 from middlewared.common.environ import environ_update
-import middlewared.main
 from middlewared.schema import accepts, Bool, Dict, Int, List, Ref, Str
 from middlewared.service_exception import CallException, CallError, ValidationError, ValidationErrors  # noqa
 from middlewared.utils import filter_list, osc
@@ -27,7 +26,9 @@ from middlewared.utils.type import copy_function_metadata
 from middlewared.async_validators import check_path_resides_within_volume
 from middlewared.validators import Range, IpAddress
 
-PAGINATION_OPTS = ('count', 'get', 'limit', 'offset')
+# the internal development record: when a query is extended, these are left to filter_list, which applies them after it filters the extended rows
+# (a `select` applied by datastore.query would drop fields the filters still need)
+POST_EXTEND_OPTS = ('count', 'get', 'limit', 'offset', 'select')
 PeriodicTaskDescriptor = namedtuple("PeriodicTaskDescriptor", ["interval", "run_on_start"])
 get_or_insert_lock = asyncio.Lock()
 LOCKS = defaultdict(asyncio.Lock)
@@ -64,7 +65,10 @@ def item_method(fn):
     return fn
 
 
-def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, check_pipes=True, transient=False):
+def job(
+    lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, check_pipes=True, transient=False,
+    abortable=False,
+):
     """Flag method as a long running job."""
     def check_job(fn):
         fn._job = {
@@ -75,6 +79,11 @@ def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, 
             'pipes': pipes or [],
             'check_pipes': check_pipes,
             'transient': transient,
+            # Synchronous jobs normally cannot be cancelled: cancelling the
+            # asyncio wrapper leaves their worker thread running.  An abortable
+            # synchronous job observes `job.aborted`, performs its own process
+            # cleanup, and only then raises CancelledError.
+            'abortable': abortable,
         }
         return fn
     return check_job
@@ -309,20 +318,25 @@ class Service(object, metaclass=ServiceBase):
 
 
 class ServiceChangeMixin:
-    async def _service_change(self, service, verb):
-
-        svc_state = (await self.middleware.call(
-            'service.query',
-            [('service', '=', service)],
-            {'get': True}
-        ))['state'].lower()
+    async def _service_change(self, service, verb, running=None):
+        # `running`: the service's state as it was before the caller changed its configuration.
+        # A service whose state check consults its own configuration (ups since
+        # the internal development record: MASTER requires upsd) would otherwise be judged by the new
+        # configuration while the old daemons are still up, and the restart would be skipped
+        # (the internal development record: SLAVE -> MASTER left upsmon running on the SLAVE files).
+        if running is None:
+            running = (await self.middleware.call(
+                'service.query',
+                [('service', '=', service)],
+                {'get': True}
+            ))['state'].lower() == 'running'
 
         # For now its hard to keep track of which services change rc.conf.
         # To be safe run this every time any service is updated.
         # This adds up ~180ms so its seems a reasonable workaround for the time being.
         await self.middleware.call('etc.generate', 'rc')
 
-        if svc_state == 'running':
+        if running:
             started = await self.middleware.call(f'service.{verb}', service)
 
             if not started:
@@ -424,11 +438,16 @@ class SystemServiceService(ConfigService):
 
     @private
     async def _update_service(self, old, new, verb=None):
+        # Read the state before the row changes (the internal development record): see _service_change.
+        running = (await self.middleware.call(
+            'service.query', [('service', '=', self._config.service)], {'get': True}
+        ))['state'].lower() == 'running'
+
         await self.middleware.call('datastore.update',
                                    f'services.{self._config.service_model or self._config.service}', old['id'], new,
                                    {'prefix': self._config.datastore_prefix})
 
-        fut = self._service_change(self._config.service, verb or self._config.service_verb)
+        fut = self._service_change(self._config.service, verb or self._config.service_verb, running=running)
         if self._config.service_verb_sync:
             await fut
         else:
@@ -479,7 +498,7 @@ class CRUDService(ServiceChangeMixin, Service):
         # for filters for performance reasons.
         if not options['force_sql_filters'] and options['extend']:
             datastore_options = options.copy()
-            for option in PAGINATION_OPTS:
+            for option in POST_EXTEND_OPTS:
                 datastore_options.pop(option, None)
             result = await self.middleware.call(
                 'datastore.query', self._config.datastore, [], datastore_options
@@ -778,17 +797,6 @@ class ServicePartBase(metaclass=ServicePartBaseMeta):
 
 class CoreService(Service):
 
-    @accepts(Str('id'), Int('cols'), Int('rows'))
-    async def resize_shell(self, id, cols, rows):
-        """
-        Resize terminal session (/websocket/shell) to cols x rows
-        """
-        shell = middlewared.main.ShellApplication.shells.get(id)
-        if shell is None:
-            raise CallError('Shell does not exist', errno.ENOENT)
-
-        shell.resize(cols, rows)
-
     @filterable
     def sessions(self, filters=None, options=None):
         """
@@ -844,6 +852,9 @@ class CoreService(Service):
     @job()
     def job_wait(self, job, id):
         target_job = self.middleware.jobs.get(id)
+        if target_job is None:
+            raise CallError(f'Job with id {id} does not exist', errno.ENOENT)
+
         target_job.wait_sync()
         if target_job.error:
             raise CallError(target_job.error)

@@ -1,6 +1,6 @@
 from middlewared.schema import Bool, Dict, List, Str, Int
 from middlewared.service import (accepts, filterable, private, periodic, CRUDService)
-from middlewared.service_exception import CallError
+from middlewared.service_exception import CallError, MatchNotFound
 from middlewared.utils import run, filter_list
 from middlewared.plugins.smb import SMBCmd
 
@@ -146,7 +146,7 @@ class ShareSec(CRUDService):
         contain names.
         """
         sharesec = await self._sharesec(action='--view', share=share_name)
-        share_sd = f'[{share_name.upper()}]\n{sharesec}'
+        share_sd = f'[{share_name}]\n{sharesec}'
         return await self.parse_share_sd(share_sd, options)
 
     async def _ae_to_string(self, ae):
@@ -198,6 +198,17 @@ class ShareSec(CRUDService):
 
         `ae_type` can be ALLOWED or DENIED.
         """
+        # Samba knows the home share as [homes], which is not the name of its row
+        if data['share_name'].lower() == 'homes':
+            share_filter = [('home', '=', True)]
+        else:
+            share_filter = [('name', '=', data['share_name'])]
+
+        try:
+            config_share = await self.middleware.call('sharing.smb.query', share_filter, {'get': True})
+        except MatchNotFound:
+            raise CallError(f'{data["share_name"]}: share does not exist', errno.ENOENT)
+
         ae_list = []
         for entry in data['share_acl']:
             ae_list.append(await self._ae_to_string(entry))
@@ -206,7 +217,6 @@ class ShareSec(CRUDService):
         if not db_commit:
             return
 
-        config_share = await self.middleware.call('sharing.smb.query', [('name', '=', data['share_name'])], {'get': True})
         await self.middleware.call('datastore.update', 'sharing.cifs_share', config_share['id'],
                                    {'cifs_share_acl': ' '.join(ae_list)})
 
@@ -219,7 +229,7 @@ class ShareSec(CRUDService):
         for share in shares:
             if share['share_acl']:
                 await self._sharesec(
-                    share=share['name'],
+                    share=share['name'] if not share['home'] else 'homes',
                     action='--replace',
                     args=','.join(share['share_acl'].split())
                 )
@@ -268,7 +278,7 @@ class ShareSec(CRUDService):
         write_share_info = True
 
         for i in rc:
-            if len(i['share_acl']) > 1:
+            if len(i['share_acl']) != 1:
                 write_share_info = False
                 break
 
@@ -383,7 +393,7 @@ class ShareSec(CRUDService):
         """
         old_acl = await self._get_instance(id)
         await self.setacl({"share_name": old_acl["share_name"], "share_acl": data["share_acl"]})
-        return await self.getacl(old_acl["share_name"])
+        return await self._get_instance(id)
 
     @accepts(Str('id_or_name', required=True))
     async def do_delete(self, id_or_name):

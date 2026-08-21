@@ -25,7 +25,10 @@ class IpmiTool:
         self.errors = 0
 
     async def __call__(self, args):
-        result = await run(["ipmitool"] + args, check=False, encoding="utf8", errors="ignore")
+        # ipmitool 1.8.19 formats timestamps with strftime(3) ("%x", "%X %Z"), so the shape of the
+        # output follows the locale. Pin it so the parser sees one shape: "MM/DD/YY HH:MM:SS UTC".
+        result = await run(["ipmitool"] + args, check=False, encoding="utf8", errors="ignore",
+                           env={**os.environ, "LC_ALL": "C"})
         if result.returncode != 0:
             self.errors += 1
             if self.errors < 5:
@@ -59,16 +62,28 @@ def parse_ipmi_sel_record(row):
     if row[1].strip() == "Pre-Init":
         return None
 
-    m, d, y = tuple(map(int, row[1].split("/")))
-    h, i, s = tuple(map(int, row[2].split(":")))
     return IPMISELRecord(
         id=int(row[0], 16),
-        datetime=datetime(y, m, d, h, i, s),
+        datetime=parse_ipmi_sel_datetime(row[1], row[2]),
         sensor=row[3],
         event=row[4],
         direction=row[5],
         verbose=row[6] if len(row) > 6 else None
     )
+
+
+def parse_ipmi_sel_datetime(date, time):
+    # ipmitool 1.8.18 printed "MM/DD/YYYY" and "HH:MM:SS", in UTC. 1.8.19 prints the date as
+    # strftime("%x") -- "MM/DD/YYYY" or "MM/DD/YY" depending on the locale -- and the time as
+    # "%X %Z", i.e. followed by a zone name, in local time unless ipmitool is given -Z.
+    time = time.strip().split()[0]
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M:%S"):
+        try:
+            return datetime.strptime(f"{date.strip()} {time}", fmt)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Unrecognized IPMI SEL timestamp: {date!r} {time!r}")
 
 
 def parse_sel_information(output):
@@ -165,7 +180,9 @@ class IPMISELAlertSource(AlertSource):
         if not await self.middleware.run_in_thread(has_ipmi):
             return
 
-        return await self._produce_alerts_for_ipmitool_output(await ipmitool(["-c", "sel", "elist"]))
+        # -Z: timestamps in UTC, as ipmitool 1.8.18 printed them, so the dismissed-datetime watermark
+        # kept from before an upgrade still compares against the same values.
+        return await self._produce_alerts_for_ipmitool_output(await ipmitool(["-Z", "-c", "sel", "elist"]))
 
     async def _produce_alerts_for_ipmitool_output(self, output):
         alerts = []

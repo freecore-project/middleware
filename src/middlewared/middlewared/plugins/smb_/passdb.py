@@ -1,3 +1,4 @@
+from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertLevel, OneShotAlertClass
 from middlewared.service import Service, job, private
 from middlewared.service_exception import CallError
 from middlewared.utils import Popen, run
@@ -6,6 +7,30 @@ from middlewared.plugins.smb import SMBCmd, SMBPath
 import os
 import subprocess
 import time
+
+
+class SMBUserMissingHashAlertClass(AlertClass, OneShotAlertClass):
+    # One alert for all users, raised and cleared by smb.synchronize_passdb.
+    category = AlertCategory.SHARING
+    level = AlertLevel.WARNING
+    title = 'SMB Users Have No Valid Password Hash'
+    text = (
+        'SMB users %(users)s have no valid SMB password hash, so their SMB accounts are not created or updated '
+        'and they may be unable to log in to SMB shares. '
+        'This usually happens when a configuration is restored without its secret seed. '
+        'Set the password of each user again, or turn off Samba Authentication for them.'
+    )
+
+    async def create(self, args):
+        return Alert(self.__class__, args, key=None)
+
+    async def delete(self, alerts, query):
+        return []
+
+
+def smbhash_is_valid(smbhash):
+    # The smbpasswd(5) line user.create stores: username:uid:LM hash:NT hash:[flags]:LCT-<hex>:
+    return len((smbhash or '').split(':')) == 7
 
 
 class SMBService(Service):
@@ -35,7 +60,7 @@ class SMBService(Service):
         local users in an AD environment. Immediately return in ldap enviornment.
         """
         pdbentries = []
-        private_dir = SMBPath.PASSDB_DIR.path
+        private_dir = SMBPath.PRIVATEDIR.path
         if not os.path.exists(f'{private_dir}/passdb.tdb'):
             return pdbentries
 
@@ -84,7 +109,7 @@ class SMBService(Service):
 
         smbpasswd_string = user['smbhash'].split(":")
         username = user['username']
-        if len(smbpasswd_string) != 7:
+        if not smbhash_is_valid(user['smbhash']):
             self.logger.warning("SMB hash for user [%s] is invalid. Authentication for SMB "
                                 "sessions for this user will fail until this is repaired. "
                                 "This may indicate that configuration was restored without a secret "
@@ -146,7 +171,7 @@ class SMBService(Service):
         `conf_users` contains results of `user.query`. Since users will receive new
         SID values, we will need to flush samba's cache to ensure consistency.
         """
-        private_dir = SMBPath.PASSDB_DIR.path
+        private_dir = SMBPath.PRIVATEDIR.path
         ts = int(time.time())
         old_path = f'{private_dir}/passdb.tdb'
         new_path = f'{private_dir}/passdb.{ts}.corrupted'
@@ -179,10 +204,24 @@ class SMBService(Service):
         conf_users = await self.middleware.call('user.query', [("smb", "=", True)])
 
         pdb_users = await self.smbpasswd_dump()
+        missing_hash = []
         for u in conf_users:
             pdb_entry = pdb_users.pop(u['username'], None)
             u.update({"pdb": pdb_entry})
             await self.middleware.call('smb.update_passdb_user', u)
+            # update_passdb_user skips a user without a usable hash. A password-disabled user has none by design.
+            if not smbhash_is_valid(u['smbhash']) and not u['password_disabled']:
+                missing_hash.append(u['username'])
+
+        try:
+            if missing_hash:
+                await self.middleware.call('alert.oneshot_create', 'SMBUserMissingHash', {
+                    'users': ', '.join(missing_hash),
+                })
+            else:
+                await self.middleware.call('alert.oneshot_delete', 'SMBUserMissingHash', None)
+        except Exception:
+            self.logger.warning('Unable to update the SMB password hash alert', exc_info=True)
 
         for entry in pdb_users.keys():
             self.logger.debug('Synchronizing passdb with config file: deleting user [%s] from passdb.tdb', entry)

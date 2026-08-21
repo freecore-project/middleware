@@ -214,7 +214,7 @@ class SMARTTestService(CRUDService):
             ),
             Str('desc'),
             Bool('all_disks', default=False),
-            List('disks', items=[Str('disk')], default=[]),
+            List('disks', items=[Str('disk')], default=[], unique=True),
             Str('type', enum=['LONG', 'SHORT', 'CONVEYANCE', 'OFFLINE'], required=True),
             register=True
         )
@@ -252,7 +252,6 @@ class SMARTTestService(CRUDService):
                 }]
             }
         """
-        data['type'] = data.pop('type')[0]
         verrors = await self.validate_data(data, 'smart_test_create')
 
         if data['all_disks']:
@@ -271,6 +270,7 @@ class SMARTTestService(CRUDService):
         if verrors:
             raise verrors
 
+        data['type'] = data.pop('type')[0]
         Cron.convert_schedule_to_db_format(data)
 
         data['id'] = await self.middleware.call(
@@ -282,7 +282,7 @@ class SMARTTestService(CRUDService):
 
         self.middleware.create_task(self._service_change('smartd', 'restart'))
 
-        return data
+        return await self.query(filters=[('id', '=', data['id'])], options={'get': True})
 
     @accepts(
         Int('id', validators=[Range(min=1)]),
@@ -296,8 +296,6 @@ class SMARTTestService(CRUDService):
         new = old.copy()
         new.update(data)
 
-        new['type'] = new.pop('type')[0]
-        old['type'] = old.pop('type')[0]
         new_disks = [disk for disk in new['disks'] if disk not in old['disks']]
         deleted_disks = [disk for disk in old['disks'] if disk not in new['disks']]
         if old['type'] == new['type']:
@@ -322,6 +320,7 @@ class SMARTTestService(CRUDService):
         if verrors:
             raise verrors
 
+        new['type'] = new.pop('type')[0]
         Cron.convert_schedule_to_db_format(new)
 
         await self.middleware.call(
@@ -654,7 +653,7 @@ class SmartService(SystemServiceService):
 
         await self._update_service(old, new, verb)
 
-        if new["powermode"] != old["powermode"]:
+        if new["powermode"] != old["powermode"].lower():
             await self.middleware.call("service.restart", "collectd")
             await self._service_change("snmp", "restart")
 

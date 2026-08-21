@@ -179,7 +179,7 @@ class FTPService(SystemServiceService):
         verrors = ValidationErrors()
 
         if not ((new["passiveportsmin"] == 0) == (new["passiveportsmax"] == 0)):
-            verrors.add("passiveportsmin", "passiveportsmin and passiveportsmax should be both zero or non-zero")
+            verrors.add("ftp_update.passiveportsmin", "passiveportsmin and passiveportsmax should be both zero or non-zero")
         if not ((new["passiveportsmin"] == 0 and new["passiveportsmax"] == 0) or
                 (new["passiveportsmax"] > new["passiveportsmin"])):
             verrors.add("ftp_update.passiveportsmax", "When specified, should be greater than passiveportsmin")

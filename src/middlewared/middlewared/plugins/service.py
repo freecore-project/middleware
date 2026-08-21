@@ -10,7 +10,7 @@ from middlewared.schema import accepts, Bool, Dict, Int, Ref, Str
 from middlewared.service import filterable, CallError, CRUDService, periodic, private
 from middlewared.service_exception import MatchNotFound
 import middlewared.sqlalchemy as sa
-from middlewared.utils import filter_list
+from middlewared.utils import filter_getattrs, filter_list
 
 
 class ServiceModel(sa.Model):
@@ -32,7 +32,11 @@ class ServiceService(CRUDService):
             options = {}
         options['prefix'] = 'srv_'
 
-        services = await self.middleware.call('datastore.query', 'services.services', filters, options)
+        if filter_getattrs(filters) & {'state', 'pids'}:
+            # These are not datastore columns, `filter_list` below applies these filters
+            services = await self.middleware.call('datastore.query', 'services.services', [], {'prefix': 'srv_'})
+        else:
+            services = await self.middleware.call('datastore.query', 'services.services', filters, options)
 
         # In case a single service has been requested
         if not isinstance(services, list):
@@ -249,11 +253,22 @@ class ServiceService(CRUDService):
         await self.middleware.call('service.generate_etc', service_object)
 
         if service_object.reloadable:
+            was_running = (await service_object.get_state()).running
+
             await service_object.before_reload()
             await service_object.reload()
             await service_object.after_reload()
 
             state = await service_object.get_state()
+            if not state.running and was_running:
+                # A daemon can look stopped for a moment while it reloads (sshd unlinks its pidfile on SIGHUP
+                # and only writes it again once it has re-executed itself), so give it some time to come back
+                for i in range(10):
+                    await asyncio.sleep(0.5)
+                    state = await service_object.get_state()
+                    if state.running:
+                        break
+
             if state.running:
                 return True
             else:

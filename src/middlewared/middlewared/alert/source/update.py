@@ -7,7 +7,11 @@ try:
     from freenasOS import Update
     from freenasOS.Update import PendingUpdates
 except ImportError:
-    Update = PendingUpdates = None
+    try:
+        from middlewared.utils.freenasOS import Update
+        from middlewared.utils.freenasOS.Update import PendingUpdates
+    except ImportError:
+        Update = PendingUpdates = None
 
 from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, FilePresenceAlertSource, ThreadedAlertSource
 from middlewared.alert.schedule import IntervalSchedule
@@ -20,20 +24,32 @@ log = logging.getLogger("update_check_alertmod")
 # FIXME: use update plugin
 def is_update_applied(update_version):
     if Update is None:
-        return False
+        return (False, '')
     active_be_msg = 'Please reboot the system to activate this update.'
     # TODO: The below boot env name should really be obtained from the update code
     # for now we just duplicate that code here
-    if update_version.startswith(Update.Avatar() + "-"):
-        update_boot_env = update_version[len(Update.Avatar() + "-"):]
+    try:
+        avatar = Update.Avatar()
+    except Exception:
+        log.warning('Failed to get Update.Avatar(), freenasOS may not support bectl on FB15')
+        return (False, '')
+
+    if update_version.startswith(avatar + "-"):
+        update_boot_env = update_version[len(avatar + "-"):]
     else:
-        update_boot_env = "%s-%s" % (Update.Avatar(), update_version)
+        update_boot_env = "%s-%s" % (avatar, update_version)
 
     found = False
     msg = ''
-    for clone in Update.ListClones():
-        if clone['realname'] == update_boot_env:
-            if clone['active'] != 'R':
+    try:
+        clones = Update.ListClones()
+    except Exception:
+        log.warning('Update.ListClones() failed — bectl output may have changed on FB15', exc_info=True)
+        return (False, '')
+
+    for clone in clones:
+        if clone.get('realname') == update_boot_env:
+            if clone.get('active') != 'R':
                 active_be_msg = 'Please activate {0} via'.format(update_boot_env) + \
                                 ' the Boot Environment Tab and Reboot to use this updated version.'
             msg = 'Update: {0} has already been applied. {1}'.format(update_version, active_be_msg)
@@ -104,8 +120,8 @@ class UpdateNotAppliedAlertSource(ThreadedAlertSource):
                 )
                 return
 
-            if is_update_applied:
-                update_applied, msg = is_update_applied(data["update_version"], create_alert=False)
+            if callable(is_update_applied):
+                update_applied, msg = is_update_applied(data["update_version"])
                 if update_applied:
                     return Alert(UpdateNotAppliedAlertClass, msg)
 

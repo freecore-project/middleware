@@ -2,11 +2,31 @@ import re
 import os
 import secrets
 import hashlib
-import crypt
+import ctypes
+import ctypes.util
 
 from contextlib import suppress
 from middlewared.plugins.etc import EtcUSR, EtcGRP
 from string import digits, ascii_uppercase, ascii_lowercase
+
+_libcrypt_path = ctypes.util.find_library('crypt')
+if _libcrypt_path is None:
+    # On FreeBSD 15, /usr/lib/libcrypt.so is an ld linker script (not ELF)
+    # and ctypes.util.find_library can't validate it. Use the versioned
+    # SONAME directly — ld.so resolves it via ldconfig to /lib/libcrypt.so.5.
+    # (Note: crypt(3) is NOT in libc on FB15 — moved entirely into libcrypt.)
+    _libcrypt_path = 'libcrypt.so.5'
+_libcrypt = ctypes.CDLL(_libcrypt_path)
+_libcrypt.crypt.restype = ctypes.c_char_p
+_libcrypt.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+
+
+def _crypt(word, salt):
+    """Call crypt(3) directly via ctypes (replacement for removed Python crypt module)."""
+    result = _libcrypt.crypt(word.encode('utf-8'), salt.encode('utf-8'))
+    if result is None:
+        raise OSError('crypt() returned NULL')
+    return result.decode('utf-8')
 
 
 def generate_webdav_auth(middlewared, render_ctx, dirfd):
@@ -38,7 +58,7 @@ def generate_webdav_auth(middlewared, render_ctx, dirfd):
         with open('webdavhtbasic', 'w', opener=opener) as f:
             os.fchmod(f.fileno(), 0o600)
             os.fchown(f.fileno(), EtcUSR.WEBDAV, EtcGRP.WEBDAV)
-            f.write(f'webdav:{crypt.crypt(password, salt())}')
+            f.write(f'webdav:{_crypt(password, salt())}')
 
     elif auth_type == 'DIGEST':
         with suppress(FileNotFoundError):
@@ -57,7 +77,7 @@ def generate_webdav_auth(middlewared, render_ctx, dirfd):
 
 def generate_webdav_config(middleware, render_ctx, dirfd):
     def opener(path, flags):
-        return os.open(path, flags, dir_fd=dirfd)
+        return os.open(path, flags, mode=0o644, dir_fd=dirfd)
 
     webdav_config = render_ctx['webdav.config']
     to_blank = None
@@ -86,6 +106,7 @@ def generate_webdav_config(middleware, render_ctx, dirfd):
         )
 
         with open('Includes/webdav-ssl.conf', 'w', opener=opener) as f:
+            os.fchmod(f.fileno(), 0o644)
             f.write(data)
 
         if webdav_config['protocol'] == 'HTTPS':
@@ -95,10 +116,8 @@ def generate_webdav_config(middleware, render_ctx, dirfd):
         to_blank = 'Includes/webdav-ssl.conf'
 
     if to_blank is not None:
-        try:
-            fd = os.open(to_blank, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, dir_fd=dirfd)
-        finally:
-            os.close(fd)
+        with open(to_blank, 'w', opener=opener) as f:
+            os.fchmod(f.fileno(), 0o644)
 
 
 def render(service, middleware, render_ctx):

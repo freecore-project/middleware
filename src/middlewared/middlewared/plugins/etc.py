@@ -8,7 +8,7 @@ import asyncio
 from collections import defaultdict
 from contextlib import suppress
 import grp
-import imp
+import importlib.util
 import os
 import pwd
 import stat
@@ -39,6 +39,12 @@ class FileShouldNotExist(Exception):
     pass
 
 
+class FileShouldNotChange(Exception):
+    # A mako template cannot return None (render() returns whatever it wrote so far, i.e. ''),
+    # so it raises this to leave the current file as it is.
+    pass
+
+
 class MakoRenderer(object):
 
     def __init__(self, service):
@@ -63,6 +69,7 @@ class MakoRenderer(object):
                     middleware=self.service.middleware,
                     service=self.service,
                     FileShouldNotExist=FileShouldNotExist,
+                    FileShouldNotChange=FileShouldNotChange,
                     IS_FREEBSD=osc.IS_FREEBSD,
                     IS_LINUX=osc.IS_LINUX,
                     render_ctx=ctx
@@ -71,6 +78,8 @@ class MakoRenderer(object):
             return await self.service.middleware.run_in_thread(do)
         except FileShouldNotExist:
             raise
+        except FileShouldNotChange:
+            return None
         except Exception:
             self.service.logger.debug('Failed to render mako template: {0}'.format(
                 exceptions.text_error_template().render()
@@ -85,8 +94,9 @@ class PyRenderer(object):
 
     async def render(self, path, ctx):
         name = os.path.basename(path)
-        find = imp.find_module(name, [os.path.dirname(path)])
-        mod = imp.load_module(name, *find)
+        spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(path), name + '.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
         args = [self.service, self.service.middleware]
         if ctx is not None:
             args.append(ctx)
@@ -176,6 +186,14 @@ class EtcService(Service):
         'rc': [
             {'type': 'py', 'path': 'rc.conf', 'platform': 'FreeBSD'},
             {'type': 'py', 'path': 'systemd', 'platform': 'Linux'},
+            # the internal development record: per-script copies of the NFS flags. /etc/rc keeps the rc.conf it
+            # read at its start; rc.subr re-reads /etc/rc.conf.d/<script> for every script, so the bind IP
+            # that ix-nfsbind renders after NETWORKING reaches the daemons through these.
+            {'type': 'py', 'path': 'rc.conf.d/rpcbind', 'platform': 'FreeBSD'},
+            {'type': 'py', 'path': 'rc.conf.d/statd', 'platform': 'FreeBSD'},
+            {'type': 'py', 'path': 'rc.conf.d/lockd', 'platform': 'FreeBSD'},
+            {'type': 'py', 'path': 'rc.conf.d/mountd', 'platform': 'FreeBSD'},
+            {'type': 'py', 'path': 'rc.conf.d/nfsd', 'platform': 'FreeBSD'},
         ],
         'sysctl': [
             {'type': 'py', 'path': 'sysctl_config'},
@@ -240,6 +258,14 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'local/avahi/avahi-daemon.conf', 'checkpoint': 'interface_sync'},
             {'type': 'py', 'path': 'local/avahi/avahi_services', 'checkpoint': 'interface_sync'}
         ],
+        'rar2fs': {
+            'ctx': [
+                {'method': 'rar2fs.config'},
+            ],
+            'entries': [
+                {'type': 'mako', 'path': 'local/rar2fs.conf', 'mode': 0o600},
+            ],
+        },
         'wsd': [
             {'type': 'mako', 'path': 'local/wsdd.conf', 'checkpoint': 'interface_sync'},
         ],
@@ -253,7 +279,12 @@ class EtcService(Service):
             {'type': 'py', 'path': 'local/nut/ups_perms'}
         ],
         'rsync': [
-            {'type': 'mako', 'path': 'local/rsyncd.conf', 'checkpoint': 'pool_import'}
+            # net/rsync's daemon reads ${ETCDIR}/rsyncd.conf; the old /usr/local/etc/rsyncd.conf
+            # is only moved there by its rc script's start_precmd.
+            {
+                'type': 'mako', 'path': 'local/rsync/rsyncd.conf' if osc.IS_FREEBSD else 'local/rsyncd.conf',
+                'local_path': 'local/rsyncd.conf', 'checkpoint': 'pool_import',
+            }
         ],
         'smb': [
             {'type': 'mako', 'path': 'local/smb4.conf'},
@@ -293,17 +324,21 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'ttys', 'platform': 'FreeBSD'},
             {'type': 'py', 'path': 'ttys_config', 'checkpoint_linux': None}
         ],
+        # the internal development record: mode 0600, both embed the tls-crypt static key inline (inherited 0644 from 13.3).
         'openvpn_server': [
-            {'type': 'mako', 'path': 'local/openvpn/server/openvpn_server.conf'}
+            {'type': 'mako', 'path': 'local/openvpn/server/openvpn_server.conf', 'mode': 0o600}
         ],
         'openvpn_client': [
-            {'type': 'mako', 'path': 'local/openvpn/client/openvpn_client.conf'}
+            {'type': 'mako', 'path': 'local/openvpn/client/openvpn_client.conf', 'mode': 0o600}
         ],
-        'kmip': [
-            {'type': 'mako', 'path': 'pykmip/pykmip.conf'}
+        # mode 0600: this file embeds the server's WireGuard private key, and
+        # DEFAULT_ETC_PERMS is 0644.
+        'wireguard': [
+            {'type': 'mako', 'path': 'local/wireguard/wg1.conf', 'mode': 0o600}
         ],
-        'truecommand': [
-            {'type': 'mako', 'path': 'wireguard/wg0.conf'}
+        # Same reason for 0600: wg2.conf embeds this system's client private key.
+        'wireguard_client': [
+            {'type': 'mako', 'path': 'local/wireguard/wg2.conf', 'mode': 0o600}
         ]
     }
     LOCKS = defaultdict(asyncio.Lock)

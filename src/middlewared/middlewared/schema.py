@@ -362,13 +362,17 @@ class UnixPerm(Str):
         if value is None:
             return
 
+        verrors = ValidationErrors()
+
         try:
             mode = int(value, 8)
         except ValueError:
-            raise ValueError('Not a valid integer. Must be between 000 and 777')
+            verrors.add(self.name, 'Not a valid integer. Must be between 000 and 777')
+        else:
+            if mode & 0o777 != mode:
+                verrors.add(self.name, 'Please supply a value between 000 and 777')
 
-        if mode & 0o777 != mode:
-            raise ValueError('Please supply a value between 000 and 777')
+        verrors.check()
 
         return super().validate(value)
 

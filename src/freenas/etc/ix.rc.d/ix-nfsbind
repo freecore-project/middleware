@@ -5,11 +5,15 @@
 
 # PROVIDE: ix-nfsbind
 # REQUIRE: middlewared NETWORKING
-# BEFORE: mountd gssd nfsuserd nfsd
+# BEFORE: rpcbind statd lockd mountd gssd nfsuserd nfsd
 
-source /etc/rc.subr
+. /etc/rc.subr
 
 nfs_bindip() {
+	# the internal development record: /etc/rc keeps the rc.conf it read at its start, so the regenerated
+	# rc.conf.freenas alone cannot change the flags below; the 'rc' group also writes
+	# /etc/rc.conf.d/{rpcbind,statd,lockd,mountd,nfsd}, which rc.subr re-reads per script. Hence BEFORE
+	# every one of them, not only mountd and nfsd.
 	# We need to make sure the NFS bind IP exists
 	# and that can't happen until network starts.
 	# Since nfs flags goes in rc.conf.local we need to regenerate it.

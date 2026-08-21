@@ -42,6 +42,9 @@ setup(
         'middlewared.apidocs': [
             'templates/websocket/*',
             'templates/*.*',
+            'static/vendor/*',
+            'static/vendor/*/*',
+            'static/vendor/*/*/*',
         ],
         'middlewared': (
             get_assets('alembic') +

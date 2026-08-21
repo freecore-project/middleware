@@ -186,7 +186,7 @@ class mDNSService(object):
             return (txtrecord, iindex)
 
     def _get_port(self):
-        if self.service in ['FTP', 'TFPT']:
+        if self.service in ['FTP', 'TFTP']:
             return (self.middleware.call_sync(f'{self.service.lower()}.config'))['port']
 
         if self.service in ['SSH', 'SFTP_SSH']:
@@ -238,12 +238,12 @@ class mDNSService(object):
 
         for ip in bind_ip:
             for intobj in self.middleware.call_sync('interface.query'):
-                if any(filter(lambda x: ip in x['address'], intobj['aliases'])):
+                if any(filter(lambda x: ip == x['address'], intobj['aliases'])):
                     try:
                         iindex.append(socket.if_nametoindex(intobj['name']))
                     except OSError:
                         self.logger.debug('Failed to determine interface index for [%s], service [%s]',
-                                          iface, service, exc_info=True)
+                                          intobj['name'], service, exc_info=True)
 
                     break
 

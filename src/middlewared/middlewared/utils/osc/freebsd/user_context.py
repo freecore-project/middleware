@@ -6,7 +6,9 @@ from multiprocessing import Process, Queue, Value
 import os
 import pwd
 import queue
+import signal
 import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -15,24 +17,26 @@ __all__ = ["run_command_with_user_context"]
 
 def setusercontext(user):
     libc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
-    libutil = ctypes.cdll.LoadLibrary(ctypes.util.find_library('util'))
+    # On FreeBSD 14+, libutil is merged into libc. Try libutil first, fall back to libc.
+    libutil_path = ctypes.util.find_library('util')
+    libutil = ctypes.cdll.LoadLibrary(libutil_path) if libutil_path else libc
     libc.getpwnam.restype = ctypes.POINTER(ctypes.c_void_p)
-    pwnam = libc.getpwnam(user)
+    pwnam = libc.getpwnam(user.encode('utf-8'))
     passwd = pwd.getpwnam(user)
 
     libutil.login_getpwclass.restype = ctypes.POINTER(ctypes.c_void_p)
     lc = libutil.login_getpwclass(pwnam)
     os.setgid(passwd.pw_gid)
     if lc and lc[0]:
-        libc.initgroups(user.encode('ascii'), passwd.pw_gid)
+        libc.initgroups(user.encode('utf-8'), passwd.pw_gid)
         libutil.setusercontext(
             lc, pwnam, passwd.pw_uid, ctypes.c_uint(0x07ff)  # 0x07ff LOGIN_SETALL
         )
         libutil.login_close(lc)
     else:
         os.setgid(passwd.pw_gid)
-        libc.setlogin(user)
-        libc.initgroups(user.encode('ascii'), passwd.pw_gid)
+        libc.setlogin(user.encode('utf-8'))
+        libc.initgroups(user.encode('utf-8'), passwd.pw_gid)
         os.setuid(passwd.pw_uid)
 
     try:
@@ -43,7 +47,11 @@ def setusercontext(user):
     os.environ['HOME'] = passwd.pw_dir
 
 
-def _run_command(user, commandline, q, rv):
+def _run_command(user, commandline, q, rv, grouped):
+    if grouped:
+        # Put the shell and every descendant it creates (ssh and both local
+        # rsync processes included) in a group the middleware parent can reap.
+        os.setsid()
     setusercontext(user)
 
     os.environ['PATH'] = (
@@ -59,40 +67,86 @@ def _run_command(user, commandline, q, rv):
         if line == b'':
             break
 
-        try:
-            q.put(line, False)
-        except queue.Full:
-            pass
+        # Block, never drop: when the parent falls behind, the full queue holds
+        # the command back through its stdout pipe instead of buffering here.
+        q.put(line)
     proc.communicate()
     rv.value = proc.returncode
     q.put(None)
 
 
-def run_command_with_user_context(commandline, user, callback):
+def _process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
+def _terminate_process_group(process, grace=2):
+    """Terminate and reap a multiprocessing child and the command tree it owns."""
+    pgid = process.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        if process.is_alive():
+            process.terminate()
+
+    deadline = time.monotonic() + grace
+    while _process_group_exists(pgid) and time.monotonic() < deadline:
+        process.join(0.05)
+
+    if _process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    process.join(grace)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def run_command_with_user_context(commandline, user, callback, abort=None):
     q = Queue(maxsize=100)
     rv = Value('i')
-    stdout = b''
+    stdout = []
+    aborted = False
     p = Process(
-        target=_run_command, args=(user, commandline, q, rv),
+        target=_run_command, args=(user, commandline, q, rv, abort is not None),
         daemon=True
     )
     p.start()
     while p.is_alive() or not q.empty():
+        if abort is not None and abort():
+            aborted = True
+            _terminate_process_group(p)
+            break
+
         try:
-            get = q.get(True, 2)
+            get = q.get(True, 0.2)
             if get is None:
                 break
-            stdout += get
+            stdout.append(get)
             callback(get)
         except queue.Empty:
             pass
         except Exception:
             logger.error('Unhandled exception', exc_info=True)
-            p.kill()
+            _terminate_process_group(p)
             raise
 
-    p.join()
+    if aborted:
+        returncode = -signal.SIGTERM
+    else:
+        p.join()
+        # A child that died before it could report the command's exit status
+        # (e.g. setusercontext() raised for a user that no longer exists) must
+        # not be mistaken for a command that succeeded.
+        returncode = p.exitcode or rv.value
 
-    return subprocess.CompletedProcess(
-        commandline, stdout=stdout, returncode=rv.value
-    )
+    return subprocess.CompletedProcess(commandline, stdout=b''.join(stdout), returncode=returncode)

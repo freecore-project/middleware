@@ -9,7 +9,6 @@ import os
 import pwd
 import socket
 import struct
-import sys
 
 from ldap.controls import SimplePagedResultsControl
 from urllib.parse import urlparse
@@ -81,8 +80,7 @@ class NslcdClient(object):
 
     def read_string(self):
         value = self.read_bytes()
-        if sys.version_info[0] >= 3:
-            value = value.decode('utf-8')
+        value = value.decode('utf-8')
         return value
 
     def get_response(self):
@@ -961,13 +959,13 @@ class LDAPService(ConfigService):
 
     @private
     async def nslcd_cmd(self, cmd):
-        nslcd = await run(['service', 'nslcd', cmd], check=False)
+        nslcd = await run(['/usr/sbin/service', 'nslcd', cmd], check=False)
         if nslcd.returncode != 0:
             raise CallError(f'nslcd failed to {cmd} with errror: {nslcd.stderr.decode()}', errno.EFAULT)
 
     @private
     async def nslcd_status(self):
-        nslcd = await run(['service', 'nslcd', 'onestatus'], check=False)
+        nslcd = await run(['/usr/sbin/service', 'nslcd', 'onestatus'], check=False)
         return True if nslcd.returncode == 0 else False
 
     @private

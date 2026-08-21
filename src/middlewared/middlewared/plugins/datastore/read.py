@@ -76,6 +76,9 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
               "params": ["account.bsdusers", [ ["username", "=", "root" ] ], {"get": true}]
             }
         """
+        stub = await self.middleware.call('datastore.stub.handle_removed_tables', name, filters, options)
+        if stub is not None:
+            return stub
         table = self._get_table(name)
 
         # We do not want to make changes to original options
@@ -281,7 +284,8 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
                 assert local_pk == pk
 
                 all_children_ids = set()
-                pk_to_children_ids = defaultdict(set)
+                # An ordered set: a `set` of string ids would iterate in a per-process hash order
+                pk_to_children_ids = defaultdict(dict)
                 for connection in await self.query(
                     relationship.secondary.name.replace('_', '.', 1),
                     [[relationship_local_pk.name, 'in', pk_values]],
@@ -290,7 +294,7 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
                     child_id = connection[relationship_remote_pk.name]
 
                     all_children_ids.add(child_id)
-                    pk_to_children_ids[connection[relationship_local_pk.name]].add(child_id)
+                    pk_to_children_ids[connection[relationship_local_pk.name]][child_id] = None
 
                 all_children = {}
                 if all_children_ids:

@@ -39,6 +39,13 @@ class FSAttachmentDelegate(ServiceChangeMixin):
         """
         return attachment[self.resource_name]
 
+    async def check_delete(self, attachments):
+        """
+        Raise if said items must not be deleted. Called for every delegate before any of them deletes anything
+        :param attachments: list of the items returned by `query`
+        :return: None
+        """
+
     async def delete(self, attachments):
         """
         Permanently delete said items

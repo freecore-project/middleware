@@ -13,8 +13,10 @@
 
 	host_conf = '/etc/host.conf'
 	if nis_enabled:
-		with open(host_conf, 'a') as f:
-			f.write('nis\n')
+		with open(host_conf, 'a+') as f:
+			f.seek(0)
+			if 'nis' not in [line.strip() for line in f]:
+				f.write('nis\n')
 	elif ad_config['ad_enable']:
 		hostname = middleware.call_sync('smb.config')['netbiosname_local'].lower()
 		domain_name = ad_config['ad_domainname'].lower()

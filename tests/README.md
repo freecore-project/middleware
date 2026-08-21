@@ -32,9 +32,49 @@ In middleware/tests run the command bellow
 
 `pip3 install -r requirements.txt`
 
+### Runner-side samba config — required, and easy to miss
+
+The SMB tests are driven **from the runner**: `protocols.py` uses the `libsmb`
+python bindings plus the `smbclient`, `smbcacls` and `smbcquotas` binaries. All
+of those need a client-side `smb4.conf` on the runner itself. Without one they
+fail with *"Can't load /usr/local/etc/smb4.conf"* and the whole SMB block of
+the suite goes red for a reason that has nothing to do with the appliance under
+test — which is exactly what a freshly built runner does.
+
+`smb4.conf` in this directory is the working one. Install it and check it:
+
+```
+cp smb4.conf /usr/local/etc/smb4.conf     # FreeBSD; /etc/samba/ on Debian
+testparm -s                               # must be clean
+```
+
+It is runner-side only — nothing in the suite reads it from this directory, and
+it is never installed on an appliance. Read the comments in it before editing:
+`client min protocol = NT1` is load-bearing for the SMB1-parametrised cases, and
+`client use spnego` must stay out (samba 4.16 raises on it, which silently fails
+`test_437_smb_vss`).
 
 ## Running REST API test
-All the test suite is run from runtests.py the usage of runtests.py is as follow:
+`runtest.py` runs the API2 parity suite against one already-running appliance.
+It never installs or updates an OS, controls an outer hypervisor, rolls back a
+zvol, or returns an appliance between releases. Perform those transitions
+manually, outside pytest, and run the same frozen test revision independently on
+the 13.3 reference and FreeCORE target.
+
+The API2 directory deliberately excludes:
+
+- removed Enterprise/HA-only tests and the removed AFP test;
+- the inherited update driver, which fetched iX lab state and controlled an
+  outer bhyve VM (OS upgrades are manual acceptance work);
+- FreeCORE plugin-origin acceptance, kept separately in
+  `freecore/test_plugin.py` because it is an intentional product divergence;
+- `test_540_vm.py` by default, because it probes nested bhyve at import time.
+  It is reported as excluded and requires the explicit `--run-nested-vm` pytest
+  option on suitable hardware.
+
+All other shipped-service modules run by default. Tests needing AD, LDAP, NIS,
+cloud, iSCSI, or VMware fixtures retain their upstream self-skip behavior when
+the corresponding `config.py` values are absent.
 
 ```
 freenas/tests/api% ./runtest.py
@@ -43,26 +83,16 @@ Mandatory option
     --ip <###.###.###.###>     - IP of the FreeNAS
     --password <root password> - Password of the FreeNAS root user
     --interface <interface>    - The interface that FreeNAS is run one
+    --ntp-server <ip>           - Explicit non-production NTP test fixture
 
 Optional option
     --test <test name>         - Test name (Network, ALL)
-    --api <version number>     - API version number (1.0, 2.0)
 
 ```
 
-### Example of command
+### Example command
 
-The default command API test default to API v1.0:
-
-`./runtests.py --ip 192.168.2.45 --interface em0 --password testing`
-
-Command to run REST API v2.0 test:
-
-`./runtests.py --ip 192.168.2.45 --interface em0 --password testing --api 2.0`
-
-Command to run a specific REST API v1.0 or v2.0 test:
-
-`./runtests.py --ip 192.168.2.45 --interface em0 --password testing --api 1.0 --test network`
+`./runtest.py --ip 192.168.2.45 --interface vtnet0 --password testing --ntp-server 192.168.2.1`
 
 
 ## How REST API tests should be written?
@@ -105,4 +135,3 @@ def test_04_cloning_a_new_boot_environment():
     results = POST("/bootenv/", payload)
     assert results.status_code == 200, results.text
 ```
-

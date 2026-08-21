@@ -4,7 +4,11 @@ import time
 
 import pytest
 
-from middlewared.service import throttle
+from middlewared.plugins.datastore.read import DatastoreService
+from middlewared.schema import Schemas, resolve_methods
+from middlewared.service import CRUDService, throttle
+
+WIDGETS = [{'id': 1, 'widget_name': 'one'}, {'id': 2, 'widget_name': 'two'}]
 
 
 @pytest.mark.timeout(10)
@@ -69,3 +73,63 @@ async def test__async_throttle():
     assert values[0] - start < 1
     assert 1.99 <= values[1] - values[0] < 3
     assert 1.99 <= values[2] - values[1] < 3
+
+
+class WidgetMiddleware(dict):
+
+    def event_register(self, name, description):
+        pass
+
+    async def call(self, name, *args):
+        result = self[name](*args)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
+
+    async def run_in_thread(self, method, *args):
+        return method(*args)
+
+
+class WidgetService(CRUDService):
+
+    class Config:
+        datastore = 'test.widget'
+        datastore_prefix = 'widget_'
+        datastore_extend = 'widget.extend'
+
+
+class WidgetDatastore(DatastoreService):
+
+    def _serialize_row(self, obj, table, aliases):
+        return dict(obj)
+
+
+@pytest.fixture
+def widget_service():
+    m = WidgetMiddleware()
+    datastore = WidgetDatastore(m)
+
+    async def datastore_query(name, filters, options):
+        # Only the SQL fetch is faked: prefix stripping, extend and `select` are the datastore's own
+        assert filters == []
+        return await datastore._queryset_serialize(
+            WIDGETS, None, {}, [{} for _ in WIDGETS], options['extend'], options['extend_context'],
+            options['prefix'], options.get('select'), options.get('extra'),
+        )
+
+    m['datastore.query'] = datastore_query
+    m['widget.extend'] = lambda data: {**data, 'label': data['name'].upper()}
+    service = WidgetService(m)
+    resolve_methods(Schemas(), [DatastoreService.query, service.query])
+    return service
+
+
+@pytest.mark.parametrize('filters,options,expected', [
+    ([['name', '=', 'two']], {'select': ['id', 'name']}, [{'id': 2, 'name': 'two'}]),
+    ([['name', '=', 'two']], {'select': ['id']}, [{'id': 2}]),
+    ([['name', '=', 'two']], {'select': ['id'], 'get': True}, {'id': 2}),
+    ([['name', '=', 'two']], {'select': ['id'], 'count': True}, 1),
+    ([['label', '=', 'TWO']], {'select': ['name']}, [{'name': 'two'}]),
+])
+async def test__crud_query__filters_fields_left_out_of_select(widget_service, filters, options, expected):
+    assert await widget_service.query(filters, options) == expected

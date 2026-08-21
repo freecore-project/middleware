@@ -122,7 +122,7 @@ class OpenVPN:
             ):
                 verrors.add(
                     f'{schema}.{mode}_certificate',
-                    f'{mode} certificate chain could not be verified with specified root CA.'
+                    f'{mode.capitalize()} certificate chain could not be verified with specified root CA.'
                 )
             extensions = cert['extensions']
             for ext in ('KeyUsage', 'SubjectKeyIdentifier', 'ExtendedKeyUsage'):
@@ -300,7 +300,12 @@ class OpenVPNServerService(SystemServiceService):
                 'on the same local port without any issues.'
             )
 
-        if ipaddress.ip_address(data['server']).version == 4 and data['netmask'] > 32:
+        if not data['server']:
+            verrors.add(
+                f'{schema_name}.server',
+                'This field is required.'
+            )
+        elif ipaddress.ip_address(data['server']).version == 4 and data['netmask'] > 32:
             verrors.add(
                 f'{schema_name}.netmask',
                 'For IPv4 server addresses please provide a netmask value from 0-32.'
@@ -327,7 +332,7 @@ class OpenVPNServerService(SystemServiceService):
     async def generate_static_key(self):
         keyfile = tempfile.NamedTemporaryFile(mode='w+', dir='/tmp/')
         await run(
-            ['openvpn', '--genkey', '--secret', keyfile.name]
+            ['openvpn', '--genkey', 'secret', keyfile.name]
         )
         keyfile.seek(0)
         key = keyfile.read()
@@ -346,7 +351,7 @@ class OpenVPNServerService(SystemServiceService):
 
     @accepts(
         Int('client_certificate_id'),
-        Str('server_address', null=True)
+        Str('server_address', null=True, default=None)
     )
     async def client_configuration_generation(self, client_certificate_id, server_address=None):
         """
@@ -647,5 +652,5 @@ def setup(middleware):
     if not os.path.exists('/usr/local/etc/rc.d/openvpn'):
         return
     for srv in ('openvpn_client', 'openvpn_server'):
-        if not os.path.exists(f'/etc/local/rc.d/{srv}'):
+        if not os.path.exists(f'/usr/local/etc/rc.d/{srv}'):
             os.symlink('/usr/local/etc/rc.d/openvpn', f'/usr/local/etc/rc.d/{srv}')

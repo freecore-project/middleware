@@ -13,7 +13,7 @@ from middlewared.schema import accepts, Dict, Int, List, Patch, Str
 from middlewared.service import CallError, ConfigService, CRUDService, job, periodic, private, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, Popen
-import middlewared.utils.osc as osc
+from middlewared.utils.krb5 import KRB5
 
 
 class keytab(enum.Enum):
@@ -25,14 +25,6 @@ class keytab(enum.Enum):
 class krb5ccache(enum.Enum):
     SYSTEM = '/tmp/krb5cc_0'
     TEMP = '/tmp/krb5cc_middleware'
-
-
-class KRB5(enum.Enum):
-    MIT = 1
-    HEIMDAL = 2
-
-    def platform():
-        return KRB5.MIT if osc.IS_LINUX else KRB5.HEIMDAL
 
 
 class KRB_AppDefaults(enum.Enum):
@@ -256,6 +248,12 @@ class KerberosService(ConfigService):
                         f'{param[0]} has invalid value: {e.errmsg}.'
                     )
                     continue
+
+            elif len(param) == 1 and line.split() and line.split()[0] in [str(x) for x in KRB_AppDefaults]:
+                verrors.add(
+                    'kerberos_appdefaults',
+                    f'{line.strip()} is an invalid appdefaults parameter. Use the form "name = value".'
+                )
 
         return verrors
 
@@ -700,7 +698,6 @@ class KerberosRealmService(CRUDService):
             },
         )
         await self.middleware.call('etc.generate', 'kerberos')
-        await self.middleware.call('service.restart', 'cron')
         return await self._get_instance(data['id'])
 
     @accepts(
@@ -720,6 +717,13 @@ class KerberosRealmService(CRUDService):
         old = await self._get_instance(id)
         new = old.copy()
         new.update(data)
+
+        verrors = ValidationErrors()
+
+        verrors.add_child('kerberos_realm_update', await self._validate(new, id))
+
+        if verrors:
+            raise verrors
 
         data = await self.kerberos_compress(new)
         await self.middleware.call(
@@ -742,9 +746,9 @@ class KerberosRealmService(CRUDService):
         await self.middleware.call('etc.generate', 'kerberos')
 
     @private
-    async def _validate(self, data):
+    async def _validate(self, data, id=None):
         verrors = ValidationErrors()
-        realms = await self.query()
+        realms = await self.query([('id', '!=', id)] if id else [])
         for realm in realms:
             if realm['realm'].upper() == data['realm'].upper():
                 verrors.add(f'kerberos_realm', f'kerberos realm with name {realm["realm"]} already exists.')
@@ -1118,7 +1122,7 @@ class KerberosKeytabService(CRUDService):
         return False
 
     @private
-    async def store_samba_keytab(self):
+    async def store_samba_keytab(self, source_keytab=None):
         """
         Samba will automatically generate system keytab entries for the AD machine account
         (netbios name with '$' appended), and maintain them through machine account password changes.
@@ -1129,15 +1133,20 @@ class KerberosKeytabService(CRUDService):
         The current system kerberos keytab and compare with a cached copy before overwriting it when a new
         keytab is generated through middleware 'etc.generate kerberos'.
         """
-        if not os.path.exists(keytab['SYSTEM'].value):
+        if source_keytab is None:
+            if not os.path.exists(keytab['SYSTEM'].value):
+                return False
+
+            keytab_list = await self._ktutil_list()
+            items_to_remove = await self._get_nonsamba_principals(keytab_list)
+            await self._generate_tmp_keytab()
+            await self._prune_keytab_principals(items_to_remove)
+            source_keytab = keytab['SAMBA'].value
+
+        if not os.path.isfile(source_keytab) or os.path.getsize(source_keytab) == 0:
             return False
 
-        encoded_keytab = None
-        keytab_list = await self._ktutil_list()
-        items_to_remove = await self._get_nonsamba_principals(keytab_list)
-        await self._generate_tmp_keytab()
-        await self._prune_keytab_principals(items_to_remove)
-        with open(keytab['SAMBA'].value, 'rb') as f:
+        with open(source_keytab, 'rb') as f:
             encoded_keytab = base64.b64encode(f.read())
 
         if not encoded_keytab:

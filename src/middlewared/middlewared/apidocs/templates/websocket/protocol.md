@@ -1,12 +1,12 @@
 ## Websocket Protocol
 
-TrueNAS uses DDP: https://github.com/meteor/meteor/blob/devel/packages/ddp/DDP.md .
+FreeCORE uses DDP: https://github.com/meteor/meteor/blob/devel/packages/ddp/DDP.md .
 
 DDP (Distributed Data Protocol) is the stateful websocket protocol to communicate between the client and the server.
 
 Websocket endpoint: `/websocket`
 
-e.g. `ws://truenas.domain/websocket`
+e.g. `ws://freecore.domain/websocket`
 
 ### Example of connection
 

@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from middlewared.plugins.system_.dmi import SystemService
 from middlewared.service import Service
 
@@ -126,7 +128,11 @@ Physical Memory Array
         Number Of Devices: 12
 """).splitlines()
 
-missing_dmi = []
+missing_dmi = ("""
+# dmidecode 3.3
+Scanning /dev/mem for entry point.
+# No SMBIOS nor DMI entry point found, sorry.
+""").splitlines()
 
 missing_dmi_type1 = ("""
 # dmidecode 3.3
@@ -220,6 +226,12 @@ Base Board Information
 """).splitlines()
 
 
+@pytest.fixture(autouse=True)
+def default_cache(monkeypatch):
+    # _parse_dmi() fills the class-level cache so give every test its own copy of the defaults
+    monkeypatch.setattr(SystemService, 'CACHE', dict(SystemService.CACHE))
+
+
 def test__full_dmi():
     expected_result = {
         'bios-release-date': date(2020, 12, 3),
@@ -255,7 +267,7 @@ def test__double_colon_dmi():
 def test__missing_dmi():
     expected_result = {
         'bios-release-date': '',
-        'ecc-memory': '',
+        'ecc-memory': None,
         'baseboard-manufacturer': '',
         'baseboard-product-name': '',
         'system-manufacturer': '',
@@ -303,7 +315,7 @@ def test__missing_dmi_type2():
 def test__missing_dmi_type16():
     expected_result = {
         'bios-release-date': '',
-        'ecc-memory': '',
+        'ecc-memory': None,
         'baseboard-manufacturer': 'Supermicro',
         'baseboard-product-name': 'X11SPH-nCTPF',
         'system-manufacturer': 'QEMU',

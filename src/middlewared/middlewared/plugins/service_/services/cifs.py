@@ -1,4 +1,5 @@
 from middlewared.service_exception import CallError
+from middlewared.utils import run
 
 from .base import SimpleService, ServiceState
 
@@ -14,9 +15,11 @@ class CIFSService(SimpleService):
 
     etc = ["smb", "smb_share"]
 
-    freebsd_rc = "smbd"
+    freebsd_rc = "samba_server"
     freebsd_pidfile = "/var/run/samba4/smbd.pid"
+    nmbd_pidfile = "/var/run/samba4/nmbd.pid"
     dcerpc_pidfile = "/var/run/samba4/samba-dcerpcd.pid"
+    wsdd_rcfile = "/usr/local/etc/rc.d/wsdd"
 
     systemd_unit = "smbd"
 
@@ -45,7 +48,7 @@ class CIFSService(SimpleService):
             except ProcessLookupError:
                 break
             except Exception:
-                self.middleware.logger.warning('%s: liveness check failed', exc_info=True)
+                self.middleware.logger.warning('%s: liveness check failed', pid, exc_info=True)
                 break
 
             time.sleep(1)
@@ -74,20 +77,33 @@ class CIFSService(SimpleService):
         self.middleware.logger.debug('Successfully shut down samba-dcerpcd')
 
     async def _get_state_freebsd(self):
+        # samba_server aggregate status checks nmbd+smbd+winbindd. nmbd is
+        # skipped when announce[netbios]=False, so gate on smbd (always
+        # required when cifs is on) to avoid a false-DOWN flap loop.
+        proc = await run("pgrep", "-F", self.freebsd_pidfile, "smbd", check=False, encoding="utf-8")
         return ServiceState(
-            (await self._freebsd_service("smbd", "status")).returncode == 0,
-            [],
+            proc.returncode == 0,
+            [int(i) for i in proc.stdout.strip().split('\n') if i.isdigit()],
         )
 
     async def start(self):
+        # forcestart bypasses per-daemon *_enable rcvars (samba_server.in
+        # samba_server_cmd force_run branch starts nmbd+smbd+winbindd
+        # unconditionally). Kill nmbd post-start to honour
+        # announce[netbios]=False.
+        await self._freebsd_service("samba_server", "start", force=True)
         announce = (await self.middleware.call("network.configuration.config"))["service_announcement"]
-        await self._freebsd_service("smbd", "start", force=True)
-        await self._freebsd_service("winbindd", "start", force=True)
-        if announce["netbios"]:
-            await self._freebsd_service("nmbd", "start", force=True)
+        if not announce["netbios"]:
+            await run("pkill", "-F", self.nmbd_pidfile, check=False)
         if announce["wsd"]:
-            await self.middleware.call('etc.generate', 'wsd')
-            await self._freebsd_service("wsdd", "start", force=True)
+            if os.path.exists(self.wsdd_rcfile):
+                await self.middleware.call("etc.generate", "wsd")
+                await self.middleware.call("etc.generate", "rc")
+                await self._freebsd_service("wsdd", "start", force=True)
+            else:
+                self.middleware.logger.warning(
+                    "WSD announcements are enabled but %s is missing", self.wsdd_rcfile
+                )
 
     async def after_start(self):
         await self.middleware.call("service.reload", "mdns")
@@ -98,10 +114,9 @@ class CIFSService(SimpleService):
             raise CallError(e)
 
     async def stop(self):
-        await self._freebsd_service("smbd", "stop", force=True)
-        await self._freebsd_service("winbindd", "stop", force=True)
-        await self._freebsd_service("nmbd", "stop", force=True)
-        await self._freebsd_service("wsdd", "stop", force=True)
+        await self._freebsd_service("samba_server", "stop", force=True)
+        if os.path.exists(self.wsdd_rcfile):
+            await self._freebsd_service("wsdd", "stop", force=True)
         await self.middleware.run_in_thread(self.terminate_dcerpcd)
 
     async def after_stop(self):

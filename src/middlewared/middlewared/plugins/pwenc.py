@@ -84,7 +84,10 @@ def encrypt(data):
     data = data.encode('utf8')
 
     def pad(x):
-        return x + (PWENC_BLOCK_SIZE - len(x) % PWENC_BLOCK_SIZE) * PWENC_PADDING
+        n = PWENC_BLOCK_SIZE - len(x) % PWENC_BLOCK_SIZE
+        # PWENC_PADDING after data that already ends in it could not be told apart from the data on decrypt, so such
+        # data is padded with n bytes of value n instead. Everything else keeps the legacy padding.
+        return x + n * (bytes([n]) if x.endswith(PWENC_PADDING) else PWENC_PADDING)
 
     nonce = os.urandom(8)
     cipher = AES.new(PWEncService.get_secret(), AES.MODE_CTR, counter=Counter.new(64, prefix=nonce))
@@ -95,12 +98,20 @@ def encrypt(data):
 def decrypt(encrypted, _raise=False):
     if not encrypted:
         return ''
+
+    def unpad(x):
+        # Legacy padding always ends in PWENC_PADDING, which is never a valid pad length (see encrypt())
+        n = x[-1] if x else 0
+        if 0 < n <= PWENC_BLOCK_SIZE and x.endswith(bytes([n]) * n):
+            return x[:-n]
+        return x.rstrip(PWENC_PADDING)
+
     try:
         encrypted = base64.b64decode(encrypted)
         nonce = encrypted[:8]
         encrypted = encrypted[8:]
         cipher = AES.new(PWEncService.get_secret(), AES.MODE_CTR, counter=Counter.new(64, prefix=nonce))
-        return cipher.decrypt(encrypted).rstrip(PWENC_PADDING).decode('utf8')
+        return unpad(cipher.decrypt(encrypted)).decode('utf8')
     except Exception:
         if _raise:
             raise

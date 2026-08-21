@@ -198,6 +198,12 @@ class InterfaceService(Service):
     def autoconfigure(self, iface, wait_dhcp):
         dhclient_running = self.middleware.call_sync('interface.dhclient_status', iface.name)[0]
         if not dhclient_running:
+            # Match 13.3 firstboot invariant: interfaces come up IPv4-only.
+            # Base FreeBSD 15 changed the kernel nd6 default to IPv6-enabled;
+            # restore IFDISABLED explicitly so the empty-DB autoconfigure path
+            # mirrors the configure() else-branch (int_ipv6auto=False).
+            iface.nd6_flags = iface.nd6_flags | {netif.NeighborDiscoveryFlags.IFDISABLED}
+            iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.AUTO_LINKLOCAL}
             # Make sure interface is UP before starting dhclient
             # NAS-103577
             if netif.InterfaceFlags.UP not in iface.flags:

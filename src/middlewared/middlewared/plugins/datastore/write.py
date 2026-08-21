@@ -47,6 +47,9 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
         """
         Insert a new entry to `name`.
         """
+        stub = await self.middleware.call('datastore.stub.handle_removed_tables_insert', name, data, options)
+        if stub is not None:
+            return stub
         table = self._get_table(name)
         insert, relationships = self._extract_relationships(table, options['prefix'], data)
 
@@ -94,6 +97,9 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
         """
         Update an entry `id` in `name`.
         """
+        stub = await self.middleware.call('datastore.stub.handle_removed_tables_update', name, id_or_filters, data, options)
+        if stub is not None:
+            return stub
         table = self._get_table(name)
         data = data.copy()
 
@@ -187,6 +193,9 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
         """
         Delete an entry `id` in `name`.
         """
+        stub = await self.middleware.call('datastore.stub.handle_removed_tables_delete', name, id_or_filters, options)
+        if stub is not None:
+            return stub
         table = self._get_table(name)
 
         await self.middleware.call(

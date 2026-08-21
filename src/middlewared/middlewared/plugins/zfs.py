@@ -91,7 +91,10 @@ class ZFSPoolService(CRUDService):
         enabled = (libzfs.FeatureState.ENABLED, libzfs.FeatureState.ACTIVE)
         with libzfs.ZFS() as zfs:
             for pool in filter(lambda x: x.name == pool_name, zfs.pools):
-                return all((i.state in enabled for i in pool.features))
+                return all(
+                    i.state in enabled for i in pool.features
+                    if getattr(i, 'supports_upgrade', True)
+                )
             else:
                 raise CallError(f'{pool_name!r} not found', errno.ENOENT)
 
@@ -357,11 +360,14 @@ class ZFSPoolService(CRUDService):
     def find_not_online(self, pool):
         pool = self.middleware.call_sync('zfs.pool.query', [['id', '=', pool]], {'get': True})
 
-        unavails = []
-        for nodes in pool['groups'].values():
+        result = {'groups': {}}
+        for group_name, nodes in pool['groups'].items():
+            unavails = []
             for node in nodes:
                 unavails.extend(self.__find_not_online(node))
-        return unavails
+            if unavails:
+                result['groups'][group_name] = unavails
+        return result
 
     def __find_not_online(self, node):
         if len(node['children']) == 0 and node['status'] not in ('ONLINE', 'AVAIL'):
@@ -403,9 +409,21 @@ class ZFSDatasetService(CRUDService):
                 if about_to_lock_dataset else []
             )
         ]
-        return self.query([['encrypted', '=', True], or_filters], {
-            'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']}, 'select': ['id', 'mountpoint']
-        })
+        # `datasets_serialized` stopped emitting a top-level `mountpoint` key (py-libzfs 3b100a9,
+        # "Do not treat mountpoint specially"). 13.3 shipped an older py-libzfs that still emitted it,
+        # so `select: ['id', 'mountpoint']` silently yielded rows with no `mountpoint` at all and every
+        # consumer subscripting it raised KeyError. Read it out of `properties` instead.
+        return [
+            {
+                'id': ds['id'],
+                'mountpoint': None if (
+                    mountpoint := ds['properties'].get('mountpoint', {}).get('value')
+                ) == 'none' else mountpoint,
+            }
+            for ds in self.query([['encrypted', '=', True], or_filters], {
+                'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']},
+            })
+        ]
 
     def flatten_datasets(self, datasets):
         return sum([[deepcopy(ds)] + self.flatten_datasets(ds['children']) for ds in datasets], [])
@@ -435,6 +453,9 @@ class ZFSDatasetService(CRUDService):
         `query-options.extra.retrieve_properties` which if set to false will make sure that no property is retrieved
         whatsoever and overrides any other property retrieval attribute.
 
+        `query-options.extra.retrieve_children` set to false ( true by default ) reads nothing below the starting
+        point: only the pools' root datasets, or only the dataset an `id` filter names, each with empty `children`.
+
         Please note that `query-options.extra` are not available using the REST protocol but are available using the websocket protocol.
         """
         options = options or {}
@@ -443,6 +464,7 @@ class ZFSDatasetService(CRUDService):
         flat = extra.get('flat', True)
         user_properties = extra.get('user_properties', True)
         retrieve_properties = extra.get('retrieve_properties', True)
+        retrieve_children = extra.get('retrieve_children', True)
         if not retrieve_properties:
             # This is a short hand version where consumer can specify that they don't want any property to
             # be retrieved
@@ -454,13 +476,22 @@ class ZFSDatasetService(CRUDService):
             if filters and len(filters) == 1 and list(filters[0][:2]) == ['id', '=']:
                 state_options = {
                     'snapshots': extra.get('snapshots', False),
-                    'recursive': extra.get('recursive', True),
+                    'recursive': extra.get('recursive', True) and retrieve_children,
                     'snapshots_recursive': extra.get('snapshots_recursive', False)
                 }
                 try:
                     datasets = [zfs.get_dataset(filters[0][2]).asdict(**state_options)]
                 except libzfs.ZFSException:
                     datasets = []
+                if not retrieve_children and datasets:
+                    datasets[0]['children'] = []
+            elif not retrieve_children:
+                # libzfs reads just the pools' root datasets here; nothing below them is touched.
+                datasets = [
+                    dict(dataset, children=[]) for dataset in zfs.datasets_serialized(
+                        props=props, user_props=user_properties, retrieve_children=False,
+                    )
+                ]
             else:
                 datasets = zfs.datasets_serialized(
                     props=props, user_props=user_properties
@@ -493,11 +524,11 @@ class ZFSDatasetService(CRUDService):
     def common_load_dataset_checks(self, ds):
         self.common_encryption_checks(ds)
         if ds.key_loaded:
-            raise CallError(f'{id} key is already loaded')
+            raise CallError(f'{ds.name} key is already loaded')
 
     def common_encryption_checks(self, ds):
         if not ds.encrypted:
-            raise CallError(f'{id} is not encrypted')
+            raise CallError(f'{ds.name} is not encrypted')
 
     def path_to_dataset(self, path):
         with libzfs.ZFS() as zfs:
@@ -782,7 +813,9 @@ class ZFSDatasetService(CRUDService):
                                 if v.get('source') == 'INHERIT':
                                     prop.inherit(recursive=v.get('recursive', False))
                                 elif 'value' in v and (
-                                    prop.value != v['value'] or prop.source.name == 'INHERITED'
+                                    # `value` is formatted (10G), `rawvalue` is literal (10737418240)
+                                    str(v['value']) not in (prop.value, prop.rawvalue) or
+                                    prop.source.name == 'INHERITED'
                                 ):
                                     prop.value = v['value']
                                 elif 'parsed' in v and (
@@ -814,16 +847,23 @@ class ZFSDatasetService(CRUDService):
         options = options or {}
         force = options.get('force', False)
         recursive = options.get('recursive', False)
+        # `zfs destroy -n` destroys nothing and refuses what the destroy itself would refuse before it starts
+        # (children or snapshots without `recursive`, dependent clones). It cannot know about busy mountpoints.
+        dry_run = options.get('dry_run', False)
 
         args = []
         if force:
             args += ['-f']
         if recursive:
             args += ['-r']
+        if dry_run:
+            args += ['-n']
 
-        # If dataset is mounted and has receive_resume_token, we should destroy it or ZFS will say
-        # "cannot destroy 'pool/dataset': dataset already exists"
-        recv_run = subprocess.run(['zfs', 'recv', '-A', id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        recv_run = None
+        if not dry_run:
+            # If dataset is mounted and has receive_resume_token, we should destroy it or ZFS will say
+            # "cannot destroy 'pool/dataset': dataset already exists"
+            recv_run = subprocess.run(['zfs', 'recv', '-A', id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Destroying may take a long time, lets not use py-libzfs as it will block
         # other ZFS operations.
         try:
@@ -831,7 +871,7 @@ class ZFSDatasetService(CRUDService):
                 ['zfs', 'destroy'] + args + [id], text=True, capture_output=True, check=True,
             )
         except subprocess.CalledProcessError as e:
-            if recv_run.returncode == 0 and e.stderr.strip().endswith('dataset does not exist'):
+            if recv_run and recv_run.returncode == 0 and e.stderr.strip().endswith('dataset does not exist'):
                 # This operation might have deleted this dataset if it was created by `zfs recv` operation
                 return
             self.logger.error('Failed to delete dataset', exc_info=True)

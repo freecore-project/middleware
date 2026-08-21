@@ -1,6 +1,7 @@
 from middlewared.schema import accepts, Any, Bool, Dict, Int, List, Patch, Str
 from middlewared.service import (
-    CallError, CRUDService, ValidationErrors, item_method, no_auth_required, pass_app, private, filterable, job
+    CallError, CRUDService, ValidationErrors, item_method, no_auth_required, pass_app, private, filterable, job,
+    POST_EXTEND_OPTS,
 )
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, filter_list
@@ -9,7 +10,8 @@ from middlewared.validators import Email
 from middlewared.plugins.smb import SMBBuiltin
 
 import binascii
-import crypt
+import ctypes
+import ctypes.util
 import errno
 import glob
 import hashlib
@@ -19,6 +21,8 @@ import shlex
 import shutil
 import string
 import stat
+import struct
+import threading
 import time
 from pathlib import Path
 from contextlib import suppress
@@ -44,10 +48,10 @@ def pw_checkname(verrors, attribute, name):
     invalid_chars = ' ,\t:+&#%^()!@~*?<>=|\\/"'
     invalids = []
     for char in name:
-        # invalid_chars nor 8-bit characters are allowed
+        # invalid_chars nor non-ASCII characters are allowed
         if (
-            char in invalid_chars and char not in invalids
-        ) or ord(char) & 0x80:
+            char in invalid_chars or not char.isascii()
+        ) and char not in invalids:
             invalids.append(char)
     if invalids:
         verrors.add(
@@ -56,17 +60,99 @@ def pw_checkname(verrors, attribute, name):
         )
 
 
+_libcrypt_path = ctypes.util.find_library('crypt')
+if _libcrypt_path is None:
+    # On FreeBSD 15, /usr/lib/libcrypt.so is an ld linker script (not ELF)
+    # and ctypes.util.find_library can't validate it. Use the versioned
+    # SONAME directly — ld.so resolves it via ldconfig to /lib/libcrypt.so.5.
+    # (Note: crypt(3) is NOT in libc on FB15 — moved entirely into libcrypt.)
+    _libcrypt_path = 'libcrypt.so.5'
+_libcrypt = ctypes.CDLL(_libcrypt_path)
+_libcrypt.crypt.restype = ctypes.c_char_p
+_libcrypt.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_crypt_lock = threading.Lock()
+
+
+def _crypt(word, salt):
+    """Call crypt(3) directly via ctypes (replacement for removed Python crypt module)."""
+    with _crypt_lock:
+        result = _libcrypt.crypt(word.encode('utf-8'), salt.encode('utf-8'))
+    if result is None:
+        raise OSError('crypt() returned NULL')
+    return result.decode('utf-8')
+
+
 def crypted_password(cleartext):
     """
     Generates an unix hash from `cleartext`.
     """
-    return crypt.crypt(cleartext, '$6$' + ''.join([
+    return _crypt(cleartext, '$6$' + ''.join([
         random.choice(string.ascii_letters + string.digits) for _ in range(16)]
     ))
 
 
+def _md4(data: bytes) -> bytes:
+    """Pure-Python MD4 (RFC 1320) for NT hash computation.
+
+    OpenSSL 3 (FB15 base) moved MD4 to the legacy provider, which is not
+    loaded by default, so hashlib.new('md4', ...) raises ValueError. CPython
+    has no built-in MD4, so we fall back to this implementation. Only used
+    when OpenSSL refuses md4; FB13's OpenSSL 1.1 still serves md4 directly.
+    """
+    h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]
+    msg = bytearray(data)
+    orig_len_bits = (8 * len(data)) & 0xFFFFFFFFFFFFFFFF
+    msg.append(0x80)
+    while len(msg) % 64 != 56:
+        msg.append(0)
+    msg += struct.pack('<Q', orig_len_bits)
+
+    mask = 0xFFFFFFFF
+
+    def f(x, y, z):
+        return (x & y) | ((~x) & z & mask)
+
+    def g(x, y, z):
+        return (x & y) | (x & z) | (y & z)
+
+    def hh(x, y, z):
+        return x ^ y ^ z
+
+    def lrot(v, n):
+        v &= mask
+        return ((v << n) | (v >> (32 - n))) & mask
+
+    r1_idx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    r1_sh = [3, 7, 11, 19] * 4
+    r2_idx = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]
+    r2_sh = [3, 5, 9, 13] * 4
+    r3_idx = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]
+    r3_sh = [3, 9, 11, 15] * 4
+
+    for chunk_off in range(0, len(msg), 64):
+        X = list(struct.unpack('<16I', bytes(msg[chunk_off:chunk_off + 64])))
+        A, B, C, D = h
+        for i, s in zip(r1_idx, r1_sh):
+            A = lrot(A + f(B, C, D) + X[i], s)
+            A, D, C, B = D, C, B, A
+        for i, s in zip(r2_idx, r2_sh):
+            A = lrot(A + g(B, C, D) + X[i] + 0x5A827999, s)
+            A, D, C, B = D, C, B, A
+        for i, s in zip(r3_idx, r3_sh):
+            A = lrot(A + hh(B, C, D) + X[i] + 0x6ED9EBA1, s)
+            A, D, C, B = D, C, B, A
+        h = [(h[0] + A) & mask, (h[1] + B) & mask,
+             (h[2] + C) & mask, (h[3] + D) & mask]
+
+    return struct.pack('<4I', *h)
+
+
 def nt_password(cleartext):
-    nthash = hashlib.new('md4', cleartext.encode('utf-16le')).digest()
+    encoded = cleartext.encode('utf-16le')
+    try:
+        nthash = hashlib.new('md4', encoded, usedforsecurity=False).digest()
+    except (ValueError, TypeError):
+        nthash = _md4(encoded)
     return binascii.hexlify(nthash).decode().upper()
 
 
@@ -74,7 +160,11 @@ def validate_sudo_commands(commands):
     verrors = ValidationErrors()
     for i, command in enumerate(commands):
         try:
-            executable = shlex.split(command)[0]
+            args = shlex.split(command)
+            if not args:
+                raise ValueError('Command must not be empty')
+
+            executable = args[0]
 
             if not executable.startswith('/'):
                 raise ValueError('Executable must be an absolute path')
@@ -178,6 +268,21 @@ class UserService(CRUDService):
             user.pop('id_type_both')
         return user
 
+    @private
+    async def sync_smb_username_map(self, microsoft_account_before, microsoft_account_after):
+        """
+        the internal development record: smb4.conf names the username map only while some user is a
+        Microsoft account, and a user change reloads the `user` etc group, which renders the
+        map file but not smb4.conf. When the flag changes, reload SMB so smbd follows now
+        instead of at its next reload. A stopped SMB service renders the current state when
+        it starts.
+        """
+        if bool(microsoft_account_before) == bool(microsoft_account_after):
+            return
+
+        if await self.middleware.call('service.started', 'cifs'):
+            await self.middleware.call('service.reload', 'cifs')
+
     @filterable
     async def query(self, filters=None, options=None):
         """
@@ -196,9 +301,10 @@ class UserService(CRUDService):
         options['prefix'] = self._config.datastore_prefix
 
         datastore_options = options.copy()
-        datastore_options.pop('count', None)
-        datastore_options.pop('get', None)
-        datastore_options.pop('limit', None)
+        # the internal development record: like CRUDService.query, leave count/get/limit/offset/select to filter_list, which
+        # applies them after it filters the extended rows (offset was applied twice, select before the filters).
+        for option in POST_EXTEND_OPTS:
+            datastore_options.pop(option, None)
 
         extra = options.get('extra', {})
         dssearch = extra.pop('search_dscache', False)
@@ -309,6 +415,10 @@ class UserService(CRUDService):
                                                       [('group', '=', 'builtin_users')],
                                                       {'get': True}))['id'])
 
+        # The home directory below is given to the new uid, so pick it first.
+        if not data.get('uid'):
+            data['uid'] = await self.get_next_uid()
+
         # Is this a new directory or not? Let's not nuke existing directories,
         # e.g. /, /root, /mnt/tank/my-dataset, etc ;).
         new_homedir = False
@@ -349,9 +459,6 @@ class UserService(CRUDService):
                     shutil.rmtree(data['home'])
                 raise
 
-        if not data.get('uid'):
-            data['uid'] = await self.get_next_uid()
-
         pk = None  # Make sure pk exists to rollback in case of an error
         data = await self.user_compress(data)
         try:
@@ -372,6 +479,7 @@ class UserService(CRUDService):
             raise
 
         await self.middleware.call('service.reload', 'user')
+        await self.sync_smb_username_map(False, data['microsoft_account'])
 
         if data['smb']:
             gm_job = await self.middleware.call('smb.synchronize_passdb')
@@ -424,7 +532,8 @@ class UserService(CRUDService):
             ])
             if not group:
                 verrors.add('user_update.group', f'Group {data["group"]} not found', errno.ENOENT)
-            group = group[0]
+            else:
+                group = group[0]
         else:
             group = user['group']
             user['group'] = group['id']
@@ -441,11 +550,14 @@ class UserService(CRUDService):
         has_home = home != '/nonexistent'
         # root user (uid 0) is an exception to the rule
         if data.get('sshpubkey') and not home.startswith('/mnt') and user['uid'] != 0:
-            verrors.add('user_update.sshpubkey', 'Home directory is not writable, leave this blank"')
+            verrors.add('user_update.sshpubkey', 'Home directory is not writable, leave this blank')
 
         # Do not allow attributes to be changed for builtin user
         if user['builtin']:
-            for i in ('group', 'home', 'home_mode', 'uid', 'username', 'smb'):
+            if 'home_mode' in data:
+                verrors.add('user_update.home_mode', 'This attribute cannot be changed')
+
+            for i in ('group', 'home', 'uid', 'username', 'smb'):
                 if i in data and data[i] != user[i]:
                     verrors.add(f'user_update.{i}', 'This attribute cannot be changed')
 
@@ -492,6 +604,8 @@ class UserService(CRUDService):
             home_old = user['home']
         else:
             home_copy = False
+
+        microsoft_account_before = user['microsoft_account']
 
         # After this point user dict has values from data
         user.update(data)
@@ -571,6 +685,7 @@ class UserService(CRUDService):
         await self.middleware.call('datastore.update', 'account.bsdusers', pk, user, {'prefix': 'bsdusr_'})
 
         await self.middleware.call('service.reload', 'user')
+        await self.sync_smb_username_map(microsoft_account_before, user['microsoft_account'])
         if user['smb'] and must_change_pdb_entry:
             gm_job = await self.middleware.call('smb.synchronize_passdb')
             await gm_job.wait()
@@ -639,6 +754,7 @@ class UserService(CRUDService):
 
         await self.middleware.call('datastore.delete', 'account.bsdusers', pk)
         await self.middleware.call('service.reload', 'user')
+        await self.sync_smb_username_map(user['microsoft_account'], False)
 
         return pk
 
@@ -814,7 +930,12 @@ class UserService(CRUDService):
         exclude_filter = [('id', '!=', pk)] if pk else []
 
         if 'username' in data:
-            pw_checkname(verrors, f'{schema}.username', data['username'])
+            # A name that is not changing is not checked again, so accounts named before the check
+            # rejected every non-ASCII character stay editable
+            if not pk or data['username'] != (await self.middleware.call(
+                'datastore.query', 'account.bsdusers', [('id', '=', pk)], {'prefix': 'bsdusr_', 'get': True}
+            ))['username']:
+                pw_checkname(verrors, f'{schema}.username', data['username'])
 
             if await self.middleware.call('datastore.query', 'account.bsdusers', [
                 ('username', '=', data['username'])
@@ -961,10 +1082,10 @@ class UserService(CRUDService):
             [('user', '=', pk)], {'prefix': 'bsdgrpmember_'}
         )
         for gm in gms:
-            if gm['id'] not in groups:
+            if gm['group']['id'] not in groups:
                 await self.middleware.call('datastore.delete', 'account.bsdgroupmembership', gm['id'])
             else:
-                existing_ids.add(gm['id'])
+                existing_ids.add(gm['group']['id'])
 
         for _id in groups - existing_ids:
             group = await self.middleware.call(
@@ -1122,9 +1243,10 @@ class GroupService(CRUDService):
         options['prefix'] = self._config.datastore_prefix
 
         datastore_options = options.copy()
-        datastore_options.pop('count', None)
-        datastore_options.pop('get', None)
-        datastore_options.pop('limit', None)
+        # the internal development record: like CRUDService.query, leave count/get/limit/offset/select to filter_list, which
+        # applies them after it filters the extended rows (offset was applied twice, select before the filters).
+        for option in POST_EXTEND_OPTS:
+            datastore_options.pop(option, None)
 
         extra = options.get('extra', {})
         dssearch = extra.pop('search_dscache', False)
@@ -1360,7 +1482,11 @@ class GroupService(CRUDService):
                     errno.EEXIST,
                 )
 
-            pw_checkname(verrors, f'{schema}.name', data['name'])
+            # As for users: an unchanged name is not checked again
+            if not pk or data['name'] != (await self.middleware.call(
+                'datastore.query', 'account.bsdgroups', [('id', '=', pk)], {'prefix': 'bsdgrp_', 'get': True}
+            ))['group']:
+                pw_checkname(verrors, f'{schema}.name', data['name'])
 
         allow_duplicate_gid = data.pop('allow_duplicate_gid', False)
         if data.get('gid') and not allow_duplicate_gid:

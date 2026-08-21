@@ -20,7 +20,7 @@ match_rx = None
 
 if platform.system() in ("FreeBSD", "Darwin"):
     PS_STR = "-awwxouser,pid,ppid,start,command"
-    MATCH_STR = '(\w+)\s+(\d+)\s+(\d+)\s+([\d\w:]+)'
+    MATCH_STR = r'(\w+)\s+(\d+)\s+(\d+)\s+([\d\w:]+)'
     match_rx = re.compile(MATCH_STR)
 else:
     print("Unknown OS", file=sys.stderr)
@@ -35,7 +35,7 @@ def AFPUsers():
     MAIN_PID = None
 
     if platform.system() in ("FreeBSD"):
-        rx = re.compile("^\S+\s+\S+\s+(\d+)\s+\d+\s+[\w\d]+\s+[\d\.:]+\s+([\d\.]+)")
+        rx = re.compile(r"^\S+\s+\S+\s+(\d+)\s+\d+\s+[\w\d]+\s+[\d\.:]+\s+([\d\.]+)")
         try:
             p = subprocess.Popen(["/usr/bin/sockstat", "-4"],
                                  stdout=subprocess.PIPE, encoding="utf8")

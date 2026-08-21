@@ -10,6 +10,23 @@ import uuid
 from pathlib import Path
 
 SYSDATASET_PATH = '/var/db/system'
+RSYNC_VANISHED = 24
+COPY_ATTEMPTS = 3
+
+
+async def copy_system_dataset(src, dst, logger, attempts=COPY_ATTEMPTS):
+    """
+    rsync `src` into `dst` for a system dataset move. Exit 24 only means a source file vanished during the copy:
+    newsyslog (cron) still rotates the logs under the system dataset after syslogd is stopped, renaming a file the
+    copy had already listed. Copy again so the rotated file arrives under its new name; any other failure, or
+    files still vanishing after `attempts` passes, is returned to the caller unchanged.
+    """
+    for attempt in range(1, attempts + 1):
+        cp = await run('rsync', '-az', f'{src}/', dst, check=False)
+        if cp.returncode != RSYNC_VANISHED or attempt == attempts:
+            return cp
+        logger.warning('Moving the system dataset: files vanished during the copy (rsync exit %d), copying again '
+                       '(pass %d of %d)', RSYNC_VANISHED, attempt + 1, attempts)
 
 
 class SystemDatasetModel(sa.Model):
@@ -83,6 +100,7 @@ class SystemDatasetService(ConfigService):
         Str('pool', null=True),
         Str('pool_exclude', null=True),
         Bool('syslog'),
+        Bool('confirm_rollback_loss', default=False),
         update=True
     ))
     @job(lock='sysdataset_update')
@@ -94,11 +112,30 @@ class SystemDatasetService(ConfigService):
 
         `pool_exclude` can be specified to make sure that we don't place the system dataset on that pool if `pool`
         is not provided.
+
+        `confirm_rollback_loss` must be set to move the system dataset to another pool while the return to
+        TrueNAS CORE 13.3 is open (`system.rollback.available`): the move destroys the snapshots that return
+        depends on.
         """
         config = await self.config()
+        confirm_rollback_loss = data.pop('confirm_rollback_loss', False)
 
         new = config.copy()
         new.update(data)
+
+        if data.get('pool') is not None and new['pool'] != config['pool'] and not confirm_rollback_loss:
+            # the internal development record: migrate() destroys <old pool>/.system with its snapshots, the ones the
+            # 13.3 return restores. Only an explicit move is asked about; the automatic relocations (`pool: None`
+            # with `pool_exclude`, on export or lock of the pool that holds it) keep their behaviour.
+            rollback = await self.middleware.call('system.rollback.available')
+            if rollback['available']:
+                window = await self.middleware.call('system.rollback.config')
+                raise CallError(
+                    f'Moving the system dataset off pool {config["pool"]!r} destroys the snapshots of its .system '
+                    f'dataset that the return to boot environment {window["origin_be"]!r} (TrueNAS CORE 13.3) '
+                    'restores, so after the move you will not be able to go back. Remove the return '
+                    '(system.rollback.remove) or pass confirm_rollback_loss to proceed.'
+                )
 
         verrors = ValidationErrors()
         if new['pool'] != config['pool']:
@@ -190,6 +227,16 @@ class SystemDatasetService(ConfigService):
 
         return await self.config()
 
+    @private
+    async def _return_window_open(self):
+        # A failed check keeps the system dataset where it is: setup() runs at boot before /var/db/system is
+        # mounted, and staying on the boot pool loses nothing.
+        try:
+            return (await self.middleware.call('system.rollback.available'))['available']
+        except Exception:
+            self.logger.warning('Cannot tell whether the return to TrueNAS CORE 13.3 is open', exc_info=True)
+            return True
+
     @accepts(
         Bool('mount', default=True),
         Str('exclude_pool', default=None, null=True),
@@ -248,7 +295,18 @@ class SystemDatasetService(ConfigService):
                 if p['is_decrypted']:
                     pool = p
                     break
-            if pool:
+            if pool and await self._return_window_open():
+                # the internal development record: while the return to TrueNAS CORE 13.3 is open the system dataset
+                # stays on the boot pool. Placing it on the first data pool runs migrate(), which destroys
+                # <boot pool>/.system with the snapshots that return restores, and do_update refuses exactly that
+                # (the internal development record) -- raising here failed pool.create/import at the end and then every boot before
+                # /var/db/system was mounted. 13.3 moved it silently; here the first setup() after the return is
+                # removed does.
+                self.logger.info(
+                    'The system dataset stays on pool %r while the return to TrueNAS CORE 13.3 is open; it moves '
+                    'to pool %r once that return is removed', boot_pool, pool['name']
+                )
+            elif pool:
                 job = await self.middleware.call('systemdataset.update', {'pool': pool['name']})
                 await job.wait()
                 if job.error:
@@ -456,7 +514,7 @@ class SystemDatasetService(ConfigService):
                 await self.middleware.call('service.stop', i)
 
             if _from:
-                cp = await run('rsync', '-az', f'{SYSDATASET_PATH}/', '/tmp/system.new', check=False)
+                cp = await copy_system_dataset(SYSDATASET_PATH, '/tmp/system.new', self.logger)
                 if cp.returncode == 0:
                     await self.__umount(_from, config['uuid'])
                     await self.__umount(_to, config['uuid'])

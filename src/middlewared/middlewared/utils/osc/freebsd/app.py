@@ -11,7 +11,10 @@ def get_app_version():
     if '/usr/local/lib' not in sys.path:
         sys.path.append('/usr/local/lib')
     # Lazy import to avoid freenasOS configure logging for us
-    from freenasOS import Configuration
+    try:
+        from freenasOS import Configuration
+    except ImportError:
+        from middlewared.utils.freenasOS import Configuration
     conf = Configuration.Configuration()
     sys_mani = conf.SystemManifest()
     if sys_mani:

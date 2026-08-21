@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/local/bin/python3
 #+
 # Copyright 2010 iXsystems, Inc.
 # All rights reserved
@@ -46,8 +46,11 @@ for dev in devs:
             pkl_file.close()
 
         temp_list = []
-        ret = os.popen("/usr/sbin/mfiutil show events -c crit").readlines()
-        for line in ret:
+        ret = subprocess.run(
+            ["/usr/sbin/mfiutil", "show", "events", "-c", "crit"],
+            capture_output=True, text=True
+        )
+        for line in ret.stdout.splitlines():
             temp_list.append(line.strip().split(" "))
         send_email = False
         for line in temp_list:
@@ -69,11 +72,12 @@ for dev in devs:
             for row in c:
                 to_addr = str(row[0])
             if len(to_addr) > 0:
-                fm = os.popen("""grep -E '^root:' /etc/aliases | """
-                              """awk '{print $2'}""").readlines()
-                if fm:
-                    for line in fm:
-                         addy = line.strip()
+                fm = subprocess.run(
+                    ["grep", "-E", "^root:", "/etc/mail/aliases"],
+                    capture_output=True, text=True
+                )
+                if fm.returncode == 0 and fm.stdout.strip():
+                    addy = fm.stdout.strip().split()[-1]
                 else:
                     # This code path results in not sending mail.  To
                     # ensure that mail is sent when email is configured
@@ -83,9 +87,10 @@ for dev in devs:
                 message = ""
                 for key in list(data.keys()):
                     message += key + " " + data[key] + "\n"
-                cmd = """echo '%s' | mailx -s 'RAID status' %s""" % (message, addy)
-                p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-                output, errors = p.communicate()
+                subprocess.run(
+                    ["mailx", "-s", "RAID status", addy],
+                    input=message, text=True
+                )
                 # TODO: If this fails we should clear the log cache so
                 # we retry sending mail on the next run
                 sys.exit()

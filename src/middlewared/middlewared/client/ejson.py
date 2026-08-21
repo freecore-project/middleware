@@ -9,7 +9,8 @@ class JSONEncoder(json.JSONEncoder):
             return {'$type': 'date', '$value': obj.isoformat()}
         elif type(obj) is datetime:
             if obj.tzinfo:
-                obj += obj.utcoffset()
+                # 10:00+02:00 is 08:00 UTC: take the offset off, do not add it
+                obj -= obj.utcoffset()
                 obj = obj.replace(tzinfo=None)
             # Total milliseconds since EPOCH
             return {'$date': int((obj - datetime(1970, 1, 1)).total_seconds() * 1000)}
@@ -22,7 +23,8 @@ def object_hook(obj):
     obj_len = len(obj)
     if obj_len == 1:
         if '$date' in obj:
-            return datetime.fromtimestamp(obj['$date'] / 1000, tz=timezone.utc) + timedelta(milliseconds=obj['$date'] % 1000)
+            # Whole seconds plus the millisecond remainder (a true division would count the remainder twice)
+            return datetime.fromtimestamp(obj['$date'] // 1000, tz=timezone.utc) + timedelta(milliseconds=obj['$date'] % 1000)
         if '$time' in obj:
             return time(*[int(i) for i in obj['$time'].split(':')])
     if obj_len == 2 and '$type' in obj and '$value' in obj:

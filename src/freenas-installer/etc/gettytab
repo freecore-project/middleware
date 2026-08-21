@@ -1,0 +1,11 @@
+# the internal development record: the installer's getty(8) sessions.  Autologin
+# makes getty skip the prompt and run the "login" program at once; the
+# program is the installer, nothing here is a login.  Replaces the base
+# gettytab on the installer ISO only.
+#
+default:\
+	:cb:ce:ck:lc:np:sp#0:im=:
+installer|installer session on the display:\
+	:al=root:lo=/etc/install-session.sh:
+installer.serial|installer session on the serial console:\
+	:al=root:lo=/etc/install-session.sh:nc:
