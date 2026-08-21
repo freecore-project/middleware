@@ -12,8 +12,9 @@ import tempfile
 from datetime import datetime
 
 import middlewared
-from middlewared.schema import Bool, Dict, accepts
+from middlewared.schema import Bool, Dict, Str, accepts
 from middlewared.service import CallError, Service, job, private
+from middlewared.plugins.config_ import scale as scale_config
 from middlewared.plugins.pwenc import PWENC_FILE_SECRET
 from middlewared.plugins.pool import GELI_KEYPATH
 
@@ -34,6 +35,7 @@ class ConfigService(Service):
         Bool('secretseed', default=False),
         Bool('pool_keys', default=False),
         Bool('root_authorized_keys', default=False),
+        Str('target', enum=['freecore', 'truenas-scale'], default='freecore'),
     ))
     @job(pipes=["output"])
     async def save(self, job, options):
@@ -48,9 +50,18 @@ class ConfigService(Service):
         `root_authorized_keys`: include "authorized_keys" file for the root user.
 
         If none of these options are set, the bundle is not generated and the database file is provided.
+
+        `target`: `truenas-scale` writes a bundle for moving to TrueNAS SCALE instead
+        (the internal development record): a copy of the database downgraded to the TrueNAS 13.3 revision
+        SCALE accepts, the selected secret seed and root keys, and a README listing the FreeCORE
+        settings SCALE has no place for. It is always a bundle, it never includes GELI keys (SCALE
+        cannot use them) and it cannot be uploaded back onto FreeCORE.
         """
 
-        if all(not options[k] for k in options):
+        if options['target'] == 'truenas-scale':
+            return await self.middleware.run_in_thread(self._save_for_scale, job, options)
+
+        if all(not options[k] for k in ('secretseed', 'pool_keys', 'root_authorized_keys')):
             bundle = False
             filename = FREENAS_DATABASE
         else:
@@ -76,6 +87,37 @@ class ConfigService(Service):
 
         if bundle:
             os.remove(filename)
+
+    def _save_for_scale(self, job, options):
+        version = self.middleware.call_sync('system.version')
+        with tempfile.TemporaryDirectory(prefix='config-scale-') as workdir:
+            os.chmod(workdir, 0o700)
+            database, undone = scale_config.build(FREENAS_DATABASE, workdir)
+            files = {}
+            included = [f'freenas-v1.db (downgraded to the 13.3 revision {scale_config.SCALE_BASE_REVISION})']
+            if options['secretseed']:
+                files['pwenc_secret'] = PWENC_FILE_SECRET
+                included.append('pwenc_secret')
+            if options['root_authorized_keys'] and os.path.exists(CONFIG_FILES['root_authorized_keys']):
+                files['root_authorized_keys'] = CONFIG_FILES['root_authorized_keys']
+                included.append('root_authorized_keys')
+            if options['pool_keys']:
+                included.append('no GELI keys: TrueNAS SCALE cannot unlock GELI pools')
+            pool_lines = []
+            for pool in self.middleware.call_sync('pool.query', [], {'select': ['name']}):
+                pool_lines.extend(scale_config.describe_pool_report(scale_config.pool_feature_report(pool['name'])))
+            readme = os.path.join(workdir, scale_config.README_NAME)
+            with open(readme, 'w') as file:
+                file.write(scale_config.readme(undone, version, included, pool_lines))
+            bundle = os.path.join(workdir, 'bundle.tar')
+            with tarfile.open(bundle, 'w') as tar:
+                tar.add(database, arcname='freenas-v1.db')
+                for arcname, path in files.items():
+                    tar.add(path, arcname=arcname)
+                tar.add(readme, arcname=scale_config.README_NAME)
+            os.chmod(bundle, 0o600)
+            with open(bundle, 'rb') as file:
+                shutil.copyfileobj(file, job.pipes.output.w)
 
     @accepts()
     @job(pipes=["input"])
@@ -187,7 +229,7 @@ class ConfigService(Service):
                 file_path = os.path.join(tmpdir, filename)
                 if os.path.exists(file_path):
                     if filename == 'geli':
-                        # Let's only copy the geli keys and not overwrite the entire directory
+                        # Copy individual legacy pool keys without replacing the key directory.
                         os.makedirs(CONFIG_FILES['geli'], exist_ok=True)
                         for key_path in os.listdir(file_path):
                             move(
@@ -230,22 +272,6 @@ class ConfigService(Service):
         factorydb = f'{FREENAS_DATABASE}.factory'
         with contextlib.suppress(OSError):
             os.unlink(factorydb)
-
-        cp = subprocess.run(
-            ['migrate93', '-f', factorydb],
-            capture_output=True,
-        )
-        if cp.returncode != 0:
-            job.logs_fd.write(cp.stderr)
-            raise CallError('Factory reset has failed.')
-
-        cp = subprocess.run(
-            ['migrate113', '-f', factorydb],
-            capture_output=True,
-        )
-        if cp.returncode != 0:
-            job.logs_fd.write(cp.stderr)
-            raise CallError('Factory reset has failed.')
 
         cp = subprocess.run(
             ['migrate'],

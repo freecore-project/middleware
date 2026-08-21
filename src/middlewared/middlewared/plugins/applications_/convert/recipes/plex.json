@@ -1,0 +1,76 @@
+{
+  "app": "plex",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "proven",
+  "title": "Plex Media Server",
+  "comment": "Plex keeps everything under one application-support directory ('Plex Media Server': Preferences.xml with the server identity and claim, Library databases, metadata). The FreeBSD package creates it under plexmediaserver_support_path (default /usr/local/plexdata) -- the FreeCORE plugin index ships exactly this jail -- and the Daemonless image exports PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR=/config/Library/Application Support, the same layout the LinuxServer and official pms-docker images keep under /config. Both sources' data paths point at the 'Plex Media Server' directory itself so one carry serves both. rc_data_var is deliberately absent: plexmediaserver_support_path names the PARENT of the data directory, and the override would replace the path wholesale; a jail with a relocated support path is refused with 'required state missing' rather than carrying the wrong tree. The plexpass package variant (rc.d/plexmediaserver_plexpass) is not detected and falls back to the as-is lift. The transcode directory is never carried (the image has its own /transcode volume); media libraries are install-time volumes, not state. Proven 2026-09-29 on a FreeCORE-15.1-RC5 (222345a88d) appliance carrying the #480 catalog fix and this recipe as overlays (both landed on 15.1-stable the same day): a 14.4-RELEASE jail running plexmediaserver 1.43.3.10896 converted in one apply after a per-entry catalog refresh; the server identity carried -- the live /identity endpoint reported the jail's exact ProcessedMachineIdentifier -- on the published 32400 mapping. The source jail was not modified. A Linux bundle mounts /config; the data directory is found inside that mount (the internal development record). hotio/plex is deliberately NOT listed: its data directory is the volume root (/config/Preferences.xml) and it writes TranscoderTempDirectory=/config/Temp into Preferences.xml, which needs a remap and a preference rewrite (per-image layouts, the internal development record).",
+  "target": {
+    "catalog_id": "daemonless:plex",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 32400
+  },
+  "sources": {
+    "jail": {
+      "pkg": "plexmediaserver",
+      "rc_script": "plexmediaserver",
+      "detect": [
+        "usr/local/etc/rc.d/plexmediaserver"
+      ],
+      "data": "usr/local/plexdata/Plex Media Server",
+      "uid": 972
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/plex",
+        "ghcr.io/linuxserver/plex",
+        "docker.io/linuxserver/plex",
+        "docker.io/plexinc/pms-docker",
+        "plexinc/pms-docker"
+      ],
+      "data": "/config/Library/Application Support/Plex Media Server",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/plex",
+        "user": "puid",
+        "environment": {
+          "VERSION": "docker"
+        },
+        "drop_environment": [
+          "PLEX_CLAIM"
+        ],
+        "volumes": [
+          {
+            "from": "",
+            "target": "/config"
+          }
+        ]
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "Library/Application Support/Plex Media Server",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "transcode directory (the image has its own /transcode volume)",
+    "Codecs (re-downloaded for the image's platform)",
+    "Cache (rebuilt)",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

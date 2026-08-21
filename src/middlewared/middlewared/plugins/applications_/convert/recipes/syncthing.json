@@ -1,0 +1,62 @@
+{
+  "app": "syncthing",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "proven",
+  "title": "Syncthing",
+  "comment": "Syncthing's --home directory (config.xml, keys, index database) carries as one tree; the Daemonless image runs it with --home=/config. The upstream syncthing/syncthing image keeps it under /var/syncthing/config and is not matched by this recipe. Shared folder paths inside config.xml still name the source's paths; bind the same datasets at those targets or re-point the folders after the first start. Proven 2026-09-29 on a stock FreeCORE-15.1-RC5 (222345a88d) appliance: a 14.4-RELEASE iocage jail running syncthing 2.1.2_4 converted to the Daemonless image (v2.1.5) in one apply; the device identity carried (identical device ID before and after), the GUI answered on the published port, and the jail's live port set (8384, 21027/udp, 22000 tcp+udp) was detected and mapped. The source jail was not modified.",
+  "target": {
+    "catalog_id": "daemonless:syncthing",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8384
+  },
+  "sources": {
+    "jail": {
+      "pkg": "syncthing",
+      "rc_script": "syncthing",
+      "rc_data_var": "syncthing_home",
+      "detect": [
+        "usr/local/etc/rc.d/syncthing"
+      ],
+      "data": "usr/local/etc/syncthing",
+      "uid": 983
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/syncthing",
+        "ghcr.io/linuxserver/syncthing",
+        "docker.io/linuxserver/syncthing"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/syncthing",
+        "tag_template": "version-v{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

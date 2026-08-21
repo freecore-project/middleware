@@ -49,7 +49,8 @@ class EventSource(object):
             self.on_finish()
         except Exception:
             self.middleware.logger.warning('EventSource %r on_finish() failed', self.name, exc_info=True)
-        asyncio.run_coroutine_threadsafe(self.app.unsubscribe(self.ident), self.app.loop)
+        # notify=True: the client did not ask for this, the source ran out.
+        asyncio.run_coroutine_threadsafe(self.app.unsubscribe(self.ident, notify=True), self.app.loop)
 
     def run(self):
         raise NotImplementedError('run() method not implemented')

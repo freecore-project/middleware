@@ -3,7 +3,10 @@ import contextlib
 import json
 import os
 
-from freenasOS import Update
+try:
+    from freenasOS import Update
+except ImportError:
+    from middlewared.utils.freenasOS import Update
 
 from middlewared.service import private, Service
 

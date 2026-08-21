@@ -1,0 +1,63 @@
+{
+  "app": "homepage",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Homepage",
+  "comment": "Homepage's state is its config directory of YAML files (settings.yaml, services.yaml, bookmarks.yaml, widgets.yaml, custom.css/js). The FreeBSD port serves the app from /usr/local/www/homepage with config/ inside it, owned by the web user (WWWOWN www, uid 80 -- the port registers no dedicated user; verify on the box round); the Daemonless image reads the same files from /config, as the upstream ghcr.io/gethomepage/homepage image does from /app/config. Docker-integration widgets reference sockets that do not exist on the appliance; they carry as text and the affected widgets show errors until edited.",
+  "target": {
+    "catalog_id": "daemonless:homepage",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 3000
+  },
+  "sources": {
+    "jail": {
+      "pkg": "homepage",
+      "rc_script": "homepage",
+      "detect": [
+        "usr/local/etc/rc.d/homepage"
+      ],
+      "data": "usr/local/www/homepage/config",
+      "uid": 80
+    },
+    "linux": {
+      "images": [
+        "ghcr.io/gethomepage/homepage",
+        "docker.io/gethomepage/homepage"
+      ],
+      "data": "/app/config",
+      "uid": 0,
+      "export": {
+        "image": "ghcr.io/gethomepage/homepage",
+        "tag_template": "v{version}",
+        "user": "puid",
+        "environment": {
+          "HOMEPAGE_ALLOWED_HOSTS": "*"
+        }
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "the built application tree (the image ships its own)",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

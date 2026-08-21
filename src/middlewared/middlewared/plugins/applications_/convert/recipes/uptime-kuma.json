@@ -1,0 +1,52 @@
+{
+  "app": "uptime-kuma",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Uptime Kuma",
+  "comment": "Uptime Kuma's data directory (kuma.db, upload/) carries as one tree into /config, the Daemonless image's DATA_DIR. There is no FreeBSD package; only a Linux export is a source.",
+  "target": {
+    "catalog_id": "daemonless:uptime-kuma",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 3001
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "docker.io/louislam/uptime-kuma",
+        "louislam/uptime-kuma"
+      ],
+      "data": "/app/data",
+      "uid": 0,
+      "export": {
+        "image": "docker.io/louislam/uptime-kuma",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 0
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

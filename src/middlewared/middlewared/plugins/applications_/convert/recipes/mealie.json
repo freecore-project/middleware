@@ -1,0 +1,50 @@
+{
+  "app": "mealie",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Mealie",
+  "comment": "Mealie keeps its database, recipe images and backups in one data directory; the official image uses /app/data and the Daemonless image reads the same tree from /config. There is no FreeBSD package; only a Linux source applies.",
+  "target": {
+    "catalog_id": "daemonless:mealie",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 9000
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "ghcr.io/mealie-recipes/mealie",
+        "docker.io/hkotel/mealie"
+      ],
+      "data": "/app/data",
+      "uid": 0,
+      "export": {
+        "image": "ghcr.io/mealie-recipes/mealie",
+        "tag_template": "v{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

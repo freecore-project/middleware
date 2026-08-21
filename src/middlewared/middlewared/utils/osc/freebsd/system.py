@@ -2,6 +2,7 @@
 import logging
 import re
 import subprocess
+
 import sysctl
 
 logger = logging.getLogger(__name__)
@@ -17,14 +18,17 @@ def get_cpu_model():
 
 
 def serial_port_choices():
-    cp = subprocess.Popen(
-        "/usr/sbin/devinfo -u | grep -A 99999 '^I/O ports:' | grep -E '*([0-9a-fA-Fx]+).*\\(uart[0-9]+\\)'",
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-    )
-    stdout, stderr = cp.communicate()
+    try:
+        cp = subprocess.run(
+            ['/usr/sbin/devinfo', '-u'],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        logger.warning('Failed to run devinfo for serial port enumeration')
+        return []
     return [
         {
             'name': e[1],
             'start': e[0],
-        } for e in RE_PORT.findall(stdout.decode(errors='ignore'))
+        } for e in RE_PORT.findall(cp.stdout)
     ]

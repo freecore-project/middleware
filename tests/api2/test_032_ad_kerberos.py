@@ -16,9 +16,14 @@ from base64 import b64decode
 from pytest_dependency import depends
 
 try:
-    from config import AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer
+    from config import (
+        AD_CREATECOMPUTER, AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer,
+    )
 except ImportError:
-    Reason = 'ADNameServer AD_DOMAIN, ADPASSWORD, or/and ADUSERNAME are missing in config.py"'
+    Reason = (
+        'ADNameServer, AD_DOMAIN, ADPASSWORD, ADUSERNAME, '
+        'or/and AD_CREATECOMPUTER are missing in config.py'
+    )
     pytestmark = pytest.mark.skip(reason=Reason)
 else:
     from auto_config import dev_test
@@ -84,6 +89,7 @@ def test_03_enabling_activedirectory(request):
         "bindname": ADUSERNAME,
         "domainname": AD_DOMAIN,
         "netbiosname": hostname,
+        "createcomputer": AD_CREATECOMPUTER,
         "dns_timeout": 15,
         "verbose_logging": True,
         "enable": True

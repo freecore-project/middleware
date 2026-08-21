@@ -1,0 +1,63 @@
+{
+  "app": "sonarr",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "proven",
+  "title": "Sonarr",
+  "comment": "Sonarr keeps everything in one data directory (-data=): database, config.xml, backups. The FreeBSD package's rc.d script and the LinuxServer image both point it at one directory; the Daemonless image runs it with -data=/config. Proven 2026-09-13 on a 15.1-MASTER-202609130322 appliance: an iocage jail running sonarr 4.0.17.2952 migrated to ghcr.io/daemonless/sonarr:latest in 39 s; the API key and a seeded tag came across, the application answered on its published port.",
+  "target": {
+    "catalog_id": "daemonless:sonarr",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8989
+  },
+  "sources": {
+    "jail": {
+      "pkg": "sonarr",
+      "rc_script": "sonarr",
+      "rc_data_var": "sonarr_data_dir",
+      "detect": [
+        "usr/local/etc/rc.d/sonarr"
+      ],
+      "data": "usr/local/sonarr",
+      "uid": 351
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/sonarr",
+        "ghcr.io/linuxserver/sonarr",
+        "docker.io/linuxserver/sonarr",
+        "ghcr.io/hotio/sonarr"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/sonarr",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

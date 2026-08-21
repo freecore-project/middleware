@@ -1,0 +1,64 @@
+{
+  "app": "emby",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Emby Server",
+  "comment": "Emby's -programdata directory carries as one tree; the Daemonless image runs it with -programdata /config.",
+  "target": {
+    "catalog_id": "daemonless:emby",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8096
+  },
+  "sources": {
+    "jail": {
+      "pkg": "emby-server",
+      "rc_script": "emby-server",
+      "rc_data_var": "emby_server_data_dir",
+      "detect": [
+        "usr/local/etc/rc.d/emby-server"
+      ],
+      "data": "var/db/emby-server",
+      "uid": 989
+    },
+    "linux": {
+      "images": [
+        "docker.io/emby/embyserver",
+        "emby/embyserver",
+        "lscr.io/linuxserver/emby",
+        "ghcr.io/linuxserver/emby",
+        "docker.io/linuxserver/emby"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/emby",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

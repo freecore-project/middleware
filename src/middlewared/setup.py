@@ -42,6 +42,9 @@ setup(
         'middlewared.apidocs': [
             'templates/websocket/*',
             'templates/*.*',
+            'static/vendor/*',
+            'static/vendor/*/*',
+            'static/vendor/*/*/*',
         ],
         'middlewared': (
             get_assets('alembic') +
@@ -50,6 +53,9 @@ setup(
             get_assets('etc_files') +
             get_assets('migration')
         ),
+        # the internal development record, #446: the converter's recipes and the lifted
+        # jail's init script are data beside the code that reads them.
+        'middlewared.plugins.applications_.convert': ['recipes/*.json', 'jail-init.sh'],
     },
     include_package_data=True,
     license='BSD',

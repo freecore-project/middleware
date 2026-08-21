@@ -62,6 +62,14 @@ class FSAttachmentDelegate(ServiceChangeMixin):
     async def stop(self, attachments):
         pass
 
+    async def rollback_export(self, attachments):
+        """Restore a failed export's non-destructive toggle after validating storage.
+
+        Return True only when this delegate's prior state has been restored. Existing
+        delegates retain their normal disabled state unless they opt into recovery.
+        """
+        return False
+
 
 class LockableFSAttachmentDelegate(FSAttachmentDelegate):
     """

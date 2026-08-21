@@ -1,0 +1,51 @@
+{
+  "app": "heimdall",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Heimdall",
+  "comment": "Heimdall keeps its SQLite database, uploaded icons and settings under the LinuxServer /config contract, and the Daemonless image keeps the same layout. Only the LinuxServer image exists upstream; there is no FreeBSD package.",
+  "target": {
+    "catalog_id": "daemonless:heimdall",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 80
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/heimdall",
+        "ghcr.io/linuxserver/heimdall",
+        "docker.io/linuxserver/heimdall"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/heimdall",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

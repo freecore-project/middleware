@@ -1,0 +1,73 @@
+name: demo
+services:
+  demo:
+    image: ghcr.io/daemonless/demo:${DEMO_TAG}
+    container_name: demo
+    restart: unless-stopped
+    environment:
+      - MODE=${MODE}
+      - API_TOKEN=${API_TOKEN}
+    volumes:
+      - "${CONFIG_DATA}:/config"
+      - "${MEDIA_PATH}:/media:ro"
+    ports:
+      - "${WEB_PORT}:8080"
+      - "${HTTPS_PORT}:8443"
+    annotations:
+      org.freebsd.jail.allow.mlock: "true"
+x-fjord:
+  version: "0.1"
+  info:
+    id: demo
+    name: Demo Service Pro
+    description: The fjord description of the demo.
+    category: Utilities
+    class: service
+    icon: icons/demo.svg
+    web_port: ${WEB_PORT}
+    upstream_url: https://github.com/example/demo
+    web_url: https://example.com/demo
+  variables:
+    - name: DEMO_TAG
+      type: image_tag
+      default: latest
+      optional: true
+      image: ghcr.io/daemonless/demo
+    - name: MODE
+      label: Runtime mode
+      type: string
+      default: production
+    - name: API_TOKEN
+      label: API credential
+      type: secret
+      default: ""
+      optional: true
+      level: primary
+    - name: CONFIG_DATA
+      label: Configuration files
+      type: zfs_dataset
+      default: config
+      host_permissions:
+        uid: 1000
+        gid: 1000
+        mode: "755"
+    - name: MEDIA_PATH
+      label: Optional media
+      type: path
+      default: ""
+      optional: true
+    - name: WEB_PORT
+      label: Web UI
+      type: port
+      default: "18080"
+    - name: HTTPS_PORT
+      label: HTTPS Web UI
+      type: port
+      default: 18443
+  variants:
+    - id: latest
+      label: Latest
+      default: true
+  appjail:
+    director: |
+      # not read by FreeCORE

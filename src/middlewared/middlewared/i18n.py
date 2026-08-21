@@ -1,6 +1,6 @@
 from gettext import NullTranslations, GNUTranslations
+from importlib.resources import files
 import logging
-import pkg_resources
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +11,7 @@ def set_language(language):
     global translations
 
     try:
-        with open(pkg_resources.resource_filename("middlewared", f"locale/{language}/LC_MESSAGES/middlewared.mo"), "rb") as f:
+        with open(files("middlewared").joinpath("locale", language, "LC_MESSAGES", "middlewared.mo"), "rb") as f:
             translations = GNUTranslations(f)
 
         return True

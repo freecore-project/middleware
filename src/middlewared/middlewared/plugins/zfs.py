@@ -1,5 +1,6 @@
 import errno
 import subprocess
+import time
 from collections import defaultdict
 from copy import deepcopy
 
@@ -11,6 +12,47 @@ from middlewared.service import (
 )
 from middlewared.utils import filter_list, filter_getattrs, osc
 from middlewared.validators import ReplicationSnapshotNamingSchema
+
+# the internal development record: a dataset carrying this user property (set locally,
+# value "on") is enumerated as a leaf.  Its children are somebody's internals
+# -- podman's zfs graph driver keeps one dataset per image layer under the
+# Applications store, hundreds of them -- and neither the Storage tree nor any
+# dataset consumer wants them; `extra.include_internal` restores the full view.
+OPAQUE_PROPERTY = 'org.freecore:opaque'
+OPAQUE_CACHE_SECONDS = 15
+_opaque_cache = (0.0, frozenset())
+
+
+def opaque_datasets():
+    """Names of the datasets marked opaque, read at most every few seconds."""
+    global _opaque_cache
+    stamp, names = _opaque_cache
+    now = time.monotonic()
+    if now - stamp < OPAQUE_CACHE_SECONDS:
+        return names
+    cp = subprocess.run(
+        ['zfs', 'get', '-H', '-r', '-s', 'local', '-t', 'filesystem', '-o', 'name,value',
+         OPAQUE_PROPERTY],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+    )
+    names = frozenset()
+    if cp.returncode == 0:
+        names = frozenset(
+            line.split('\t', 1)[0] for line in cp.stdout.splitlines()
+            if '\t' in line and line.split('\t', 1)[1].strip() == 'on'
+        )
+    _opaque_cache = (now, names)
+    return names
+
+
+def forget_opaque_datasets():
+    global _opaque_cache
+    _opaque_cache = (0.0, frozenset())
+
+
+def is_internal(name, opaque):
+    """True for a dataset strictly below an opaque one."""
+    return any(name.startswith(f'{parent}/') for parent in opaque)
 
 
 class ZFSSetPropertyError(CallError):
@@ -91,7 +133,10 @@ class ZFSPoolService(CRUDService):
         enabled = (libzfs.FeatureState.ENABLED, libzfs.FeatureState.ACTIVE)
         with libzfs.ZFS() as zfs:
             for pool in filter(lambda x: x.name == pool_name, zfs.pools):
-                return all((i.state in enabled for i in pool.features))
+                return all(
+                    i.state in enabled for i in pool.features
+                    if getattr(i, 'supports_upgrade', True)
+                )
             else:
                 raise CallError(f'{pool_name!r} not found', errno.ENOENT)
 
@@ -357,11 +402,14 @@ class ZFSPoolService(CRUDService):
     def find_not_online(self, pool):
         pool = self.middleware.call_sync('zfs.pool.query', [['id', '=', pool]], {'get': True})
 
-        unavails = []
-        for nodes in pool['groups'].values():
+        result = {'groups': {}}
+        for group_name, nodes in pool['groups'].items():
+            unavails = []
             for node in nodes:
                 unavails.extend(self.__find_not_online(node))
-        return unavails
+            if unavails:
+                result['groups'][group_name] = unavails
+        return result
 
     def __find_not_online(self, node):
         if len(node['children']) == 0 and node['status'] not in ('ONLINE', 'AVAIL'):
@@ -403,12 +451,71 @@ class ZFSDatasetService(CRUDService):
                 if about_to_lock_dataset else []
             )
         ]
-        return self.query([['encrypted', '=', True], or_filters], {
-            'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']}, 'select': ['id', 'mountpoint']
-        })
+        # `datasets_serialized` stopped emitting a top-level `mountpoint` key (py-libzfs 3b100a9,
+        # "Do not treat mountpoint specially"). 13.3 shipped an older py-libzfs that still emitted it,
+        # so `select: ['id', 'mountpoint']` silently yielded rows with no `mountpoint` at all and every
+        # consumer subscripting it raised KeyError. Read it out of `properties` instead.
+        return [
+            {
+                'id': ds['id'],
+                'mountpoint': None if (
+                    mountpoint := ds['properties'].get('mountpoint', {}).get('value')
+                ) == 'none' else mountpoint,
+            }
+            for ds in self.query([['encrypted', '=', True], or_filters], {
+                'extra': {'properties': ['encryption', 'keystatus', 'mountpoint']},
+            })
+        ]
 
     def flatten_datasets(self, datasets):
         return sum([[deepcopy(ds)] + self.flatten_datasets(ds['children']) for ds in datasets], [])
+
+    def opaque_datasets(self):
+        return sorted(opaque_datasets())
+
+    def forget_opaque_datasets(self):
+        forget_opaque_datasets()
+
+    def serialize_skipping(self, dataset, opaque):
+        """Serialise a dataset tree, opaque datasets as leaves.
+
+        Python walks only the path down to an opaque dataset; every other
+        subtree is one C call (``asdict(recursive=True)``), which is what makes
+        this as fast as the plain enumeration when nothing is opaque below.
+        """
+        name = dataset.name
+        if name in opaque:
+            result = dataset.asdict(recursive=False)
+            result['children'] = []
+            return result
+        if not any(parent.startswith(f'{name}/') for parent in opaque):
+            return dataset.asdict(recursive=True)
+        result = dataset.asdict(recursive=False)
+        result['children'] = [self.serialize_skipping(child, opaque) for child in dataset.children]
+        return result
+
+    @staticmethod
+    def restrict_properties(datasets, props, user_properties):
+        """What ``datasets_serialized(props=..., user_props=...)`` would have kept.
+
+        libzfs applies ``props`` to native properties only; user properties (the
+        ``module:name`` keys) come back whenever ``user_props`` is set, whatever
+        ``props`` says.  Dropping them here broke ``jail.iocage_set_up``, which finds
+        the activated pool through ``org.freebsd.ioc:active`` (the internal development record).
+        """
+        def kept(key):
+            if ':' in key:
+                return bool(user_properties)
+            return props is None or key in props or key == 'mountpoint'
+
+        for dataset in datasets:
+            properties = dataset.get('properties')
+            if isinstance(properties, dict):
+                dataset['properties'] = {
+                    key: value for key, value in properties.items() if kept(key)
+                }
+            ZFSDatasetService.restrict_properties(dataset.get('children') or [], props, user_properties)
+        return datasets
 
     @filterable
     def query(self, filters=None, options=None):
@@ -457,14 +564,29 @@ class ZFSDatasetService(CRUDService):
                     'recursive': extra.get('recursive', True),
                     'snapshots_recursive': extra.get('snapshots_recursive', False)
                 }
+                leaf = (
+                    state_options['recursive'] and not extra.get('include_internal') and
+                    filters[0][2] in opaque_datasets()
+                )
+                if leaf:
+                    # the internal development record: the store itself is a leaf here too.
+                    state_options['recursive'] = False
                 try:
                     datasets = [zfs.get_dataset(filters[0][2]).asdict(**state_options)]
                 except libzfs.ZFSException:
                     datasets = []
+                if leaf and datasets:
+                    datasets[0]['children'] = []
             else:
-                datasets = zfs.datasets_serialized(
-                    props=props, user_props=user_properties
-                )
+                opaque = frozenset() if extra.get('include_internal') else opaque_datasets()
+                if opaque:
+                    datasets = [self.serialize_skipping(pool.root_dataset, opaque) for pool in zfs.pools]
+                    if props is not None or not user_properties:
+                        datasets = self.restrict_properties(datasets, props, user_properties)
+                else:
+                    datasets = zfs.datasets_serialized(
+                        props=props, user_props=user_properties
+                    )
                 if flat:
                     datasets = self.flatten_datasets(datasets)
                 else:
@@ -837,7 +959,11 @@ class ZFSDatasetService(CRUDService):
             self.logger.error('Failed to delete dataset', exc_info=True)
             error = e.stderr.strip()
             errno_ = errno.EFAULT
-            if "Device busy" in error:
+            normalized_error = error.casefold()
+            if (
+                'device busy' in normalized_error or
+                'pool or dataset is busy' in normalized_error
+            ):
                 errno_ = errno.EBUSY
             raise CallError(f'Failed to delete dataset: {error}', errno_)
 
@@ -941,9 +1067,14 @@ class ZFSSnapshot(CRUDService):
             stdout = cp.stdout.strip()
             if not stdout:
                 return []
+            opaque = frozenset()
+            if not (options.get('extra') or {}).get('include_internal'):
+                opaque = opaque_datasets()
             snaps = [
                 {'name': i, 'pool': i.split('/', 1)[0]}
                 for i in stdout.split('\n')
+                # the internal development record: image layers under an opaque dataset
+                if not (opaque and is_internal(i.split('@', 1)[0], opaque))
             ]
             return filter_list(snaps, filters, options)
         with libzfs.ZFS() as zfs:
@@ -956,13 +1087,23 @@ class ZFSSnapshot(CRUDService):
                     if e.code != libzfs.Error.NOENT:
                         raise
             else:
+                opaque = frozenset()
+                if not (options.get('extra') or {}).get('include_internal'):
+                    opaque = opaque_datasets()
                 for i in zfs.snapshots:
                     try:
-                        snapshots.append(i.asdict())
+                        snapshot = i.asdict()
                     except libzfs.ZFSException as e:
                         # snapshot may have been deleted while this is running
                         if e.code != libzfs.Error.NOENT:
                             raise
+                        continue
+                    # the internal development record: image layers under an opaque dataset
+                    if opaque and is_internal(
+                        str(snapshot.get('dataset') or snapshot.get('name', '').split('@', 1)[0]), opaque,
+                    ):
+                        continue
+                    snapshots.append(snapshot)
         # FIXME: awful performance with hundreds/thousands of snapshots
         return filter_list(snapshots, filters, options)
 

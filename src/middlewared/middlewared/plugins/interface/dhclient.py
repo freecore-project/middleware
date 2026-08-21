@@ -1,7 +1,9 @@
+import asyncio
 import os
+import signal
 import subprocess
 
-from middlewared.service import private, Service
+from middlewared.service import CallError, private, Service
 from middlewared.utils import osc, Popen
 
 
@@ -41,6 +43,36 @@ class InterfaceService(Service):
             self.logger.error('Failed to run dhclient on {}: {}'.format(
                 interface, output,
             ))
+
+    @private
+    async def dhclient_rebind(self, interface):
+        """Restart an active DHCP client and wait for its replacement."""
+        running, old_pid = self.dhclient_status(interface)
+        if not running:
+            return False
+
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        for _ in range(100):
+            if not self.dhclient_status(interface)[0]:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise CallError(f'Timed out stopping dhclient on {interface!r}')
+
+        try:
+            await asyncio.wait_for(self.dhclient_start(interface, wait=True), timeout=60)
+        except asyncio.TimeoutError:
+            raise CallError(f'Timed out starting dhclient on {interface!r}')
+
+        running, new_pid = self.dhclient_status(interface)
+        if not running or new_pid == old_pid:
+            raise CallError(f'Failed to restart dhclient on {interface!r}')
+
+        return True
 
     @private
     def dhclient_status(self, interface):

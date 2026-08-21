@@ -1,0 +1,14 @@
+name: demo
+
+x-daemonless:
+  title: Demo Stack
+  category: Utilities
+  description: A deliberately unsupported stack.
+  upstream_url: https://github.com/example/demo
+  web_url: https://example.com/demo
+
+services:
+  demo:
+    image: ghcr.io/daemonless/demo:latest
+  database:
+    image: ghcr.io/daemonless/postgres:18

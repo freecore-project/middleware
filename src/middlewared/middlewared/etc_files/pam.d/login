@@ -6,18 +6,23 @@
 <%namespace name="pam" file="pam.inc" />
 <%
         dsp = pam.getDirectoryServicePam(middleware=middleware, file='login')
+        twofactor_auth = middleware.call_sync('auth.twofactor.config')
+        twofactor_enabled = twofactor_auth['enabled'] and twofactor_auth['services']['console']
 %>
 # auth
 auth		sufficient	pam_self.so		no_warn
-% if dsp.enabled() and dsp.name() != 'NIS':
+% if dsp.enabled() and dsp.name() != 'NIS' and not twofactor_enabled:
 ${dsp.pam_auth()}
 % endif
 auth		include		system
+% if twofactor_enabled:
+auth		required	/usr/local/lib/security/pam_oath.so	usersfile=/usr/local/etc/users.oath	window=${twofactor_auth['window']}
+% endif
 
 # account
 account		requisite	pam_securetty.so
 account		required	pam_nologin.so
-% if dsp.enabled() and dsp.name() != 'NIS':
+% if dsp.enabled() and dsp.name() != 'NIS' and not twofactor_enabled:
 ${dsp.pam_account()}
 % endif
 account		include		system

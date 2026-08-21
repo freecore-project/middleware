@@ -1,8 +1,8 @@
 import logging
-import subprocess
-import sysctl
 import os
-from packaging import version
+import subprocess
+
+import sysctl
 
 from middlewared.utils.io import write_if_changed
 
@@ -31,7 +31,6 @@ def generate_loader_config(middleware):
         generate_ha_loader_config,
         generate_ec2_config,
         generate_truenas_logo,
-        generate_dual_nvdimm_config,
     ]
     if middleware.call_sync("system.is_freenas"):
         generators.append(generate_xen_loader_config)
@@ -48,7 +47,7 @@ def generate_loader_config(middleware):
 
 
 def generate_truenas_logo(middleware):
-    return [f'loader_logo="TrueNAS{middleware.call_sync("system.product_type").capitalize()}"']
+    return [f'loader_logo="{middleware.call_sync("system.product_name")}"']
 
 
 def list_efi_consoles():
@@ -146,39 +145,6 @@ def generate_ec2_config(middleware):
             'boot_multicons="YES"',
             'hint.atkbd.0.disabled="1"',
             'hint.atkbdc.0.disabled="1"',
-        ]
-
-
-def generate_dual_nvdimm_config(middleware):
-    data = middleware.call_sync('system.info')
-
-    product = data['system_product']
-
-    # 0123456789/12345679 are some of the default values
-    # that we've seen from supermicro.
-    # Before the version 3 hardware, we were not changing
-    # this value so this is a way to identify version 1/2
-    # m-series hardware.
-    if data['system_product_version'] in ('0123456789', '123456789'):
-        return
-
-    try:
-        current_vers = version.parse(data['system_product_version'])
-        minimum_vers = version.Version('3.0')
-    except Exception as e:
-        middleware.logger.error('Failed determining hardware version with error: %s', e)
-        return
-
-    # for now we only check to make sure that the current version is 3 because
-    # we quickly found out that the SMBIOS defaults for the system-version value
-    # from supermicro aren't very predictable. Since setting these values on a
-    # system that doesn't support the dual-nvdimm configs leads to "no carrier"
-    # on the ntb0 interface, we play it safe. The `minimum_vers` will need to be
-    # changed as time goes on if we start tagging hardware with 4.0,5.0 etc etc
-    if product.startswith('TRUENAS-M') and current_vers.major == minimum_vers.major:
-        return [
-            'hint.ntb_hw.0.split=1',
-            'hint.ntb_hw.0.config="ntb_pmem:1:4:0,ntb_pmem:1:4:0,ntb_transport"'
         ]
 
 

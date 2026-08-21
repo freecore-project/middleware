@@ -1,0 +1,63 @@
+{
+  "app": "vaultwarden",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "proven",
+  "title": "Vaultwarden",
+  "comment": "Vaultwarden's DATA_FOLDER (db.sqlite3, rsa keys, attachments, sends, icon cache) carries as one tree into /config, which is the Daemonless image's DATA_FOLDER. The admin token and other settings come from the environment, not from the data folder; set them on the application. The image fronts vaultwarden with nginx on port 80. Proven 2026-09-29 on a stock FreeCORE-15.1-RC5 (222345a88d) appliance: a 14.4-RELEASE iocage jail's vaultwarden converted in one apply; db.sqlite3 and rsa_key.pem carried byte-identical (rsa key sha256 verified before and after), the web vault answered on the chosen host port. The source jail was not modified.",
+  "target": {
+    "catalog_id": "daemonless:vaultwarden",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 80
+  },
+  "sources": {
+    "jail": {
+      "pkg": "vaultwarden",
+      "rc_script": "vaultwarden",
+      "rc_data_var": "vaultwarden_data_folder",
+      "detect": [
+        "usr/local/etc/rc.d/vaultwarden",
+        "usr/local/www/vaultwarden"
+      ],
+      "data": "usr/local/www/vaultwarden/data",
+      "uid": 80
+    },
+    "linux": {
+      "images": [
+        "docker.io/vaultwarden/server",
+        "vaultwarden/server"
+      ],
+      "data": "/data",
+      "uid": 0,
+      "export": {
+        "image": "docker.io/vaultwarden/server",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 0
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

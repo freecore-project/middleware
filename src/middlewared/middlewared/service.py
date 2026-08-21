@@ -11,11 +11,11 @@ import socket
 import threading
 import time
 import traceback
+import uuid
 from subprocess import run
 import ipaddress
 
 from middlewared.common.environ import environ_update
-import middlewared.main
 from middlewared.schema import accepts, Bool, Dict, Int, List, Ref, Str
 from middlewared.service_exception import CallException, CallError, ValidationError, ValidationErrors  # noqa
 from middlewared.utils import filter_list, osc
@@ -64,7 +64,10 @@ def item_method(fn):
     return fn
 
 
-def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, check_pipes=True, transient=False):
+def job(
+    lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, check_pipes=True, transient=False,
+    abortable=False,
+):
     """Flag method as a long running job."""
     def check_job(fn):
         fn._job = {
@@ -75,6 +78,11 @@ def job(lock=None, lock_queue_size=None, logs=False, process=False, pipes=None, 
             'pipes': pipes or [],
             'check_pipes': check_pipes,
             'transient': transient,
+            # Synchronous jobs normally cannot be cancelled: cancelling the
+            # asyncio wrapper leaves their worker thread running.  An abortable
+            # synchronous job observes `job.aborted`, performs its own process
+            # cleanup, and only then raises CancelledError.
+            'abortable': abortable,
         }
         return fn
     return check_job
@@ -778,17 +786,6 @@ class ServicePartBase(metaclass=ServicePartBaseMeta):
 
 class CoreService(Service):
 
-    @accepts(Str('id'), Int('cols'), Int('rows'))
-    async def resize_shell(self, id, cols, rows):
-        """
-        Resize terminal session (/websocket/shell) to cols x rows
-        """
-        shell = middlewared.main.ShellApplication.shells.get(id)
-        if shell is None:
-            raise CallError('Shell does not exist', errno.ENOENT)
-
-        shell.resize(cols, rows)
-
     @filterable
     def sessions(self, filters=None, options=None):
         """
@@ -1041,6 +1038,54 @@ class CoreService(Service):
             }
 
         return events
+
+    @accepts(Str('event'))
+    @pass_app()
+    async def subscribe(self, app, event):
+        """
+        Subscribe this connection to `event` and return the subscription id
+        to pass to `core.unsubscribe`.
+
+        For JSON-RPC clients, which have no protocol-level subscribe frame.
+        The legacy protocol's `sub` message does the same thing with an
+        identifier the client picks itself.
+        """
+        ident = str(uuid.uuid4())
+        await app.subscribe(ident, event)
+        return ident
+
+    @accepts(Str('id_'))
+    @pass_app()
+    async def unsubscribe(self, app, id_):
+        """
+        Remove the subscription `id_` returned by `core.subscribe`.
+        """
+        await app.unsubscribe(id_)
+
+    @accepts(Dict(
+        'options',
+        Bool('private_methods'),
+        Bool('py_exceptions'),
+        additional_attrs=True,
+    ))
+    @pass_app()
+    async def set_options(self, app, options):
+        """
+        Set options for this connection. They last as long as it does.
+
+        `py_exceptions` makes errors carry a pickled Python exception, the
+        same thing the legacy protocol's PY_EXCEPTIONS connect feature asks
+        for.
+
+        `private_methods` is accepted for compatibility with clients written
+        against the documented TrueNAS API and has no effect here: this
+        lineage does not hide private methods from the wire, it only leaves
+        them out of `core.get_methods`. Options this version does not know
+        are ignored rather than refused, so a client is never locked out by
+        one it happens to send.
+        """
+        if 'py_exceptions' in options:
+            app._py_exceptions = options['py_exceptions']
 
     @private
     async def call_hook(self, name, args, kwargs=None):

@@ -1,0 +1,61 @@
+{
+  "app": "jellyfin",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Jellyfin",
+  "comment": "Jellyfin's --datadir (data/, config/, plugins/, root/) carries as one tree; the transcoding cache is not carried, the image has its own /cache volume. The Daemonless image runs it with --datadir /config, the same layout as the official jellyfin/jellyfin image (JELLYFIN_DATA_DIR=/config, settings in /config/config). The LinuxServer images are deliberately NOT listed (the internal development record): they hardcode JELLYFIN_DATA_DIR=/config/data and JELLYFIN_CONFIG_DIR=/config, so carrying their /config as one tree lands the database at /config/data/data and the settings at /config -- the server starts empty and still answers on 8096. Unlisted, an lsio bundle has no recipe: native is unavailable and the compat tier is still offered. A second layout needs per-image source layouts (the internal development record); do not re-add them here.",
+  "target": {
+    "catalog_id": "daemonless:jellyfin",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8096
+  },
+  "sources": {
+    "jail": {
+      "pkg": "jellyfin",
+      "rc_script": "jellyfin",
+      "rc_data_var": "jellyfin_data_dir",
+      "detect": [
+        "usr/local/etc/rc.d/jellyfin"
+      ],
+      "data": "var/db/jellyfin",
+      "uid": 868
+    },
+    "linux": {
+      "images": [
+        "docker.io/jellyfin/jellyfin",
+        "jellyfin/jellyfin"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "docker.io/jellyfin/jellyfin",
+        "tag_template": "{version}",
+        "user": "user"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

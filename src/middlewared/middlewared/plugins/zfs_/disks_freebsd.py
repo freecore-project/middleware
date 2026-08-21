@@ -13,7 +13,7 @@ class ZFSPoolService(Service, PoolDiskServiceBase):
     def get_disks(self, name):
         try:
             with ZFS() as zfs:
-                disks = [i.replace('/dev/', '').replace('.eli', '') for i in zfs.get(name).disks]
+                disks = [i.replace('/dev/', '').removesuffix('.eli') for i in zfs.get(name).disks]
         except Exception:
             self.logger.error('Failed to retrieve disks for %r', name, exc_info=True)
             return []
@@ -29,6 +29,11 @@ class ZFSPoolService(Service, PoolDiskServiceBase):
                 # maybe the disk for this zpool doesn't have a label (freenas-boot/boot-pool)
                 # we still need to try and find the raw disk
                 found_disk = cache['dev_to_disk'].get(disk)
+            if not found_disk:
+                # the internal development record: a pool made on a whole disk (no partition table) names the disk itself;
+                # without this it was not reserved and disk.get_unused offered it.
+                dev = found_label or disk
+                found_disk = dev if dev in cache['whole_disks'] else None
 
             pool_disks.append(found_disk) if found_disk else None
 

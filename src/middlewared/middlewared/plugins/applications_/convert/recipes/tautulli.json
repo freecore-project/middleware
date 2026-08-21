@@ -1,0 +1,63 @@
+{
+  "app": "tautulli",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Tautulli",
+  "comment": "Tautulli keeps everything in one --datadir (tautulli.db, config.ini, backups/, cache/). The FreeBSD rc script hardcodes /var/db/tautulli (no rc.conf variable, hence no rc_data_var) and runs as the tautulli user (uid 892); the Daemonless image runs it with --datadir /config, the same contract as the LinuxServer and official images. The internal updater is disabled by the image (TAUTULLI_DOCKER).",
+  "target": {
+    "catalog_id": "daemonless:tautulli",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8181
+  },
+  "sources": {
+    "jail": {
+      "pkg": "tautulli",
+      "rc_script": "tautulli",
+      "detect": [
+        "usr/local/etc/rc.d/tautulli"
+      ],
+      "data": "var/db/tautulli",
+      "uid": 892
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/tautulli",
+        "ghcr.io/linuxserver/tautulli",
+        "docker.io/linuxserver/tautulli",
+        "ghcr.io/tautulli/tautulli",
+        "docker.io/tautulli/tautulli"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/tautulli",
+        "tag_template": "version-v{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cache (rebuilt from Plex)",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

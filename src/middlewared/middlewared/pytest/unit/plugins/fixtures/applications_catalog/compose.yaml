@@ -1,0 +1,45 @@
+name: demo
+
+x-daemonless:
+  title: Demo Service
+  icon: ":material-apps:"
+  category: Utilities
+  description: A deterministic catalog parser fixture.
+  upstream_url: https://github.com/example/demo
+  web_url: https://example.com/demo
+  freshports_url: https://www.freshports.org/www/demo/
+  docs:
+    env:
+      MODE: Runtime mode
+      API_TOKEN:
+        desc: API credential
+        default: ""
+    volumes:
+      /config: Configuration files
+      /media:
+        desc: Optional media
+        optional: true
+    ports:
+      8080: Web UI
+      8443: HTTPS Web UI
+  healthcheck:
+    port: 8080
+    path: /health
+
+services:
+  demo:
+    image: ghcr.io/daemonless/demo:latest
+    container_name: demo
+    restart: unless-stopped
+    environment:
+      - MODE=production
+      - API_TOKEN=
+    volumes:
+      - /provider/host/config:/config
+      - /provider/host/media:/media:ro
+    ports:
+      - "18080:8080"
+      - published: 18443
+        target: 8443
+    annotations:
+      org.freebsd.jail.allow.mlock: "true"

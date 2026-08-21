@@ -2,6 +2,7 @@ from .apidocs import app as apidocs_app
 from .client import ejson as json
 from .event import EventSource, Events
 from .job import Job, JobsQueue
+from .jsonrpc import is_jsonrpc_request, JSONRPCHandler
 from .pipe import Pipes, Pipe
 from .restful import RESTfulAPI
 from .schema import Error as SchemaError
@@ -25,13 +26,11 @@ from collections import defaultdict
 import argparse
 import asyncio
 import binascii
-from collections import namedtuple
 import concurrent.futures
 import concurrent.futures.process
 import concurrent.futures.thread
 import contextlib
 import errno
-import fcntl
 import functools
 import inspect
 import itertools
@@ -40,12 +39,9 @@ import os
 import pickle
 import re
 import queue
-import select
 import setproctitle
 import signal
-import struct
 import sys
-import termios
 import threading
 import time
 import traceback
@@ -75,6 +71,10 @@ class Application(object):
         self.session_id = str(uuid.uuid4())
         self.rest = False
         self.websocket = True
+        # Wire protocol of this connection: None is the legacy `msg`-based
+        # protocol every existing client speaks, a JSONRPCHandler is JSON-RPC
+        # 2.0 (freecore/freecore#23). It is the only switch between the two.
+        self.rpc = None
 
         # Allow at most 10 concurrent calls and only queue up until 20
         self._softhardsemaphore = SoftHardSemaphore(10, 20)
@@ -118,12 +118,15 @@ class Application(object):
         }
 
     def send_error(self, message, errno, reason=None, exc_info=None, etype=None, extra=None):
+        if self.rpc is not None:
+            return self.rpc.send_error(message, errno, reason, exc_info, etype, extra)
+
         error_extra = {}
         if self._py_exceptions and exc_info:
             error_extra['py_exception'] = binascii.b2a_base64(pickle.dumps(exc_info[1])).decode()
         self._send({
             'msg': 'result',
-            'id': message['id'],
+            'id': message.get('id'),
             'error': dict({
                 'error': errno,
                 'type': etype,
@@ -131,6 +134,16 @@ class Application(object):
                 'trace': self._tb_error(exc_info) if exc_info else None,
                 'extra': extra,
             }, **error_extra),
+        })
+
+    def _send_result(self, message, result):
+        if self.rpc is not None:
+            return self.rpc.send_result(message, result)
+
+        self._send({
+            'id': message['id'],
+            'msg': 'result',
+            'result': result,
         })
 
     async def call_method(self, message, serviceobj, methodobj):
@@ -145,11 +158,7 @@ class Application(object):
                 result = list(result)
             elif isinstance(result, types.AsyncGeneratorType):
                 result = [i async for i in result]
-            self._send({
-                'id': message['id'],
-                'msg': 'result',
-                'result': result,
-            })
+            self._send_result(message, result)
         except SoftHardSemaphoreLimit as e:
             self.send_error(
                 message,
@@ -194,7 +203,14 @@ class Application(object):
                 )
 
     async def subscribe(self, ident, name):
+        """
+        Register `ident` as a subscription to `name` on this connection.
 
+        Raises CallError if this connection already subscribes to `name`.
+        Acknowledgement is left to the caller because it is protocol
+        specific: the legacy protocol answers with a `ready`/`nosub` frame,
+        JSON-RPC answers with the result of the `core.subscribe` call.
+        """
         if ':' in name:
             shortname, arg = name.split(':', 1)
         else:
@@ -205,14 +221,7 @@ class Application(object):
             for v in self.__event_sources.values():
                 # Do not allow an event source to be subscribed again
                 if v['name'] == name:
-                    self._send({
-                        'msg': 'nosub',
-                        'id': ident,
-                        'error': {
-                            'error': 'Already subscribed',
-                        }
-                    })
-                    return
+                    raise CallError('Already subscribed')
             es = event_source(self.middleware, self, ident, name, arg)
             self.__event_sources[ident] = {
                 'event_source': es,
@@ -223,18 +232,25 @@ class Application(object):
         else:
             self.__subscribed[ident] = name
 
-        self._send({
-            'msg': 'ready',
-            'subs': [ident],
-        })
+    async def unsubscribe(self, ident, notify=False):
+        """
+        Drop the subscription registered as `ident`.
 
-    async def unsubscribe(self, ident):
+        `notify` marks the subscription as ended by us rather than by the
+        client, which JSON-RPC reports as a `notify_unsubscribed`
+        notification; the legacy protocol has no equivalent and ignores it.
+        """
+        name = None
         if ident in self.__subscribed:
-            self.__subscribed.pop(ident)
+            name = self.__subscribed.pop(ident)
         elif ident in self.__event_sources:
+            name = self.__event_sources[ident]['name']
             event_source = self.__event_sources[ident]['event_source']
             await self.middleware.run_in_thread(event_source.cancel)
             self.__event_sources.pop(ident)
+
+        if notify and name is not None and self.rpc is not None:
+            self.rpc.notify_unsubscribed(name)
 
     def send_event(self, name, event_type, **kwargs):
         if (
@@ -257,7 +273,11 @@ class Application(object):
                 event['cleared'] = kwargs.pop('cleared')
         if kwargs:
             event['extra'] = kwargs
-        self._send(event)
+
+        if self.rpc is not None:
+            self.rpc.send_event(event)
+        else:
+            self._send(event)
 
     def on_open(self):
         self.middleware.register_wsclient(self)
@@ -276,6 +296,17 @@ class Application(object):
 
         self.middleware.unregister_wsclient(self)
 
+    def use_jsonrpc(self):
+        """
+        Switch this connection to JSON-RPC 2.0.
+
+        JSON-RPC has no handshake frame, so the connection counts as having
+        completed one. Authentication is unchanged: it still happens through
+        the `auth.*` methods, and unauthenticated calls are still refused.
+        """
+        self.rpc = JSONRPCHandler(self)
+        self.handshake = True
+
     async def on_message(self, message):
         # Run callbacks registered in plugins for on_message
         for method in self.__callbacks['on_message']:
@@ -283,6 +314,26 @@ class Application(object):
                 method(self, message)
             except Exception:
                 self.logger.error('Failed to run on_message callback.', exc_info=True)
+
+        if self.rpc is None and not self.handshake and is_jsonrpc_request(message):
+            # A JSON-RPC client that connected here instead of /api/current.
+            # Nothing legacy has happened on this connection yet, so it is
+            # safe to answer in the protocol it is actually speaking.
+            self.use_jsonrpc()
+
+        if self.rpc is not None:
+            await self.rpc.on_message(message)
+            return
+
+        if not isinstance(message, dict):
+            self.send_error({}, errno.EINVAL, 'Message is malformed: an object was expected.')
+            return
+
+        if 'msg' not in message:
+            # Without this, a frame from an unexpected protocol raises
+            # KeyError here and takes the connection down with it.
+            self.send_error(message, errno.EINVAL, "Message is malformed: 'msg' is absent.")
+            return
 
         if message['msg'] == 'connect':
             if message.get('version') != '1':
@@ -342,7 +393,21 @@ class Application(object):
             return
 
         if message['msg'] == 'sub':
-            await self.subscribe(message['id'], message['name'])
+            try:
+                await self.subscribe(message['id'], message['name'])
+            except CallError as e:
+                self._send({
+                    'msg': 'nosub',
+                    'id': message['id'],
+                    'error': {
+                        'error': e.errmsg,
+                    }
+                })
+            else:
+                self._send({
+                    'msg': 'ready',
+                    'subs': [message['id']],
+                })
         elif message['msg'] == 'unsub':
             await self.unsubscribe(message['id'])
 
@@ -452,6 +517,8 @@ class FileApplication(object):
                 twofactor_auth = await self.middleware.call('auth.twofactor.config')
                 if twofactor_auth['enabled']:
                     return web.Response(status=401, body='HTTP Basic Auth is unavailable when OTP is enabled')
+                if (await self.middleware.call('auth.webauthn.config'))['enabled']:
+                    return web.Response(status=401, body='HTTP Basic Auth is unavailable when WebAuthn is enabled')
 
                 try:
                     auth = binascii.a2b_base64(auth[6:]).decode()
@@ -550,236 +617,6 @@ class FileApplication(object):
             body=json.dumps({'job_id': job.id}).encode(),
         )
         return resp
-
-
-ShellResize = namedtuple("ShellResize", ["cols", "rows"])
-
-
-class ShellWorkerThread(threading.Thread):
-    """
-    Worker thread responsible for forking and running the shell
-    and spawning the reader and writer threads.
-    """
-
-    def __init__(self, ws, input_queue, loop, options):
-        self.ws = ws
-        self.input_queue = input_queue
-        self.loop = loop
-        self.shell_pid = None
-        self.command = self.get_command(options)
-        self._die = False
-        super(ShellWorkerThread, self).__init__(daemon=True)
-
-    def get_command(self, options):
-        allowed_options = ('jail', 'vm_id')
-        if all(options.get(k) for k in allowed_options):
-            raise CallError(f'Only one option is supported from {", ".join(allowed_options)}')
-
-        if options.get('jail'):
-            return ['/usr/local/bin/iocage', 'console', '-f', options['jail']]
-        elif options.get('vm_id'):
-            return ['/usr/bin/cu', '-l', f'nmdm{options["vm_id"]}B']
-        else:
-            return ['/usr/bin/login', '-p', '-f', 'root']
-
-    def resize(self, cols, rows):
-        self.input_queue.put(ShellResize(cols, rows))
-
-    def run(self):
-
-        self.shell_pid, master_fd = os.forkpty()
-        if self.shell_pid == 0:
-            osc.close_fds(3)
-
-            os.chdir('/root')
-            os.execve(self.command[0], self.command, {
-                'TERM': 'xterm',
-                'HOME': '/root',
-                'LANG': 'en_US.UTF-8',
-                'PATH': '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:/root/bin',
-            })
-
-        # Terminal baudrate affects input queue size
-        attr = termios.tcgetattr(master_fd)
-        attr[4] = attr[5] = termios.B921600
-        termios.tcsetattr(master_fd, termios.TCSANOW, attr)
-
-        def reader():
-            """
-            Reader thread for reading from pty file descriptor
-            and forwarding it to the websocket.
-            """
-            while True:
-                read = os.read(master_fd, 1024)
-                if read == b'':
-                    break
-                asyncio.run_coroutine_threadsafe(
-                    self.ws.send_str(read.decode('utf8')), loop=self.loop
-                ).result()
-
-        def writer():
-            """
-            Writer thread for reading from input_queue and write to
-            the shell pty file descriptor.
-            """
-            while True:
-                try:
-                    get = self.input_queue.get(timeout=1)
-                    if isinstance(get, ShellResize):
-                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", get.rows, get.cols, 0, 0))
-                    else:
-                        os.write(master_fd, get)
-                except queue.Empty:
-                    # If we timeout waiting in input query lets make sure
-                    # the shell process is still alive
-                    try:
-                        os.kill(self.shell_pid, 0)
-                    except ProcessLookupError:
-                        break
-
-        t_reader = threading.Thread(target=reader, daemon=True)
-        t_reader.start()
-
-        t_writer = threading.Thread(target=writer, daemon=True)
-        t_writer.start()
-
-        # Wait for shell to exit
-        while True:
-            try:
-                pid, rv = os.waitpid(self.shell_pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if self._die:
-                return
-            if pid <= 0:
-                time.sleep(1)
-
-        t_reader.join()
-        t_writer.join()
-        asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
-
-    def die(self):
-        self._die = True
-
-
-class ShellConnectionData(object):
-    id = None
-    t_worker = None
-
-
-class ShellApplication(object):
-    shells = {}
-
-    def __init__(self, middleware):
-        self.middleware = middleware
-
-    async def ws_handler(self, request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        conndata = ShellConnectionData()
-        conndata.id = str(uuid.uuid4())
-
-        try:
-            await self.run(ws, request, conndata)
-        except Exception:
-            if conndata.t_worker:
-                await self.worker_kill(conndata.t_worker)
-        finally:
-            self.shells.pop(conndata.id, None)
-            return ws
-
-    async def run(self, ws, request, conndata):
-
-        # Each connection will have its own input queue
-        input_queue = queue.Queue()
-        authenticated = False
-
-        async for msg in ws:
-            if authenticated:
-                # Add content of every message received in input queue
-                try:
-                    input_queue.put(msg.data.encode())
-                except UnicodeEncodeError:
-                    # Should we handle Encode error?
-                    # xterm.js seems to operate with the websocket in text mode,
-                    pass
-            else:
-                try:
-                    data = json.loads(msg.data)
-                except json.decoder.JSONDecodeError:
-                    continue
-
-                token = data.get('token')
-                if not token:
-                    continue
-
-                token = await self.middleware.call('auth.get_token', token)
-                if not token:
-                    await ws.send_json({
-                        'msg': 'failed',
-                        'error': {
-                            'error': errno.EACCES,
-                            'reason': 'Invalid token',
-                        }
-                    })
-                    continue
-
-                authenticated = True
-                await ws.send_json({
-                    'msg': 'connected',
-                    'id': conndata.id,
-                })
-
-                options = data.get('options', {})
-                options['jail'] = data.get('jail') or options.get('jail')
-                conndata.t_worker = ShellWorkerThread(
-                    ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(), options=options
-                )
-                conndata.t_worker.start()
-
-                self.shells[conndata.id] = conndata.t_worker
-
-        # If connection was not authenticated, return earlier
-        if not authenticated:
-            return ws
-
-        if conndata.t_worker:
-            self.middleware.create_task(self.worker_kill(conndata.t_worker))
-
-        return ws
-
-    async def worker_kill(self, t_worker):
-        # If connection has been closed lets make sure shell is killed
-        if t_worker.shell_pid:
-
-            try:
-                kqueue = select.kqueue()
-                kevent = select.kevent(
-                    t_worker.shell_pid,
-                    select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ENABLE, select.KQ_NOTE_EXIT
-                )
-                kqueue.control([kevent], 0)
-
-                os.kill(t_worker.shell_pid, signal.SIGTERM)
-
-                # If process has not died in 2 seconds, try the big gun
-                events = await self.middleware.run_in_thread(kqueue.control, None, 1, 2)
-                if not events:
-                    os.kill(t_worker.shell_pid, signal.SIGKILL)
-
-                    # If process has not died even with the big gun
-                    # There is nothing else we can do, leave it be and
-                    # release the worker thread
-                    events = await self.middleware.run_in_thread(kqueue.control, None, 1, 2)
-                    if not events:
-                        t_worker.die()
-            except ProcessLookupError:
-                pass
-
-        # Wait thread join in yet another thread to avoid event loop blockage
-        # There may be a simpler/better way to do this?
-        await self.middleware.run_in_thread(t_worker.join)
 
 
 class PreparedCall:
@@ -1460,11 +1297,17 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
             time.sleep(interval)
 
-    async def ws_handler(self, request):
+    async def api_handler(self, request):
+        """JSON-RPC 2.0 endpoint (`/api/current`); see middlewared/jsonrpc.py."""
+        return await self.ws_handler(request, jsonrpc=True)
+
+    async def ws_handler(self, request, jsonrpc=False):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
         connection = Application(self, self.loop, request, ws)
+        if jsonrpc:
+            connection.use_jsonrpc()
         connection.on_open()
 
         try:
@@ -1490,6 +1333,11 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                 try:
                     message = json.loads(msg.data)
                 except ValueError as f:
+                    if connection.rpc is not None:
+                        # JSON-RPC has a code for this, so say so and stay up.
+                        connection.rpc.send_parse_error(str(f))
+                        continue
+
                     await ws.close(
                         code=WSCloseCode.INVALID_TEXT,
                         message=f'{f}'.encode('utf-8'),
@@ -1596,6 +1444,9 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         self.loop.add_signal_handler(signal.SIGUSR2, self.log_threads_stacks)
 
         app.router.add_route('GET', '/websocket', self.ws_handler)
+        # JSON-RPC 2.0 over WebSocket, the protocol clients written against
+        # the modern documented TrueNAS API speak (freecore/freecore#23).
+        app.router.add_route('GET', '/api/current', self.api_handler)
 
         app.router.add_route('*', '/api/docs{path_info:.*}', WSGIHandler(apidocs_app))
         app.router.add_route('*', '/ui{path_info:.*}', WebUIAuth(self))
@@ -1604,8 +1455,12 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         app.router.add_route('*', '/_download{path_info:.*}', self.fileapp.download)
         app.router.add_route('*', '/_upload{path_info:.*}', self.fileapp.upload)
 
-        shellapp = ShellApplication(self)
-        app.router.add_route('*', '/_shell{path_info:.*}', shellapp.ws_handler)
+        # The terminal endpoint. Replaced the legacy /_shell (ShellApplication
+        # + ShellWorkerThread, deleted here) once all four of its consumers ran
+        # on this one. See the internal development record.
+        from .plugins.webterminal import ShellApplication2
+        shellapp2 = ShellApplication2(self)
+        app.router.add_route('*', '/_webterminal{path_info:.*}', shellapp2.ws_handler)
 
         restful_api = RESTfulAPI(self, app)
         await restful_api.register_resources()
@@ -1710,7 +1565,7 @@ def main():
     args = parser.parse_args()
 
     pidpath = '/var/run/middlewared.pid'
-    startup_seq_path = '/tmp/middlewared_startup.seq'
+    startup_seq_path = '/var/run/middlewared_startup.seq'
 
     if args.restart:
         if os.path.exists(pidpath):

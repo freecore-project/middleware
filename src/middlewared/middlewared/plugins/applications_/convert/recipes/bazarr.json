@@ -1,0 +1,63 @@
+{
+  "app": "bazarr",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Bazarr",
+  "comment": "Bazarr's --config directory (config.yaml, db, cache, log) carries as one tree; the Daemonless image runs it with --config /config.",
+  "target": {
+    "catalog_id": "daemonless:bazarr",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 6767
+  },
+  "sources": {
+    "jail": {
+      "pkg": "bazarr",
+      "rc_script": "bazarr",
+      "rc_data_var": "bazarr_datadir",
+      "detect": [
+        "usr/local/etc/rc.d/bazarr"
+      ],
+      "data": "usr/local/bazarr",
+      "uid": 357
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/bazarr",
+        "ghcr.io/linuxserver/bazarr",
+        "docker.io/linuxserver/bazarr",
+        "ghcr.io/hotio/bazarr"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/bazarr",
+        "tag_template": "version-v{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

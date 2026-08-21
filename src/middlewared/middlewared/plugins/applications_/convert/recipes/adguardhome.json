@@ -1,0 +1,76 @@
+{
+  "app": "adguardhome",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "AdGuard Home",
+  "comment": "AdGuard Home splits its state into conf/ (AdGuardHome.yaml: upstreams, filters, users, the finished first-run state) and work/ (filter caches, statistics, query log, sessions), and the Daemonless image mounts them as two volumes mirroring the official /opt/adguardhome layout. There is no FreeBSD port, so only a Linux source applies. conf/ is the application and is required; work/ is optional (statistics and the query log reset when absent). Carrying conf/ skips the first-run wizard. DNS/DoT/DoH/DHCP port mappings are install configuration, not state. First multi-volume recipe (the internal development record).",
+  "target": {
+    "catalog_id": "daemonless:adguardhome",
+    "volume": "opt-adguardhome-conf",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 3000,
+    "volumes": {
+      "opt-adguardhome-work": {
+        "uid": 1000,
+        "gid": 1000
+      }
+    }
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "docker.io/adguard/adguardhome",
+        "adguard/adguardhome"
+      ],
+      "data": "/opt/adguardhome/conf",
+      "uid": 0,
+      "paths": {
+        "work": "/opt/adguardhome/work"
+      },
+      "export": {
+        "image": "docker.io/adguard/adguardhome",
+        "tag_template": "v{version}",
+        "user": "image",
+        "image_uid": 0,
+        "volumes": [
+          {
+            "from": "",
+            "target": "/opt/adguardhome/work"
+          },
+          {
+            "from": "AdGuardHome.yaml",
+            "target": "/opt/adguardhome/conf/AdGuardHome.yaml"
+          }
+        ]
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    },
+    {
+      "from": "{work}",
+      "to": "",
+      "volume": "opt-adguardhome-work",
+      "optional": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

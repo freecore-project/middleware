@@ -1,0 +1,65 @@
+{
+  "app": "redis",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Redis",
+  "comment": "Redis's state is what lives in its `dir` -- dump.rdb and the appendonly files; the FreeBSD package points it at /var/db/redis (uid 535) and the official Linux image at /data. The Daemonless image runs redis-server with its own /config/redis.conf whose dir is /config/data, so the data directory carries there. The jail's redis.conf is deliberately NOT carried: its dir, bind and unixsocket settings name jail paths that are wrong inside the container -- the image configuration is authoritative and tuning is re-applied by hand. rc_data_var is deliberately absent: the only rc.conf variable (redis_config) names the CONFIG file, not the data directory.",
+  "target": {
+    "catalog_id": "daemonless:redis",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 6379
+  },
+  "sources": {
+    "jail": {
+      "pkg": "redis",
+      "rc_script": "redis",
+      "detect": [
+        "usr/local/etc/rc.d/redis"
+      ],
+      "data": "var/db/redis",
+      "uid": 535
+    },
+    "linux": {
+      "images": [
+        "docker.io/library/redis",
+        "redis",
+        "docker.io/valkey/valkey"
+      ],
+      "data": "/data",
+      "uid": 999,
+      "export": {
+        "image": "docker.io/library/redis",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 999,
+        "drop": [
+          "redis.conf: the image runs with its own defaults"
+        ]
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "data",
+      "required": true
+    }
+  ],
+  "drop": [
+    "redis.conf (the image configuration is authoritative; jail dir/bind/socket paths do not apply)",
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}
