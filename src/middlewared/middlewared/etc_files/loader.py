@@ -1,7 +1,8 @@
 import logging
-import subprocess
-import sysctl
 import os
+import subprocess
+
+import sysctl
 from packaging import version
 
 from middlewared.utils.io import write_if_changed
@@ -48,7 +49,7 @@ def generate_loader_config(middleware):
 
 
 def generate_truenas_logo(middleware):
-    return [f'loader_logo="TrueNAS{middleware.call_sync("system.product_type").capitalize()}"']
+    return [f'loader_logo="{middleware.call_sync("system.product_name")}"']
 
 
 def list_efi_consoles():

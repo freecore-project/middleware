@@ -10,7 +10,7 @@ class VolumeVersionAlertClass(AlertClass):
     title = "New Feature Flags Are Available for Pool"
     text = (
         "New ZFS version or feature flags are available for pool(s) %s. Upgrading pools is a one-time process that can "
-        "prevent rolling the system back to an earlier TrueNAS version. It is recommended to read the TrueNAS release "
+        "prevent rolling the system back to an earlier FreeCORE version. It is recommended to read the FreeCORE release "
         "notes and confirm you need the new ZFS feature flags before upgrading a pool."
     )
 

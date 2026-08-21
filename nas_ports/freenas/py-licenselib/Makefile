@@ -14,11 +14,15 @@ USES=		python
 USE_PYTHON=	autoplist distutils
 
 EXTRACT_ONLY=
-WRKSRC?=/usr/nas_source/py-licenselib
+NAS_SRC?=	/usr/nas_source/py-licenselib
+WRKSRC=		${WRKDIR}/py-licenselib
 
 # no checksum, we just used git!
 checksum fetch:
 	echo ${.TARGET} not needed because building direct
 
+post-extract:
+	@${MKDIR} ${WRKSRC}
+	@${CP} -R ${NAS_SRC}/. ${WRKSRC}/
 
 .include <bsd.port.mk>

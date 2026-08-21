@@ -132,8 +132,8 @@ def test_05_check_user_exists(request):
         pw = results.json()
         assert pw['pw_uid'] == next_uid, results.text
         assert pw['pw_shell'] == '/bin/csh', results.text
-        assert pw['pw_gecos'] == 'Test User', results.txt
-        assert pw['pw_dir'] == '/nonexistent', results.txt
+        assert pw['pw_gecos'] == 'Test User', results.text
+        assert pw['pw_dir'] == '/nonexistent', results.text
 
 
 def test_06_get_user_info(request):
@@ -164,14 +164,14 @@ def test_10_look_user_shell(request):
 
 def test_11_add_employee_id_and_team_special_attributes(request):
     depends(request, ["user_02", "user_01"])
-    payload = {
-        'key': 'Employee ID',
-        'value': 'TU1234',
-        'key': 'Team',
-        'value': 'QA'
-    }
-    results = POST(f"/user/id/{user_id}/set_attribute/", payload)
-    assert results.status_code == 200, results.text
+    # These were one dict with duplicate keys, so only Team/QA survived and the
+    # Employee ID attribute this test claims to set was never sent.
+    for payload in (
+        {'key': 'Employee ID', 'value': 'TU1234'},
+        {'key': 'Team', 'value': 'QA'},
+    ):
+        results = POST(f"/user/id/{user_id}/set_attribute/", payload)
+        assert results.status_code == 200, results.text
 
 
 def test_12_get_new_next_uid(request):

@@ -2,7 +2,7 @@ from setuptools import setup
 
 
 install_requires = [
-    'ws4py',
+    'websocket-client',
 ]
 
 setup(
@@ -15,13 +15,11 @@ setup(
     include_package_data=True,
     license='BSD',
     platforms='any',
-    namespace_packages=[str('middlewared')],
     classifiers=[
         'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: BSD License',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
     ],
     install_requires=install_requires,

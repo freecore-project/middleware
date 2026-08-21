@@ -16,9 +16,14 @@ from base64 import b64decode
 from pytest_dependency import depends
 
 try:
-    from config import AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer
+    from config import (
+        AD_CREATECOMPUTER, AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer,
+    )
 except ImportError:
-    Reason = 'ADNameServer AD_DOMAIN, ADPASSWORD, or/and ADUSERNAME are missing in config.py"'
+    Reason = (
+        'ADNameServer, AD_DOMAIN, ADPASSWORD, ADUSERNAME, '
+        'or/and AD_CREATECOMPUTER are missing in config.py'
+    )
     pytestmark = pytest.mark.skip(reason=Reason)
 else:
     from auto_config import dev_test
@@ -74,6 +79,7 @@ def test_03_enabling_activedirectory(request):
         "bindname": ADUSERNAME,
         "domainname": AD_DOMAIN,
         "netbiosname": hostname,
+        "createcomputer": AD_CREATECOMPUTER,
         "dns_timeout": 15,
         "verbose_logging": True,
         "enable": True
@@ -115,10 +121,18 @@ def test_07_get_idmap_backend_options(request):
     """
     depends(request, ["AD_IS_HEALTHY"])
     global BACKEND_OPTIONS
+    global ORIGINAL_IDMAP
     global WORKGROUP
     results = GET("/idmap/backend_options")
     assert results.status_code == 200, results.text
     BACKEND_OPTIONS = results.json()
+
+    results = GET("/idmap/id/1/")
+    assert results.status_code == 200, results.text
+    ORIGINAL_IDMAP = {
+        key: results.json()[key]
+        for key in ("range_low", "range_high", "idmap_backend", "options")
+    }
 
     results = GET("/smb")
     assert results.status_code == 200, results.text
@@ -427,14 +441,20 @@ def test_18_verify_activedirectory_leave_do_not_leak_password_in_middleware_log(
     assert results['result'] is False, str(results['output'])
 
 
-def test_19_remove_site(request):
+def test_19_restore_default_idmap(request):
+    depends(request, ["GATHERED_BACKEND_OPTIONS"])
+    results = PUT("/idmap/id/1/", ORIGINAL_IDMAP)
+    assert results.status_code == 200, results.text
+
+
+def test_20_remove_site(request):
     depends(request, ["JOINED_AD"])
     payload = {"site": None}
     results = PUT("/activedirectory/", payload)
     assert results.status_code == 200, results.text
 
 
-def test_20_reset_dns(request):
+def test_21_reset_dns(request):
     depends(request, ["SET_DNS"])
     global payload
     payload = {

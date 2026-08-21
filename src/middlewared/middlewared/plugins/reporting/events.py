@@ -10,6 +10,30 @@ from middlewared.event import EventSource
 from middlewared.plugins.reporting.iostat import DiskStats
 
 
+def _sysctl_val(mib):
+    """Read a single-value sysctl, returning int/str or None."""
+    result = sysctl.filter(mib)
+    return result[0].value if result else None
+
+
+def _sysctl_list(mib):
+    """Read a multi-value sysctl as a list of ints."""
+    result = sysctl.filter(mib)
+    return result[0].value if result else None
+
+
+def _normalize_temperature(v):
+    if isinstance(v, str):
+        v = v.strip()
+        if not v.endswith('C'):
+            return None
+        try:
+            return round((float(v[:-1]) + 273.15) * 10)
+        except ValueError:
+            return None
+    return v
+
+
 MEGABIT = 131072
 RE_BASE = re.compile(r'([0-9]+)base')
 RE_MBS = re.compile(r'([0-9]+)Mb/s')
@@ -43,16 +67,25 @@ class RealtimeEventSource(EventSource):
             data['usage'] = 0
         return data
 
+    @staticmethod
+    def _unpack_vm_counter(v):
+        """Unpack a vm.stats sysctl value, handling both 4-byte (u_int) and
+        8-byte (u_long) counter sizes as seen on FB15 64-bit systems."""
+        if isinstance(v, int):
+            return v
+        if len(v) == 8:
+            return struct.unpack("Q", v)[0]
+        return struct.unpack("I", v)[0]
+
     def get_memory_info(self, arc_size):
-        page_size = int(sysctl.filter("hw.pagesize")[0].value)
-        classes = {
-            k: v if isinstance(v, int) else struct.unpack("I", v)[0] * page_size
-            for k, v in [
-                (k, sysctl.filter(f"vm.stats.vm.v_{k}_count")[0].value)
-                for k in ["laundry", "inactive", "active", "wire", "free"]
-            ]
-        }
-        classes["os_reserved"] = int(sysctl.filter("hw.physmem")[0].value) - sum(classes.values())
+        page_size = _sysctl_val("hw.pagesize") or 4096
+        page_size = int(page_size)
+        classes = {}
+        for k in ["laundry", "inactive", "active", "wire", "free"]:
+            v = _sysctl_val(f"vm.stats.vm.v_{k}_count")
+            classes[k] = self._unpack_vm_counter(v) * page_size if v is not None else 0
+        physmem = _sysctl_val("hw.physmem")
+        classes["os_reserved"] = int(physmem) - sum(classes.values()) if physmem is not None else 0
 
         classes["wire"] -= arc_size
         classes["arc"] = arc_size
@@ -119,10 +152,10 @@ class RealtimeEventSource(EventSource):
             hits = 0
             misses = 0
             data['zfs'] = {}
-            hits = sysctl.filter('kstat.zfs.misc.arcstats.hits')[0].value
-            misses = sysctl.filter('kstat.zfs.misc.arcstats.misses')[0].value
-            data['zfs']['arc_max_size'] = sysctl.filter('kstat.zfs.misc.arcstats.c_max')[0].value
-            data['zfs']['arc_size'] = sysctl.filter('kstat.zfs.misc.arcstats.size')[0].value
+            hits = _sysctl_val('kstat.zfs.misc.arcstats.hits') or 0
+            misses = _sysctl_val('kstat.zfs.misc.arcstats.misses') or 0
+            data['zfs']['arc_max_size'] = _sysctl_val('kstat.zfs.misc.arcstats.c_max') or 0
+            data['zfs']['arc_size'] = _sysctl_val('kstat.zfs.misc.arcstats.size') or 0
             total = hits + misses
             if total > 0:
                 data['zfs']['cache_hit_ratio'] = hits / total
@@ -136,8 +169,8 @@ class RealtimeEventSource(EventSource):
             # Get CPU usage %
             data['cpu'] = {}
             num_times = 5
-            cp_times = sysctl.filter('kern.cp_times')[0].value  # cp_times has values for all cores
-            cp_time = sysctl.filter('kern.cp_time')[0].value  # cp_time is the sum of all cores
+            cp_times = _sysctl_list('kern.cp_times')  # cp_times has values for all cores
+            cp_time = _sysctl_list('kern.cp_time')  # cp_time is the sum of all cores
             if cp_time and cp_times and cp_times_last:
                 # Get the difference of times between the last check and the current one
                 # cp_time has a list with user, nice, system, interrupt and idle
@@ -155,10 +188,10 @@ class RealtimeEventSource(EventSource):
             # CPU temperature
             data['cpu']['temperature'] = {}
             for i in itertools.count():
-                v = sysctl.filter(f'dev.cpu.{i}.temperature')
-                if not v:
+                v = _normalize_temperature(_sysctl_val(f'dev.cpu.{i}.temperature'))
+                if v is None:
                     break
-                data['cpu']['temperature'][i] = v[0].value
+                data['cpu']['temperature'][i] = v
             data['cpu']['temperature_celsius'] = {k: (v - 2732) / 10 for k, v in data['cpu']['temperature'].items()}
 
             # Interface related statistics
