@@ -43,7 +43,7 @@ class SMARTDService(SimpleService):
             return
 
         for process in psutil.process_iter(attrs=["cmdline", "create_time"]):
-            if process.info["cmdline"][:1] == ["/usr/local/sbin/smartd"]:
+            if process.info["cmdline"][:1] and os.path.basename(process.info["cmdline"][0]) == "smartd":
                 break
         else:
             # No smartd process present

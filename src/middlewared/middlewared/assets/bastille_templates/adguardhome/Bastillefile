@@ -1,0 +1,2 @@
+# FreeCORE adaptation; see FREECORE-NOTES.md and Bastillefile.upstream.
+CMD /bin/sh -e /tmp/adguardhome-install.sh

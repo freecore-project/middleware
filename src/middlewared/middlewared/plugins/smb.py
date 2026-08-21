@@ -18,6 +18,11 @@ try:
 except ImportError:
     param = None
 
+try:
+    from samba.param import LoadParm
+except ImportError:
+    LoadParm = None
+
 
 LOGLEVEL_MAP = {
     '0': 'NONE',
@@ -26,7 +31,7 @@ LOGLEVEL_MAP = {
     '3': 'FULL',
     '10': 'DEBUG',
 }
-RE_NETBIOSNAME = re.compile(r"^[a-zA-Z0-9\.\-_!@#\$%^&\(\)'\{\}~]{1,15}$")
+RE_NETBIOSNAME = re.compile(r"^[a-zA-Z0-9\.\-_!@#\$%^&\(\)'\{\}~]{1,15}\Z")
 
 LP_CTX = param.get_context()
 
@@ -80,9 +85,8 @@ class SMBPath(enum.Enum):
     LEGACYSTATE = ('/root/samba', 0o755, True)
     LEGACYPRIVATE = ('/root/samba/private', 0o700, True)
     MSG_SOCK = ('/var/db/system/samba4/private/msg.sock', 0o700, False)
-    RUNDIR = ('/var/run/samba4', True)
+    RUNDIR = ('/var/run/samba4', 0o755, True)
     CACHEDIR = ('/var/run/samba-cache', 0o755, True)
-    PASSDB_DIR = ('/var/run/samba-cache/private', 0o700, True)
     LOCKDIR = ('/var/run/samba4', 0o755, True)
     LOGDIR = ('/var/log/samba4', 0o755, True)
     IPCSHARE = ('/var/tmp', 0o1777, True)
@@ -171,6 +175,21 @@ class SMBSharePreset(enum.Enum):
             'worm:grace_period = 300',
         ])
     }}
+
+
+def preserved_creation_params(data, schema_attrs, preset_params):
+    """
+    Values the caller explicitly diverged from the schema defaults must survive
+    preset application (the internal development record) — apply_presets otherwise
+    silently discards them. A value equal to its schema default is
+    indistinguishable from an omitted one, so the preset keeps authority there.
+    `auxsmbconf` is excluded because apply_presets already merges it with
+    caller precedence.
+    """
+    return {
+        k: data[k] for k in preset_params
+        if k != 'auxsmbconf' and k in schema_attrs and k in data and data[k] != schema_attrs[k].default
+    }
 
 
 class SMBModel(sa.Model):
@@ -338,7 +357,7 @@ class SMBService(SystemServiceService):
         if not ldap['ldap_enable']:
             return True
 
-        set_pass = await run(['usr/local/bin/smbpasswd', '-w', ldap['ldap_bindpw']], check=False)
+        set_pass = await run([SMBCmd.SMBPASSWD.value, '-w', ldap['ldap_bindpw']], check=False)
         if set_pass.returncode != 0:
             self.logger.debug(f"Failed to set set ldap bindpw in secrets.tdb: {set_pass.stdout.decode()}")
             return False
@@ -354,12 +373,10 @@ class SMBService(SystemServiceService):
         """
         try:
             if section.upper() == 'GLOBAL':
-                try:
-                    LP_CTX.load(SMBPath.GLOBALCONF.platform())
-                except Exception as e:
-                    self.logger.warning("Failed to reload smb.conf: %s", e)
-
-                return LP_CTX.get(parm)
+                # A fresh context per call. LP_CTX.load() never resets samba's globals to
+                # their defaults, so a parameter dropped from smb4.conf (realm after leaving
+                # AD) would keep its old value until middlewared restarts.
+                return LoadParm(SMBPath.GLOBALCONF.platform()).get(parm)
             else:
                 return self.middleware.call_sync('sharing.smb.reg_getparm', section, parm)
 
@@ -515,7 +532,7 @@ class SMBService(SystemServiceService):
                                        new['smb_options'],
                                        'smb_update.smb_options')
         except ValidationErrors as errs:
-            verrors.add_child('smb_update.smb_options', errs)
+            verrors.extend(errs)
 
         if new.get('unixcharset') and new['unixcharset'] not in await self.unixcharset_choices():
             verrors.add(
@@ -696,7 +713,8 @@ class SMBService(SystemServiceService):
             new_sid = await self.middleware.call("smb.get_system_sid")
             await self.middleware.call("smb.set_database_sid", new_sid)
             new_config["cifs_SID"] = new_sid
-            await self.middleware.call("smb.synchronize_group_mappings")
+            gm_job = await self.middleware.call("smb.synchronize_group_mappings")
+            await gm_job.wait(raise_error=True)
 
         return new_config
 
@@ -833,7 +851,12 @@ class SharingSMBService(SharingService):
             except OSError as e:
                 raise CallError(f'Failed to create {path}: {e}')
 
+        preserved = preserved_creation_params(
+            data, self.do_create.accepts[0].attrs,
+            SMBSharePreset[data['purpose']].value['params'],
+        )
         await self.apply_presets(data)
+        data.update(preserved)
         await self.compress(data)
         vuid = await self.generate_vuid(data['timemachine'])
         data.update({'vuid': vuid})
@@ -842,8 +865,9 @@ class SharingSMBService(SharingService):
             {'prefix': self._config.datastore_prefix})
 
         await self.strip_comments(data)
-        await self.middleware.call('sharing.smb.reg_addshare', data)
+        # A Time Machine share turns the AAPL extensions on, and its registry entry is rendered from that setting
         enable_aapl = await self.check_aapl(data)
+        await self.middleware.call('sharing.smb.reg_addshare', data)
 
         if enable_aapl:
             await self._service_change('cifs', 'restart')
@@ -870,11 +894,7 @@ class SharingSMBService(SharingService):
         verrors = ValidationErrors()
         path = data.get('path')
 
-        old = await self.middleware.call(
-            'datastore.query', self._config.datastore, [('id', '=', id)],
-            {'extend': self._config.datastore_extend,
-             'prefix': self._config.datastore_prefix,
-             'get': True})
+        old = await self.get_instance(id)
 
         new = old.copy()
         new.update(data)
@@ -1066,32 +1086,35 @@ class SharingSMBService(SharingService):
                 continue
 
             kv = entry.split('=', 1)
-            if len(kv) != 2:
+            if len(kv) != 2 or not kv[0].strip():
                 verrors.add(
-                    f'{schema_name}.auxsmbconf',
+                    schema_name,
                     f'Auxiliary parameters must be in the format of "key = value": {entry}'
                 )
                 continue
 
-            if kv[0].strip() in aux_blacklist:
+            key = kv[0].strip()
+            if key in aux_blacklist:
                 verrors.add(
-                    f'{schema_name}.auxsmbconf',
-                    f'{kv[0]} is a blacklisted auxiliary parameter. Changes to this parameter '
+                    schema_name,
+                    f'{key} is a blacklisted auxiliary parameter. Changes to this parameter '
                     'are not permitted.'
                 )
 
-            if schema_name == 'smb_update.smb_options' and ':' not in kv[0]:
+            if schema_name == 'smb_update.smb_options' and ':' not in key:
                 """
                 lib/param doesn't validate params containing a colon.
                 this dump_a_parameter() wraps around the respective lp_ctx
                 function in samba that checks the known parameter table.
                 This should be a lightweight validation of GLOBAL params.
+                It prints the value of a known parameter, to stdout unless
+                given a file, so the value goes to /dev/null.
                 """
                 try:
-                    LP_CTX.dump_a_parameter(kv[0].strip())
+                    LP_CTX.dump_a_parameter(key, 'global', os.devnull)
                 except RuntimeError as e:
                     verrors.add(
-                        f'{schema_name}.auxsmbconf',
+                        schema_name,
                         str(e)
                     )
 
@@ -1126,14 +1149,20 @@ class SharingSMBService(SharingService):
                 await self.validate_aux_params(data['auxsmbconf'],
                                                f'{schema_name}.auxsmbconf')
             except ValidationErrors as errs:
-                verrors.add_child(f'{schema_name}.auxsmbconf', errs)
+                verrors.extend(errs)
 
-        if not data['acl'] and not await self.middleware.call('filesystem.acl_is_trivial', data['path']):
-            verrors.add(
-                f'{schema_name}.acl',
-                f'ACL detected on {data["path"]}. ACLs must be stripped prior to creation '
-                'of SMB share.'
-            )
+        if not data['acl']:
+            if not os.path.exists(data['path']):
+                verrors.add(
+                    f'{schema_name}.path',
+                    'Path must exist so that its ACL can be checked when "acl" is disabled.'
+                )
+            elif not await self.middleware.call('filesystem.acl_is_trivial', data['path']):
+                verrors.add(
+                    f'{schema_name}.acl',
+                    f'ACL detected on {data["path"]}. ACLs must be stripped prior to creation '
+                    'of SMB share.'
+                )
 
         if data.get('name') and data['name'].lower() in ['global', 'homes', 'printers']:
             verrors.add(
@@ -1151,14 +1180,11 @@ class SharingSMBService(SharingService):
 
         if home:
             if old and old['id'] is not None:
-                id = old['id']
+                home_filters.append(('id', '!=', old['id']))
 
-                if not old['home']:
-                    home_filters.append(('id', '!=', id))
-                    # The user already had this set as the home share
-                    home_result = await self.middleware.call(
-                        'datastore.query', self._config.datastore,
-                        home_filters, {'prefix': self._config.datastore_prefix})
+            home_result = await self.middleware.call(
+                'datastore.query', self._config.datastore,
+                home_filters, {'prefix': self._config.datastore_prefix})
 
         return home_result
 
@@ -1186,7 +1212,7 @@ class SharingSMBService(SharingService):
 
     @private
     async def name_exists(self, data, schema_name, verrors, id=None):
-        name = data['name']
+        name = data.get('name', '')
         path = data['path']
 
         if path and not name:
@@ -1277,7 +1303,7 @@ class SharingSMBService(SharingService):
         the registry as-needed.
         """
         if not os.path.exists(SMBPath.GLOBALCONF.platform()):
-            self.logger.warning("smb.conf does not exist. Skipping registry synchronization."
+            self.logger.warning("smb.conf does not exist. Skipping registry synchronization. "
                                 "This may indicate that SMB service has not completed initialization.")
             return
 

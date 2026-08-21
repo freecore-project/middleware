@@ -457,6 +457,21 @@ def test__schema_unixperm_null():
     assert unixpermnull(self, None) is None
 
 
+@pytest.mark.parametrize("value", ['', 'rwx', '8', '1000'])
+def test__schema_unixperm_invalid(value):
+
+    @accepts(UnixPerm('data'))
+    def unixperm(self, data):
+        return data
+
+    self = Mock()
+
+    with pytest.raises(ValidationErrors) as ve:
+        unixperm(self, value)
+
+    assert [e.attribute for e in ve.value.errors] == ['data']
+
+
 def test__schema_dir_null():
 
     @accepts(Dir('data', null=True))

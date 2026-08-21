@@ -52,14 +52,6 @@ class FailoverService(PseudoServiceBase):
         # FIXME: Linux
 
 
-class KmipService(PseudoServiceBase):
-    name = "kmip"
-
-    async def start(self):
-        await self.middleware.call("service.start", "ssl")
-        await self.middleware.call("etc.generate", "kmip")
-
-
 class LoaderService(PseudoServiceBase):
     name = "loader"
 
@@ -170,8 +162,8 @@ class SslService(PseudoServiceBase):
         pass
 
 
-class SysconsService(SimpleService):
-    name = "syscons"
+class VtService(SimpleService):
+    name = "vt"
 
     etc = ["rc"]
     restartable = True

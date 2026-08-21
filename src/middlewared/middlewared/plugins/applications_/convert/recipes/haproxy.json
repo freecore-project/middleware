@@ -1,0 +1,63 @@
+{
+  "app": "haproxy",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "HAProxy",
+  "comment": "HAProxy has no runtime state to migrate -- the configuration file IS the application. The FreeBSD rc script reads haproxy_config (default /usr/local/etc/haproxy.conf), which rc_data_var picks up when the operator moved it; the official Linux image reads /usr/local/etc/haproxy/haproxy.cfg; the Daemonless image runs -f /config/haproxy.conf. Certificate and socket paths inside the carried file name source locations and need editing before the proxy passes its config check -- the plan cannot rewrite them.",
+  "target": {
+    "catalog_id": "daemonless:haproxy",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 80
+  },
+  "sources": {
+    "jail": {
+      "pkg": "haproxy",
+      "rc_script": "haproxy",
+      "rc_data_var": "haproxy_config",
+      "detect": [
+        "usr/local/etc/rc.d/haproxy"
+      ],
+      "data": "usr/local/etc/haproxy.conf",
+      "uid": 0
+    },
+    "linux": {
+      "images": [
+        "docker.io/library/haproxy",
+        "haproxy",
+        "docker.io/haproxytech/haproxy-alpine"
+      ],
+      "data": "/usr/local/etc/haproxy/haproxy.cfg",
+      "uid": 0,
+      "export": {
+        "image": "docker.io/library/haproxy",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 99
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "haproxy.conf",
+      "required": true
+    }
+  ],
+  "drop": [
+    "TLS certificate files (paths inside the configuration need editing)",
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

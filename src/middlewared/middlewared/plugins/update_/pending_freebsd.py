@@ -2,11 +2,18 @@
 import json
 import os
 
-from freenasOS import Update
-from freenasOS.Exceptions import (
-    UpdateIncompleteCacheException, UpdateInvalidCacheException,
-    UpdateBusyCacheException,
-)
+try:
+    from freenasOS import Update
+    from freenasOS.Exceptions import (
+        UpdateIncompleteCacheException, UpdateInvalidCacheException,
+        UpdateBusyCacheException,
+    )
+except ImportError:
+    from middlewared.utils.freenasOS import Update
+    from middlewared.utils.freenasOS.Exceptions import (
+        UpdateIncompleteCacheException, UpdateInvalidCacheException,
+        UpdateBusyCacheException,
+    )
 
 from middlewared.service import private, Service
 

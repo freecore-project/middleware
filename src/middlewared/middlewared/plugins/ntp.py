@@ -123,10 +123,9 @@ class NTPServerService(CRUDService):
         maxpoll = data['maxpoll']
         minpoll = data['minpoll']
         force = data.pop('force', False)
-        usable = True if await self.middleware.run_in_thread(
-            self.test_ntp_server, data['address']) else False
 
-        if not force and not usable:
+        # The probe waits out ntplib's timeout on a server that does not answer, so a forced save skips it
+        if not force and not await self.middleware.run_in_thread(self.test_ntp_server, data['address']):
             verrors.add(f'{schema_name}.address',
                         'Server could not be reached. Check "Force" to '
                         'continue regardless.'

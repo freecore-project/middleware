@@ -1,0 +1,55 @@
+name: home-assistant
+services:
+  home-assistant:
+    image: ghcr.io/daemonless/home-assistant:latest
+    container_name: home-assistant
+    restart: unless-stopped
+    network_mode: host
+    stop_grace_period: 2m
+    annotations:
+      org.freebsd.jail.allow.raw_sockets: 'true'
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG_DATA}:/config
+x-fjord:
+  version: '0.1'
+  info:
+    id: home-assistant
+    name: Home Assistant
+    description: Open source home automation that puts local control and privacy first.
+    category: Utilities
+    class: service
+    icon: icons/home-assistant.svg
+    web_port: '8123'
+    upstream_url: https://github.com/daemonless/home-assistant
+    web_url: https://www.home-assistant.io/
+    name_env:
+      TRUSTED_PROXIES: '{proxy}'
+  variables:
+  - name: CONFIG_DATA
+    label: Configuration directory
+    type: zfs_dataset
+    default: config
+    host_permissions:
+      uid: 1000
+      gid: 1000
+      mode: '755'
+  - name: PUID
+    label: User ID for the application process
+    type: string
+    default: '1000'
+  - name: PGID
+    label: Group ID for the application process
+    type: string
+    default: '1000'
+  - name: TZ
+    label: Timezone for the container
+    type: string
+    default: UTC
+  variants:
+  - id: latest
+    label: Latest
+    default: true

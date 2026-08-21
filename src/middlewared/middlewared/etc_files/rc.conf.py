@@ -1,12 +1,62 @@
-import itertools
+import os
 import re
+import shlex
 import subprocess
-import sysctl
 
+import sysctl as _sysctl
+from middlewared.plugins.applications_.utils import (
+    PODMAN_PATH,
+    RUNTIME_READY,
+    podman_environment,
+)
+from middlewared.plugins.bastille_.utils import bastille_paths
 from middlewared.utils.io import write_if_changed
+from middlewared.utils.nfs_rc import nfs_rc_flags
 
-NFS_BINDIP_NOTFOUND = '/tmp/.nfsbindip_notfound'
 RE_FIRMWARE_VERSION = re.compile(r'Firmware Revision\s*:\s*(\S+)', re.M)
+KLDLOAD = '/sbin/kldload'
+SYSCTL = '/sbin/sysctl'
+
+
+def rc_conf_value(value):
+    return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+
+
+def rc_conf_args(args):
+    # rc.subr evals "$command $rc_flags $command_args", so a value that ends up
+    # in ${name}_flags or command_args is shell-quoted per argument for that eval
+    # before it is escaped for the double-quoted rc.conf assignment.
+    return rc_conf_value(shlex.join(args))
+
+
+def _load_nfsd_module():
+    try:
+        subprocess.run(
+            [KLDLOAD, 'nfsd'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def _set_sysctl(oid, value):
+    try:
+        _sysctl.filter(oid)[0].value = value
+        return
+    except (IndexError, OSError):
+        pass
+
+    try:
+        subprocess.run(
+            [SYSCTL, f'{oid}={value}'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
 
 
 def get_context(middleware):
@@ -28,10 +78,14 @@ def collectd_config(middleware, context):
         yield 'collectd_daemon_enable="YES"'
         yield 'rrdcached_enable="YES"'
 
-        rrdcached_flags = '-s www -l /var/run/rrdcached.sock -p /var/run/rrdcached.pid'
+        yield 'rrdcached_group="www"'
+        yield 'rrdcached_address="/var/run/rrdcached.sock"'
+        yield 'rrdcached_pid="/var/run/rrdcached.pid"'
+
+        rrdcached_flags = ''
         sysds = middleware.call_sync('systemdataset.config')
         if sysds['pool'] in ('', middleware.call_sync('boot.pool_name')):
-            rrdcached_flags += ' -w 3600 -f 7200'
+            rrdcached_flags = '-w 3600 -f 7200'
         yield f'rrdcached_flags="{rrdcached_flags}"'
     else:
         return []
@@ -56,7 +110,8 @@ def geli_config(middleware, context):
 
 def host_config(middleware, context):
     config = middleware.call_sync('network.configuration.config')
-    yield f'hostname="{config["hostname_local"]}.{config["domain"]}"'
+    hostname = f'{config["hostname_local"]}.{config["domain"]}'
+    yield f'hostname="{rc_conf_value(hostname)}"'
 
     if config['ipv4gateway']:
         yield f'defaultrouter="{config["ipv4gateway"]}"'
@@ -66,13 +121,12 @@ def host_config(middleware, context):
 
     if config['netwait_enabled']:
         yield 'netwait_enable="YES"'
+        config['netwait_ip'] = ' '.join(config['netwait_ip'])
         if not config['netwait_ip']:
             if config['ipv4gateway']:
                 config['netwait_ip'] = config['ipv4gateway']
             elif config['ipv6gateway']:
                 config['netwait_ip'] = config['ipv6gateway']
-        else:
-            config['netwait_ip'] = ' '.join(config["netwait_ip"])
 
         yield f'netwait_ip="{config["netwait_ip"]}"'
 
@@ -80,7 +134,7 @@ def host_config(middleware, context):
 def kbdmap_config(middleware, context):
     general = middleware.call_sync('system.general.config')
     if general['kbdmap']:
-        yield f'keymap="{general["kbdmap"]}"'
+        yield f'keymap="{rc_conf_value(general["kbdmap"])}"'
     else:
         return []
 
@@ -98,8 +152,8 @@ def lldp_config(middleware, context):
     if lldp['country']:
         ladvd_flags += ['-c', lldp['country']]
     if lldp['location']:
-        ladvd_flags += ['-l', rf'\"{lldp["location"]}\"']
-    yield f'ladvd_flags="{" ".join(ladvd_flags)}"'
+        ladvd_flags += ['-l', lldp['location']]
+    yield f'ladvd_flags="{rc_conf_args(ladvd_flags)}"'
 
 
 def service_announcement(middleware, context):
@@ -107,6 +161,44 @@ def service_announcement(middleware, context):
     yield f'nmbd_enable="{"YES" if announce["netbios"] else "NO"}"'
     yield f'avahi_daemon_enable="{"YES" if announce["mdns"] else "NO"}"'
     yield f'wsdd_enable="{"YES" if announce["wsd"] else "NO"}"'
+
+
+def wsdd_config(middleware, context):
+    announce = middleware.call_sync("network.configuration.config")["service_announcement"]
+    if not announce["wsd"]:
+        return []
+
+    smb_config = middleware.call_sync("smb.config")
+    interfaces = smb_config["bindip"] or list(middleware.call_sync("smb.bindip_choices").values())
+
+    flags = []
+    if smb_config["netbiosname_local"]:
+        flags += ["-n", smb_config["netbiosname_local"]]
+    for interface in interfaces:
+        flags += ["-i", interface]
+
+    if flags:
+        yield f'wsdd_flags="{rc_conf_value(" ".join(flags))}"'
+
+    try:
+        realm = middleware.call_sync("smb.getparm", "realm", "GLOBAL")
+    except Exception:
+        middleware.logger.debug("Failed to read SMB realm for wsdd rc configuration", exc_info=True)
+        realm = None
+
+    if realm:
+        yield f'wsdd_domain="{rc_conf_value(realm)}"'
+    else:
+        yield f'wsdd_group="{rc_conf_value(smb_config["workgroup"])}"'
+
+
+def samba_daemons_config(middleware, context):
+    # samba_server rc.d reads smbd_enable / winbindd_enable / nmbd_enable to
+    # decide which of the three to launch. smbd + winbindd are always-on (the
+    # cifs service lifecycle is middleware-controlled via forcestart).
+    # nmbd_enable is emitted by service_announcement based on announce[netbios].
+    yield 'smbd_enable="YES"'
+    yield 'winbindd_enable="YES"'
 
 
 def services_config(middleware, context):
@@ -126,8 +218,12 @@ def services_config(middleware, context):
             'dynamicdns': ['inadyn'],
             'ftp': ['proftpd'],
             'openvpn_client': ['openvpn_client'],
+            'qemu_guest_agent': ['qemu_guest_agent'],
             'openvpn_server': ['openvpn_server'],
+            'rar2fs': ['rar2fs'],
             'rsync': ['rsyncd'],
+            'wireguard': ['wireguard_server'],
+            'wireguard_client': ['wireguard_client'],
             'snmp': ['snmpd', 'snmp_agent'],
             'tftp': ['inetd'],
             'webdav': ['apache24'],
@@ -143,10 +239,12 @@ def services_config(middleware, context):
         3. On BOTH controllers in TrueNAS HA systems
     """
     mapping.update({
+        'cifs': ['samba_server'],
         'iscsitarget': ['ctld'],
         'lldp': ['ladvd'],
         'ssh': ['openssh'],
-        'cifs': ['samba_server', 'smbd', 'winbindd']
+        # Per-daemon smbd/winbindd rcvars are emitted by
+        # samba_daemons_config; nmbd_enable by service_announcement.
     })
 
     for service in services:
@@ -159,51 +257,20 @@ def services_config(middleware, context):
 
 
 def nfs_config(middleware, context):
-    # nfs.extend() method checks contents of keytab for
-    # nfs service principal name entries. Ensure that
-    # system keytab is generated before this point.
-    middleware.call_sync('etc.generate', 'kerberos')
+    # nfs.extend() checks /etc/krb5.keytab for an nfs service principal. Every
+    # path that changes a keytab regenerates that file itself; regenerating it
+    # here, on every rc reload, would replace machine account keys winbindd has
+    # rotated into it with the older copy in the database.
     nfs = middleware.call_sync('nfs.config')
 
-    mountd_flags = ['-rS']
-    if nfs['mountd_log']:
-        mountd_flags.append('-l')
-    if nfs['allow_nonroot']:
-        mountd_flags.append('-n')
-    if nfs['mountd_port']:
-        mountd_flags += ['-p', str(nfs['mountd_port'])]
-
-    statd_flags = []
-    lockd_flags = []
     nfsuserd_flags = []
-    if nfs['statd_lockd_log']:
-        statd_flags.append('-d')
-        lockd_flags += ['-d', '10']
-    if nfs['rpcstatd_port']:
-        statd_flags += ['-p', str(nfs['rpcstatd_port'])]
-    if nfs['rpclockd_port']:
-        lockd_flags += ['-p', str(nfs['rpclockd_port'])]
 
-    nfs_server_flags = ['-t', '-n', str(nfs['servers'])]
-    if nfs['udp']:
-        nfs_server_flags.append('-u')
-
-    """
-    Make sure the IPs exist before we try to bind the NFS service to them
-    Redmine 16044
-    """
-    bindip = middleware.call_sync('nfs.bindip', nfs)
-    if bindip:
-        ips = list(itertools.chain(*[['-h', i] for i in bindip]))
-        mountd_flags += ips
-        nfs_server_flags += ips
-        statd_flags += ips
-        yield f'rpcbind_flags="{" ".join(ips)}"'
-
-    yield f'nfs_server_flags="{" ".join(nfs_server_flags)}"'
-    yield f'rpc_statd_flags="{" ".join(statd_flags)}"'
-    yield f'rpc_lockd_flags="{" ".join(lockd_flags)}"'
-    yield f'mountd_flags="{" ".join(mountd_flags)}"'
+    # Make sure the IPs exist before we try to bind the NFS service to them (Redmine 16044).
+    # The same flags are written to /etc/rc.conf.d/<daemon> by this group: /etc/rc never re-reads
+    # rc.conf.freenas after it started, so ix-nfsbind's regeneration only reaches the daemons
+    # through those per-script files (the internal development record).
+    for var, value in nfs_rc_flags(nfs, middleware.call_sync('nfs.bindip', nfs)).items():
+        yield f'{var}="{value}"'
 
     if not context['failover_licensed'] or context['failover_status'] == 'MASTER':
         enabled = middleware.call_sync(
@@ -219,6 +286,7 @@ def nfs_config(middleware, context):
 
     if nfs['v4']:
         yield 'nfsv4_server_enable="YES"'
+        _load_nfsd_module()
 
         if nfs['v4_krb_enabled']:
             if enabled:
@@ -231,17 +299,17 @@ def nfs_config(middleware, context):
         if nfs['v4_v3owner']:
             # Per RFC7530, sending NFSv3 style UID/GIDs across the wire is now allowed
             # You must have both of these sysctl's set to allow the desired functionality
-            sysctl.filter('vfs.nfsd.enable_stringtouid')[0].value = 1
-            sysctl.filter('vfs.nfs.enable_uidtostring')[0].value = 1
+            for oid, val in [('vfs.nfsd.enable_stringtouid', 1), ('vfs.nfs.enable_uidtostring', 1)]:
+                _set_sysctl(oid, val)
         else:
-            sysctl.filter('vfs.nfsd.enable_stringtouid')[0].value = 0
-            sysctl.filter('vfs.nfs.enable_uidtostring')[0].value = 0
+            for oid in ('vfs.nfsd.enable_stringtouid', 'vfs.nfs.enable_uidtostring'):
+                _set_sysctl(oid, 0)
             if nfs['v4_domain']:
-                nfsuserd_flags.append(f"-domain {nfs['v4_domain']}")
+                nfsuserd_flags += ['-domain', nfs['v4_domain']]
 
     if nfsuserd_flags and enabled:
         yield 'nfsuserd_enable="YES"'
-        yield f"nfsuserd_flags=\"{' '.join(nfsuserd_flags)}\""
+        yield f'nfsuserd_flags="{rc_conf_args(nfsuserd_flags)}"'
 
     elif enabled and nfs['v4'] and not nfs['v4_v3owner']:
         yield 'nfsuserd_enable="YES"'
@@ -256,7 +324,7 @@ def nis_config(middleware, context):
     if nis['servers']:
         domain += ',' + nis['servers']
 
-    yield f'nisdomainname="{nis["domain"]}"'
+    yield f'nisdomainname="{rc_conf_value(nis["domain"])}"'
     yield 'nis_client_enable="YES"'
 
     flags = ['-S', domain]
@@ -264,7 +332,7 @@ def nis_config(middleware, context):
         flags.append('-s')
     if nis['manycast']:
         flags.append('-m')
-    yield f'nis_client_flags="{" ".join(flags)}"'
+    yield f'nis_client_flags="{rc_conf_args(flags)}"'
 
 
 def nut_config(middleware, context):
@@ -280,9 +348,11 @@ def nut_config(middleware, context):
     ups = middleware.call_sync('ups.config')
     if ups['mode'] == 'MASTER':
         yield 'nut_enable="YES"'
-        yield f'nut_upslog_ups="{ups["identifier"]}"'
+        upslog_ups = ups['identifier']
     else:
-        yield f'nut_upslog_ups="{ups["identifier"]}@{ups["remotehost"]}:{ups["remoteport"]}"'
+        upslog_ups = f'{ups["identifier"]}@{ups["remotehost"]}:{ups["remoteport"]}'
+    # nut_upslog's rc script evals this as part of nut_upslog_flags.
+    yield f'nut_upslog_ups="{rc_conf_args([upslog_ups])}"'
     yield 'nut_upslog_enable="YES"'
     yield 'nut_upsmon_enable="YES"'
 
@@ -311,6 +381,12 @@ def snmp_config(middleware, context):
     yield 'snmpd_conffile="/etc/local/snmpd.conf"'
     loglevel = middleware.call_sync('snmp.config')['loglevel']
     yield f'snmpd_flags="-LS{loglevel}d"'
+    # net-snmp 5.9.5.2's rc.d script defaults snmpd_sugid=YES and then passes
+    # "-u snmpd -g snmpd", but the appliance has no snmpd account: builtin users
+    # come from the middleware DB, and the internal development record deliberately refused to add one there.
+    # 13.3 shipped net-snmp 5.9.1, whose rc.d script has no sugid handling at all,
+    # so snmpd ran as root. Keep that behaviour rather than diverging the user model.
+    yield 'snmpd_sugid="NO"'
 
 
 def staticroute_config(middleware, context):
@@ -343,8 +419,15 @@ def truenas_config(middleware, context):
         yield 'failover_enable="YES"'
 
 
-def truecommand_config(middleware, context):
-    return ['wireguard_interfaces="wg0"'] if middleware.call_sync('truecommand.config')['enabled'] else []
+# wireguard_config() used to live here as the sole owner of wireguard_interfaces,
+# emitting wg0 for the TrueCommand Cloud tunnel. TrueCommand Cloud is gone
+# (the internal development record) and wg0 with it (the internal development record), so nothing writes
+# wireguard_interfaces any more: wg1 is named by wireguard_server_interface and wg2
+# by wireguard_client_interface, each owned by its own rc script (the internal development record, the internal development record).
+# Do not reintroduce wireguard_interfaces to start wg1 or wg2 -- the
+# net/wireguard-tools rc script it feeds acts on every listed interface at once, so
+# it cannot give either one an independent lifecycle, and its start never returns on
+# FreeBSD 15.
 
 
 def tunable_config(middleware, context):
@@ -353,6 +436,62 @@ def tunable_config(middleware, context):
     ]):
         yield f'{tun["var"]}="{tun["value"]}"'
     return []
+
+
+def applications_config(middleware, context):
+    config = middleware.call_sync('applications.config')
+    if not config['pool']:
+        return []
+
+    # Podman itself is daemonless. Its rc script only restarts workloads after
+    # middlewared has made the pool-backed configuration and PF ready.
+    runtime_ready = os.path.exists(RUNTIME_READY)
+    restart_ready = config['restart_on_boot'] and runtime_ready
+    yield f'podman_enable="{"YES" if restart_ready else "NO"}"'
+    yield 'podman_service_enable="NO"'
+    if restart_ready:
+        environment = podman_environment(config['pool'])
+        command = ' '.join([
+            '/usr/bin/env',
+            *(f'{name}={value}' for name, value in environment.items()),
+            PODMAN_PATH,
+        ])
+        yield f'podman="{rc_conf_value(command)}"'
+
+    # the internal development record: the experimental Linux image tier owns these two
+    # lines. The base rc script loads linux64/linprocfs/linsysfs and sets the ELF
+    # fallback brand; the /compat/linux mounts are not needed because podman gives
+    # each Linux container its own linprocfs/linsysfs. An administrator's own RC
+    # tunable for linux_enable keeps precedence: it is theirs, not ours.
+    if config.get('linux_compat_enabled') and not middleware.call_sync('tunable.query', [
+        ('type', '=', 'RC'), ('var', '=', 'linux_enable'), ('enabled', '=', True),
+    ]):
+        yield 'linux_enable="YES"'
+        yield 'linux_mounts_enable="NO"'
+
+    # The generated composite ruleset retains failover/management rules and
+    # adds only the CNI anchors required by native Applications.
+    if runtime_ready:
+        yield 'pf_enable="YES"'
+        yield 'pf_rules="/etc/pf.conf.block"'
+
+
+def bastille_config(middleware, context):
+    config = middleware.call_sync('bastille.rc_config')
+    enabled = bool(
+        config['pool'] and config['enabled'] and config['configuration_valid'] and
+        not config.get('switching_pool', False)
+    )
+    yield f'bastille_enable="{"YES" if enabled else "NO"}"'
+    if not config['pool']:
+        return
+
+    paths = bastille_paths(config['pool'])
+    yield f'bastille_conf="{rc_conf_value(paths["config_file"])}"'
+    yield f'bastille_env="BASTILLE_CONFIG={rc_conf_value(paths["config_file"])}"'
+    yield f'bastille_jailsdir="{rc_conf_value(paths["jails"])}"'
+    yield f'bastille_startup_delay="{config["startup_delay"]}"'
+    yield f'bastille_parallel_limit="{config["parallel_limit"]}"'
 
 
 def vmware_config(middleware, context):
@@ -391,9 +530,10 @@ def _bmc_watchdog_is_broken():
 
 def watchdog_config(middleware, context):
     if context['is_freenas']:
-        # Bug #7337 -- blacklist AMD systems for now
-        model = sysctl.filter('hw.model')
-        if not model or 'AMD' not in model[0].value:
+        # Bug the internal development record -- blacklist AMD systems for now
+        model = _sysctl.filter('hw.model')
+        model_value = model[0].value if model else ''
+        if 'AMD' not in model_value:
             product = middleware.call_sync('system.dmidecode_info')['baseboard-product-name']
 
             if product in ('C2750D4I', 'C2550D4I') and _bmc_watchdog_is_broken():
@@ -423,6 +563,8 @@ def render(service, middleware):
     for i in (
         services_config,
         service_announcement,
+        wsdd_config,
+        samba_daemons_config,
         collectd_config,
         geli_config,
         host_config,
@@ -439,11 +581,12 @@ def render(service, middleware):
         snmp_config,
         staticroute_config,
         tftp_config,
-        truecommand_config,
         truenas_config,
         vmware_config,
         watchdog_config,
         zfs_config,
+        applications_config,
+        bastille_config,
         tunable_config,
     ):
         try:

@@ -34,7 +34,9 @@ class SystemService(Service):
                 # means no DMI information available so fill out cache
                 # with empty values so we don't continually try to fill it
                 # (which defeats the entire purpose of having a cache)
-                SystemService.CACHE = {i: '' for i in SystemService.CACHE}
+                # ecc-memory is a boolean, so it stays None (unknown) just
+                # like it does when there is no DMI type 16 section
+                SystemService.CACHE = {i: None if i == 'ecc-memory' else '' for i in SystemService.CACHE}
                 break
 
             if 'DMI type 0,' in line:

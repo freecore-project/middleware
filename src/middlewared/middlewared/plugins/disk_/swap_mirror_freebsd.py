@@ -17,10 +17,19 @@ class DiskService(Service, DiskSwapMirrorBase):
             raise CallError(f'Failed to create gmirror {name}: {cp.stderr}')
 
     async def destroy_swap_mirror(self, name):
-        mirror_data = await self.middleware.call('disk.get_swap_mirrors', [['name', '=', name]], {'get': True})
+        mirror_data = await self.middleware.call(
+            'disk.get_swap_mirrors', [['name', '=', name]], {'get': True}
+        )
         mirror_name = os.path.join('mirror', name)
         if mirror_data['encrypted_provider']:
-            await self.middleware.call('disk.remove_encryption', f'{mirror_name}.eli')
+            cp = await run(
+                'geli', 'detach', mirror_data['encrypted_provider'], check=False, encoding='utf8'
+            )
+            if cp.returncode:
+                self.logger.warning(
+                    'Failed to detach geli provider %s: %s',
+                    mirror_data['encrypted_provider'], cp.stderr,
+                )
 
         cp = await run('gmirror', 'destroy', name, check=False, encoding='utf8')
         if cp.returncode:

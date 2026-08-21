@@ -36,6 +36,19 @@ RE_CHECKS = re.compile(r"Checks:\s*(?P<checks>[0-9 /]+)(, (?P<progress>[0-9]+)%)
 
 REMOTES = {}
 
+
+def get_remote(name):
+    """
+    The provider that a stored credential names. A credential carried over
+    from an older configuration can name a provider that is not there any
+    more (Hubic, the internal development record).
+    """
+    try:
+        return REMOTES[name]
+    except KeyError:
+        raise CallError(f"The cloud sync provider {name} is not available in this version.") from None
+
+
 OAUTH_URL = "https://freenas.org/oauth"
 
 RcloneConfigTuple = namedtuple("RcloneConfigTuple", ["config_path", "remote_path", "extra_args"])
@@ -47,7 +60,7 @@ class RcloneConfig:
     def __init__(self, cloud_sync):
         self.cloud_sync = cloud_sync
 
-        self.provider = REMOTES[self.cloud_sync["credentials"]["provider"]]
+        self.provider = get_remote(self.cloud_sync["credentials"]["provider"])
 
         self.config = None
         self.tmp_file = None
@@ -174,10 +187,17 @@ async def rclone(middleware, job, cloud_sync, dry_run=False):
         path = cloud_sync["path"]
         if cloud_sync["direction"] == "PUSH":
             if cloud_sync["snapshot"]:
-                dataset, recursive = get_dataset_recursive(
-                    await middleware.call("zfs.dataset.query", [["type", "=", "FILESYSTEM"]]),
-                    cloud_sync["path"],
-                )
+                # `zfs.dataset.query`'s serialized path has no top-level `mountpoint` key:
+                # py-libzfs 3b100a9 ("Do not treat mountpoint specially") removed it, while
+                # 13.3's shipped py39-libzfs still emitted it. Same delta as #288 -- read the
+                # value out of `properties` so `get_dataset_recursive` keeps the input shape it
+                # was written against. 'none' maps to None, exactly as the old top-level key did.
+                datasets = []
+                for ds in await middleware.call("zfs.dataset.query", [["type", "=", "FILESYSTEM"]]):
+                    mountpoint = ds["properties"].get("mountpoint", {}).get("value")
+                    datasets.append(dict(ds, mountpoint=None if mountpoint == "none" else mountpoint))
+
+                dataset, recursive = get_dataset_recursive(datasets, cloud_sync["path"])
                 snapshot_name = (
                     f"cloud_sync-{cloud_sync.get('id', 'onetime')}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
                 )
@@ -243,7 +263,7 @@ async def rclone(middleware, job, cloud_sync, dry_run=False):
 
         await run_script(job, env, cloud_sync["post_script"], "Post-script")
 
-        refresh_credentials = REMOTES[cloud_sync["credentials"]["provider"]].refresh_credentials
+        refresh_credentials = get_remote(cloud_sync["credentials"]["provider"]).refresh_credentials
         if refresh_credentials:
             credentials_attributes = cloud_sync["credentials"]["attributes"].copy()
             updated = False
@@ -268,7 +288,7 @@ async def run_script(job, env, hook, script_name):
         return
 
     if not hook.startswith("#!"):
-        hook = f"#!/bin/bash\n{hook}"
+        hook = f"#!/usr/bin/env bash\n{hook}"
 
     fd, name = tempfile.mkstemp()
     os.close(fd)
@@ -774,7 +794,7 @@ class CloudSyncService(TaskPathService):
         if verrors:
             raise verrors
 
-        provider = REMOTES[credentials["provider"]]
+        provider = get_remote(credentials["provider"])
 
         schema = []
 
@@ -844,7 +864,7 @@ class CloudSyncService(TaskPathService):
         if data["direction"] == "PUSH":
             credentials = await self._get_credentials(data["credentials"])
 
-            provider = REMOTES[credentials["provider"]]
+            provider = get_remote(credentials["provider"])
 
             if provider.readonly:
                 verrors.add(f"{name}.direction", "This remote is read-only")
@@ -977,7 +997,7 @@ class CloudSyncService(TaskPathService):
         if not credentials:
             raise CallError("Invalid credentials")
 
-        provider = REMOTES[credentials["provider"]]
+        provider = get_remote(credentials["provider"])
 
         if not provider.buckets:
             raise CallError("This provider does not use buckets")
@@ -1036,7 +1056,7 @@ class CloudSyncService(TaskPathService):
 
         credentials = await self._get_credentials(cloud_sync["credentials"])
 
-        path = get_remote_path(REMOTES[credentials["provider"]], cloud_sync["attributes"])
+        path = get_remote_path(get_remote(credentials["provider"]), cloud_sync["attributes"])
 
         return await self.ls(dict(cloud_sync, credentials=credentials), path)
 
@@ -1128,7 +1148,7 @@ class CloudSyncService(TaskPathService):
         local_path = cloud_sync["path"]
         local_direction = FsLockDirection.READ if cloud_sync["direction"] == "PUSH" else FsLockDirection.WRITE
 
-        remote_path = get_remote_path(REMOTES[credentials["provider"]], cloud_sync["attributes"])
+        remote_path = get_remote_path(get_remote(credentials["provider"]), cloud_sync["attributes"])
         remote_direction = FsLockDirection.READ if cloud_sync["direction"] == "PULL" else FsLockDirection.WRITE
 
         directions = {

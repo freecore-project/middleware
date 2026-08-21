@@ -80,24 +80,6 @@ class AlertSourceRunFailedOnBackupNodeAlertClass(AlertClass):
     exclude_from_list = True
 
 
-class AutomaticAlertFailedAlertClass(AlertClass, SimpleOneShotAlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "Failed to Notify iXsystems About Alert"
-    text = textwrap.dedent("""\
-        Creating an automatic alert for iXsystems about system %(serial)s failed: %(error)s.
-        Please contact iXsystems Support: https://www.ixsystems.com/support/
-
-        Alert:
-
-        %(alert)s
-    """)
-
-    exclude_from_list = True
-
-    deleted_automatically = False
-
-
 class TestAlertClass(AlertClass):
     category = AlertCategory.SYSTEM
     level = AlertLevel.CRITICAL
@@ -505,44 +487,6 @@ class AlertService(Service):
                     if alert.mail:
                         await self.middleware.call("mail.send", alert.mail)
 
-                if await self.middleware.call("system.is_enterprise"):
-                    new_proactive_support_alerts = [
-                        alert
-                        for alert in new_alerts
-                        if (
-                            alert.klass.proactive_support and
-                            (await as_.get_alert_class(alert)).get("proactive_support", True)
-                        )
-                    ]
-                    if new_proactive_support_alerts:
-                        if await self.middleware.call("support.is_available_and_enabled"):
-                            support = await self.middleware.call("support.config")
-                            msg = [f"* {alert.formatted}" for alert in new_proactive_support_alerts]
-
-                            serial = (await self.middleware.call("system.info"))["system_serial"]
-
-                            for name, verbose_name in await self.middleware.call("support.fields"):
-                                value = support[name]
-                                if value:
-                                    msg += ["", "{}: {}".format(verbose_name, value)]
-
-                            msg = "\n".join(msg)
-
-                            job = await self.middleware.call("support.new_ticket", {
-                                "title": "Automatic alert (%s)" % serial,
-                                "body": msg,
-                                "attach_debug": False,
-                                "category": "Hardware",
-                                "criticality": "Loss of Functionality",
-                                "environment": "Production",
-                                "name": "Automatic Alert",
-                                "email": "auto-support@ixsystems.com",
-                                "phone": "-",
-                            })
-                            await job.wait()
-                            if job.error:
-                                await self.middleware.call("alert.oneshot_create", "AutomaticAlertFailed",
-                                                           {"serial": serial, "alert": msg, "error": str(job.error)})
 
     def __uuid(self):
         return str(uuid.uuid4())
@@ -869,6 +813,7 @@ class AlertServiceService(CRUDService):
         datastore = "system.alertservice"
         datastore_extend = "alertservice._extend"
         datastore_order_by = ["name"]
+        verbose_name = "Alert Service"
 
     @accepts()
     async def list_types(self):
@@ -942,7 +887,7 @@ class AlertServiceService(CRUDService):
                     "enabled": true,
                     "type": "Mail",
                     "attributes": {
-                        "email": "dev@ixsystems.com"
+                        "email": "dev@freecore.org"
                     },
                     "settings": {
                         "VolumeVersion": "HOURLY"
@@ -967,9 +912,7 @@ class AlertServiceService(CRUDService):
         """
         Update Alert Service of `id`.
         """
-        old = await self.middleware.call("datastore.query", self._config.datastore, [("id", "=", id)],
-                                         {"extend": self._config.datastore_extend,
-                                          "get": True})
+        old = await self.get_instance(id)
 
         new = old.copy()
         new.update(data)
@@ -1012,7 +955,7 @@ class AlertServiceService(CRUDService):
                     "enabled": true,
                     "type": "Mail",
                     "attributes": {
-                        "email": "dev@ixsystems.com"
+                        "email": "dev@freecore.org"
                     },
                     "settings": {}
                 }]
@@ -1068,6 +1011,7 @@ class AlertClassesService(ConfigService):
     @accepts(Dict(
         "alert_classes_update",
         Dict("classes", additional_attrs=True),
+        update=True,
     ))
     async def do_update(self, data):
         """
@@ -1083,6 +1027,11 @@ class AlertClassesService(ConfigService):
         for k, v in new["classes"].items():
             if k not in AlertClass.class_by_name:
                 verrors.add(f"alert_class_update.classes.{k}", "This alert class does not exist")
+                continue
+
+            if not isinstance(v, dict):
+                verrors.add(f"alert_class_update.classes.{k}", "A dict was expected")
+                continue
 
             verrors.add_child(
                 f"alert_class_update.classes.{k}",

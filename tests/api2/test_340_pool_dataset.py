@@ -6,6 +6,7 @@ import sys
 import os
 import pytest
 from pytest_dependency import depends
+from time import sleep
 apifolder = os.getcwd()
 sys.path.append(apifolder)
 from functions import DELETE, GET, POST, PUT, SSH_TEST, wait_on_job
@@ -16,6 +17,7 @@ pytestmark = pytest.mark.skipif(dev_test, reason='Skip for testing')
 
 dataset = f'{pool_name}/dataset1'
 dataset_url = dataset.replace('/', '%2F')
+smb_dataset = f'{pool_name}/smb-dataset1'
 zvol = f'{pool_name}/zvol1'
 zvol_url = zvol.replace('/', '%2F')
 
@@ -49,6 +51,38 @@ def test_02_create_dataset(request):
     assert result.status_code == 200, result.text
 
 
+@pytest.mark.dependency(name="create_smb_dataset")
+def test_02a_create_smb_dataset_with_default_acl(request):
+    depends(request, ["pool_04"], scope="session")
+    result = POST('/pool/dataset/', {'name': smb_dataset, 'share_type': 'SMB'})
+    assert result.status_code == 200, result.text
+
+
+def test_02b_smb_dataset_receives_legacy_default_acl(request):
+    depends(request, ["create_smb_dataset"])
+    expected_ace = {
+        'tag': 'GROUP',
+        'id': 545,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'MODIFY'},
+        'flags': {'BASIC': 'INHERIT'},
+    }
+
+    # pool.dataset.create starts the legacy permission job asynchronously.
+    # Poll the observable ACL instead of racing the first getacl request.
+    for _ in range(30):
+        result = POST('/filesystem/getacl/', {
+            'path': f'/mnt/{smb_dataset}',
+            'simplified': True,
+        })
+        assert result.status_code == 200, result.text
+        if expected_ace in result.json()['acl']:
+            break
+        sleep(1)
+
+    assert expected_ace in result.json()['acl'], result.text
+
+
 def test_03_query_dataset_by_name(request):
     depends(request, ["create_dataset"])
     dataset = GET(f'/pool/dataset/?id={dataset_url}')
@@ -76,6 +110,32 @@ def test_05_set_permissions_for_dataset(request):
             'mode': '777',
             'group': 'nobody',
             'user': 'nobody'
+        }
+    )
+
+    assert result.status_code == 200, result.text
+    JOB_ID = result.json()
+    job_status = wait_on_job(JOB_ID, 180)
+    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+
+
+def test_06_set_permissions_for_dataset_without_acl(request):
+    depends(request, ["create_dataset"])
+    global JOB_ID
+    # 'acl' must be sent explicitly empty, exactly as test_05 does. When the key
+    # is omitted the schema layer supplies a non-empty default, and
+    # pool.dataset.permission then fails its own validation twice over --
+    #   pool_dataset_permission.mode:  setting mode and ACL simultaneously ...
+    #   pool_dataset_permissions.acl:  Simultaneously setting and removing ACL ...
+    # -- because both guards are `if acl and ...`. Sending [] is what "without
+    # acl" means here, and it is what makes mode + stripacl a legal call.
+    result = POST(
+        f'/pool/dataset/id/{dataset_url}/permission/', {
+            'acl': [],
+            'mode': '755',
+            'group': 'nobody',
+            'user': 'nobody',
+            'options': {'stripacl': True}
         }
     )
 

@@ -3,7 +3,7 @@ import collections
 import re
 
 
-DISKS = ('da', 'ada', 'vtbd', 'mfid', 'nvd', 'pmem')
+DISKS = ('da', 'ada', 'vtbd', 'mfid', 'nvd', 'nda', 'pmem')
 SHELF = ('ses',)
 TYPES = ('CREATE', 'DESTROY')
 PREV_TASK = collections.deque(maxlen=1)
@@ -50,8 +50,8 @@ async def devd_devfs_hook(middleware, data):
         # so we ignore this event.
         return
 
-    now = asyncio.get_event_loop().time()
-    task = asyncio.get_event_loop().call_later
+    now = asyncio.get_running_loop().time()
+    task = asyncio.get_running_loop().call_later
 
     if not PREV_TASK:
         if data['cdev'].startswith(DISKS):

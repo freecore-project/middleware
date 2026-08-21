@@ -1,0 +1,71 @@
+name: actual
+services:
+  actual:
+    image: ghcr.io/daemonless/actual:latest
+    container_name: actual
+    restart: unless-stopped
+    network_mode: host
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    - NODE_ENV=${NODE_ENV}
+    - ACTUAL_PORT=${ACTUAL_PORT}
+    - ACTUAL_HOSTNAME=${ACTUAL_HOSTNAME}
+    - ACTUAL_DATA_DIR=${ACTUAL_DATA_DIR}
+    volumes:
+    - ${DATA_DATA}:/data
+x-fjord:
+  version: '0.1'
+  info:
+    id: actual
+    name: Actual Budget
+    description: Self-hosted personal finance sync server (Actual Budget) on FreeBSD.
+    category: Productivity
+    class: service
+    icon: icons/actual.svg
+    web_port: '5006'
+    upstream_url: https://github.com/actualbudget/actual
+    web_url: https://actualbudget.org/
+  variables:
+  - name: DATA_DATA
+    label: Application data — account database, budget files and server config
+    type: zfs_dataset
+    default: data
+    host_permissions:
+      uid: 1000
+      gid: 1000
+      mode: '755'
+  - name: PUID
+    label: User ID for the application process
+    type: string
+    default: '1000'
+  - name: PGID
+    label: Group ID for the application process
+    type: string
+    default: '1000'
+  - name: TZ
+    label: Timezone for the container
+    type: string
+    default: Etc/UTC
+  - name: NODE_ENV
+    label: Node runtime mode; leave as 'production'
+    type: string
+    default: production
+  - name: ACTUAL_PORT
+    label: Internal port the sync server listens on; leave as 5006
+    type: string
+    default: '5006'
+  - name: ACTUAL_HOSTNAME
+    label: Bind address for the sync server; leave as 0.0.0.0 (the app's own default, '::', is IPv6-any and breaks single-stack
+      containers)
+    type: string
+    default: 0.0.0.0
+  - name: ACTUAL_DATA_DIR
+    label: Directory where Actual stores its account database, budget files and server config (under the /data volume)
+    type: string
+    default: /data
+  variants:
+  - id: latest
+    label: Latest
+    default: true

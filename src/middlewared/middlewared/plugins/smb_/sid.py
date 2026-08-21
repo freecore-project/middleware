@@ -76,6 +76,9 @@ class SMBService(Service):
         """
         db_SID = (await self.middleware.call('smb.config'))['cifs_SID']
         system_sid = await self.get_system_sid()
+        if not system_sid:
+            self.logger.warning('Unable to determine system SID, leaving SID in nas config unchanged')
+            return
 
         if db_SID != system_sid:
             self.logger.warning(f"Domain SID in group_mapping.tdb ({system_sid}) is not SID in nas config ({db_SID}). Updating db")

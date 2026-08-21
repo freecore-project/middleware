@@ -385,7 +385,7 @@ class SharingSMBService(Service):
                 continue
             try:
                 auxparam, val = param.split('=', 1)
-                if auxparam == 'include':
+                if auxparam.strip() == 'include':
                     self.logger.warning('[%s] contains invalid include line: %s',
                                         data['name'], param)
                     continue

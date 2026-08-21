@@ -3,3 +3,18 @@ add path 'usbctl' mode 660 group uucp
 add path 'usb/*' mode 660 group uucp
 add path 'ttyU*' mode 660 group uucp
 
+
+# the internal development record: the device set Bastille gives its VNET jails.
+# Bastille 1.4.0 writes `devfs_ruleset = 13;` into every -V jail (and every
+# -B jail using DHCP) and expects `bastille setup vnet` to have defined the
+# ruleset in this file. The appliance never runs `bastille setup`, and /etc is
+# rebuilt from the image at every boot, so the ruleset ships here instead:
+# upstream's definition, byte for byte. Without it the ruleset is empty and the
+# jail sees the host's whole /dev, raw disks and kernel memory included.
+[bastille_vnet=13]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add include $devfsrules_unhide_login
+add include $devfsrules_jail
+add include $devfsrules_jail_vnet
+add path 'bpf*' unhide

@@ -1,5 +1,301 @@
 #!/bin/sh -ex
-(
-    cd "$(python3 -c 'import os; import middlewared; print(os.path.dirname(middlewared.__spec__.origin))')" &&
-    alembic upgrade head
-)
+
+# TrueNAS 15 fresh-install factory DB setup.
+#
+# Strategy: start from a real TrueNAS 13.3 factory-v1.db snapshot shipped
+# with this package (the canonical output of the legacy migrate93/113/alembic
+# chain — 38 tables pre-seeded with iX defaults: wheel+31 system groups, root
+# +31 system users, every ConfigService table, all 17 services entries). Then:
+#
+#   1. `alembic upgrade head` — applies every migration between 13.3's pinned
+#      revision (b412304844e1) and FB15 HEAD before SQLAlchemy can create
+#      tables that Alembic owns.
+#   2. `Model.metadata.create_all` — idempotent, adds any FB15-only tables
+#      that aren't represented by migrations without touching existing data.
+#   3. Defensive seed fallback for any FB15-only ConfigService rows that
+#      Alembic/create_all did not populate.
+#
+# Why shipped-DB instead of scripted seeds: 13.3's Django migrate93/113
+# produced ~40 tables of real default data (network_globalconfiguration,
+# services_*, directoryservice_*, system_* etc.) via Django fixtures. Our
+# earlier generic seed only handled the tables middleware queries at boot;
+# everything else (reset_root_pw → auth.twofactor, service config, etc.)
+# kept hitting empty-row whack-a-mole. Shipping the real DB is a single
+# source of truth that matches 13.3 behaviour exactly.
+#
+# For upgrade paths from earlier 15.0 releases (15.0 GA -> 15.1), use the
+# normal `alembic upgrade head` flow on the live DB — this script only runs
+# at install time on a fresh /data/freenas-v1.db.
+
+DB="${FREENAS_DATABASE:-${FREENAS_CONFIG:-/data/freenas-v1.db}}"
+SEED_DB="/usr/local/share/truenas/factory-v1.db"
+MW_DIR="$(python3 -c 'import os, middlewared; print(os.path.dirname(middlewared.__spec__.origin))')"
+
+# Start from the shipped 13.3 factory-v1.db seed when available. If the target
+# DB already exists (re-run, upgrade path), leave it alone.
+if [ -f "$SEED_DB" ] && [ ! -f "$DB" ]; then
+    echo "migrate: seeding ${DB} from shipped ${SEED_DB}"
+    cp "$SEED_DB" "$DB"
+    chmod 644 "$DB"
+fi
+
+if sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alembic_version'" \
+    | grep -q '^alembic_version$'
+then
+    # Subshell so the cwd change never leaks: a bare `cd "$MW_DIR"` would leave
+    # the main shell in site-packages/middlewared, and the `python3 -` heredoc
+    # below would then run with that dir on sys.path[0] — `import sqlalchemy`
+    # resolves middlewared/sqlalchemy.py (self-circular-import -> ImportError,
+    # false /data/update.failed on every in-place upgrade). the internal development record
+    (cd "$MW_DIR" && FREENAS_DATABASE="$DB" alembic upgrade head)
+    ALEMBIC_UPGRADED=1
+else
+    ALEMBIC_UPGRADED=0
+fi
+
+python3 - "$DB" <<'PY'
+import os, sys, importlib
+import middlewared, sqlalchemy
+from sqlalchemy import text
+from sqlalchemy.types import Integer, Boolean, String, Text, DateTime, JSON, LargeBinary, Numeric
+from middlewared.sqlalchemy import Model
+
+db_path = sys.argv[1]
+
+# --- Step 1: import every plugin so every sa.Model and ConfigService
+# subclass is registered before we walk the hierarchies below.
+# Mirrors the filename-suffix filter in middlewared.utils.load_modules:
+# files/dirs ending in _freebsd/_linux only load on the matching OS, so
+# pyudev / pyroute2 / glustercli etc. never get pulled in on the wrong OS.
+from middlewared.utils import osc
+plugin_dir = os.path.join(os.path.dirname(middlewared.__file__), "plugins")
+for root, dirs, files in os.walk(plugin_dir):
+    if "pytest" in root or "__pycache__" in root:
+        continue
+
+    dirs[:] = [
+        d for d in dirs
+        if not (d.endswith(('_freebsd', '_linux'))
+                and d.rsplit('_', 1)[-1].upper() != osc.SYSTEM)
+    ]
+
+    rel = os.path.relpath(root, plugin_dir)
+    for f in files:
+        if not f.endswith(".py") or f == "__init__.py":
+            continue
+        name = f[:-3]
+        if any(name.endswith(f'_{suffix}') for suffix in ('base', 'freebsd', 'linux')):
+            if name.rsplit('_', 1)[-1].upper() != osc.SYSTEM:
+                continue
+
+        mod = ("middlewared.plugins." + (name if rel == "."
+               else rel.replace("/", ".") + "." + name))
+        try:
+            importlib.import_module(mod)
+        except Exception as e:
+            print(f"migrate: import failed for {mod}: {type(e).__name__}: {str(e).splitlines()[0][:80]}",
+                  file=sys.stderr)
+
+# --- Step 2: create schema from SQLAlchemy models.
+engine = sqlalchemy.create_engine(f"sqlite:///{db_path}")
+Model.metadata.create_all(engine)
+print(f"migrate: created {len(Model.metadata.tables)} tables in {db_path}")
+
+# --- Step 3: seed one default row per ConfigService table.
+# 13.3's factory-v1.db had these rows pre-populated via migrate93/113 Django
+# fixtures. Without them, ConfigService._get_or_insert fails at middleware
+# startup when a NOT NULL column has no default (e.g. system_email.em_smtp),
+# which aborts init and leaves the public socket unopened — netcli and every
+# consumer fails with FileNotFoundError. Seed here to match the 13.3 outcome.
+
+def _type_default(col):
+    t = col.type
+    if col.nullable:
+        return None
+    if col.default is not None and getattr(col.default, "arg", None) is not None:
+        return col.default.arg
+    if col.server_default is not None:
+        return None
+    if isinstance(t, (Integer, Numeric)):
+        return 0
+    if isinstance(t, Boolean):
+        return False
+    if isinstance(t, (String, Text)):
+        return ""
+    if isinstance(t, DateTime):
+        return None
+    if isinstance(t, JSON):
+        return "{}"
+    if isinstance(t, LargeBinary):
+        return b""
+    return ""
+
+def _collect_config_services():
+    from middlewared.service import ConfigService
+    seen = set()
+    out = []
+    def walk(cls):
+        for sub in cls.__subclasses__():
+            if sub in seen:
+                continue
+            seen.add(sub)
+            walk(sub)
+            ds = getattr(getattr(sub, "_config", None), "datastore", None)
+            if ds:
+                out.append((sub.__name__, ds))
+    walk(ConfigService)
+    return out
+
+seed_queue = _collect_config_services()
+seeded = skipped = failed = 0
+with engine.begin() as conn:
+    for cls_name, datastore in seed_queue:
+        table_name = datastore.replace(".", "_")
+        tbl = Model.metadata.tables.get(table_name)
+        if tbl is None:
+            continue
+        n = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+        if n:
+            skipped += 1
+            continue
+        vals = {}
+        for col in tbl.columns:
+            if col.primary_key and col.autoincrement is True:
+                continue
+            if col.nullable and col.default is None and col.server_default is None:
+                continue
+            v = _type_default(col)
+            if v is not None or not col.nullable:
+                vals[col.name] = v if v is not None else ""
+        try:
+            conn.execute(tbl.insert().values(**vals))
+            seeded += 1
+        except Exception as e:
+            failed += 1
+            print(f"migrate: seed failed for {table_name} ({cls_name}): {type(e).__name__}: {str(e)[:120]}",
+                  file=sys.stderr)
+
+print(f"migrate: ConfigService seed — {seeded} seeded, {skipped} already had rows, {failed} failed")
+
+# --- Step 4: seed account_bsdgroups (wheel) + account_bsdusers (root).
+# Not ConfigService — these are lists, but middleware + installer assume the
+# bootstrap root/wheel pair exists. 13.3 got them from migrate93 Django
+# fixtures; hard-seed here. Values match 13.3 factory-v1.db shape: builtin,
+# shell=/bin/csh per account.py model default, locked unixhash "*" which
+# install.sh overwrites via SQL UPDATE after prompting for the password.
+with engine.begin() as conn:
+    groups = Model.metadata.tables.get("account_bsdgroups")
+    users = Model.metadata.tables.get("account_bsdusers")
+    if groups is not None and conn.execute(
+        text("SELECT COUNT(*) FROM account_bsdgroups")
+    ).scalar() == 0:
+        conn.execute(groups.insert().values(
+            id=1, bsdgrp_gid=0, bsdgrp_group="wheel",
+            bsdgrp_builtin=True, bsdgrp_sudo=False,
+            bsdgrp_sudo_nopasswd=False, bsdgrp_sudo_commands="[]",
+            bsdgrp_smb=False,
+        ))
+        print("migrate: seeded account_bsdgroups wheel (gid=0)")
+    if users is not None and conn.execute(
+        text("SELECT COUNT(*) FROM account_bsdusers")
+    ).scalar() == 0:
+        conn.execute(users.insert().values(
+            id=1,
+            bsdusr_uid=0,
+            bsdusr_username="root",
+            bsdusr_unixhash="*",
+            bsdusr_smbhash="*",
+            bsdusr_home="/root",
+            bsdusr_shell="/bin/csh",
+            bsdusr_full_name="root",
+            bsdusr_builtin=True,
+            bsdusr_smb=False,
+            bsdusr_password_disabled=False,
+            bsdusr_locked=False,
+            bsdusr_sudo=False,
+            bsdusr_sudo_nopasswd=False,
+            bsdusr_sudo_commands="[]",
+            bsdusr_microsoft_account=False,
+            bsdusr_group_id=1,
+            bsdusr_attributes="{}",
+        ))
+        print("migrate: seeded account_bsdusers root (uid=0)")
+
+# --- Step 5: pair /data/pwenc_secret with the freshly seeded DB.
+# 13.3's migrate93 ran with `-s pwenc_secret`, so the shipped factory-v1.db
+# carried encrypted fields paired with /data/pwenc_secret. Without that
+# pairing, middlewared's pwenc.setup detects the mismatch on first boot,
+# generates a new secret, and wipes every encrypted password field
+# (services_ups.ups_monpwd among them) to '' via reset_passwords. That
+# empty monpwd then renders upsmon.conf's MONITOR line without a password
+# field and `service.start ups` fails with "Unable to use old-style MONITOR
+# line without a username". Generate the secret here, prime
+# system_settings.stg_pwenc_check, and re-seed monpwd with the 13.3
+# default ("fixmepass") so the rendered MONITOR line is well-formed.
+import os
+PWENC_FILE_SECRET = '/data/pwenc_secret'
+if not os.path.exists(PWENC_FILE_SECRET):
+    os.makedirs(os.path.dirname(PWENC_FILE_SECRET), exist_ok=True)
+    with open(PWENC_FILE_SECRET, 'wb') as f:
+        os.chmod(PWENC_FILE_SECRET, 0o600)
+        f.write(os.urandom(32))
+    print(f"migrate: generated {PWENC_FILE_SECRET}")
+
+    from middlewared.plugins.pwenc import encrypt, PWENC_CHECK
+    with engine.begin() as conn:
+        settings_tbl = Model.metadata.tables.get('system_settings')
+        if settings_tbl is not None:
+            conn.execute(text("UPDATE system_settings SET stg_pwenc_check = :v"),
+                         {'v': encrypt(PWENC_CHECK)})
+        ups_tbl = Model.metadata.tables.get('services_ups')
+        if ups_tbl is not None:
+            conn.execute(text("UPDATE services_ups SET ups_monpwd = :v"),
+                         {'v': encrypt('fixmepass')})
+    print("migrate: primed stg_pwenc_check + seeded ups_monpwd default")
+
+# --- Step 6: (removed) pre-populated /etc/rc.conf.freenas hostname.
+#
+# This used to write hostname="<gc_hostname>.<gc_domain>" into
+# /etc/rc.conf.freenas so that /etc/rc.d/hostname would find an FQDN there
+# during boot. It was aimed at the right symptom and the wrong cause, and it
+# did harm in the one context where it actually took effect:
+#
+#   * pkg-install POST-INSTALL runs this script with FREENAS_INSTALL=yes
+#     against the FACTORY database, so the value written is the factory
+#     placeholder ("freecore.local"), not any real host's name. It is copied
+#     into /conf/base/etc by build/customize/conf-base.py and seeded into the
+#     /etc tmpfs on every boot, which is how an upgraded appliance ended up
+#     calling itself freecore.local instead of failing loudly.
+#   * ix-update runs this script at boot and then reboots immediately. /etc
+#     is a tmpfs by then, so that write never survives and never had any
+#     effect at all.
+#
+# The real cause was that early_late_divider="*" stopped taking effect on
+# FreeBSD 14+, so the whole of /etc/rc.d ran in the early pass, before
+# /etc/ix.rc.d/ix-etc had generated /etc/rc.conf.freenas -- which also left
+# watchdogd disabled. That is fixed in the base rc(8) two-pass logic; see
+# the internal development record. With the divider working again, /etc/rc.d/hostname
+# runs in the late pass and reads the generated file, so no seed is needed --
+# and if generation ever fails the hostname falls back to /etc/rc.conf's
+# "truenas", which is a visible failure rather than a plausible-looking one.
+
+# --- Step 7: (removed) iX crash-reporting sentinel.
+#
+# This used to create /data/.crashreporting_disabled so
+# CrashReporting.is_disabled() would short-circuit before uploading to
+# sentry.ixsystems.com. the internal development record removed sentry_sdk from
+# logger.py outright -- is_disabled() now returns True unconditionally and
+# report() is a no-op -- so the sentinel gates a mechanism that no longer
+# exists and is not created any more.
+#
+# Note the sentinel never covered usage collection: plugins/usage.py posted to
+# usage.freenas.org on its own daily schedule with no sentinel check. That
+# plugin is deleted in the same change.
+
+engine.dispose()
+PY
+
+if [ "$ALEMBIC_UPGRADED" -eq 0 ]; then
+    # Subshell for cwd symmetry with the upgrade branch (the internal development record).
+    (cd "$MW_DIR" && FREENAS_DATABASE="$DB" alembic stamp head)
+fi

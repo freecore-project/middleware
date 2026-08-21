@@ -1,0 +1,61 @@
+{
+  "app": "navidrome",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Navidrome",
+  "comment": "Navidrome's data folder (navidrome.db, cache) carries into /config/data, which is where the Daemonless image points --datafolder. config.toml is owned by the image (MusicFolder=/music); bind the music dataset at /music.",
+  "target": {
+    "catalog_id": "daemonless:navidrome",
+    "volume": "config",
+    "layout": {
+      "data": "data"
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 4533
+  },
+  "sources": {
+    "jail": {
+      "pkg": "navidrome",
+      "rc_script": "navidrome",
+      "rc_data_var": "navidrome_datafolder",
+      "detect": [
+        "usr/local/etc/rc.d/navidrome"
+      ],
+      "data": "var/db/navidrome",
+      "uid": 1000
+    },
+    "linux": {
+      "images": [
+        "docker.io/deluan/navidrome",
+        "deluan/navidrome"
+      ],
+      "data": "/data",
+      "uid": 1000,
+      "export": {
+        "image": "docker.io/deluan/navidrome",
+        "tag_template": "{version}",
+        "user": "user"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "data",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

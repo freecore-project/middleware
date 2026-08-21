@@ -37,9 +37,17 @@ class ISCSIGlobalService(Service, GlobalActionsBase):
                 'offload',
             ),
         }
-        xml = (await run(['ctladm', 'islist', '-x'], check=False, encoding='utf8')).stdout
+        result = await run(['ctladm', 'islist', '-x'], check=False, encoding='utf8')
+        xml = result.stdout
+        if not xml or not xml.strip():
+            return filter_list([], filters, options)
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            self.logger.warning('Failed to parse ctladm islist XML output')
+            return filter_list([], filters, options)
         sessions = []
-        for connection in ET.fromstring(xml).findall('.//connection'):
+        for connection in root.findall('.//connection'):
             session = {}
             for j in connection:
                 if j.tag in tags['first'] and j.text.isdigit():
@@ -55,12 +63,20 @@ class ISCSIGlobalService(Service, GlobalActionsBase):
         return filter_list(sessions, filters, options)
 
     async def terminate_luns_for_pool(self, pool_name):
-        xml = (await run(
+        result = await run(
             ['ctladm', 'devlist', '-b', 'block', '-x'],
             check=False,
             encoding='utf8'
-        )).stdout
-        for lun in ET.fromstring(xml).findall('.//lun'):
+        )
+        xml = result.stdout
+        if not xml or not xml.strip():
+            return
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            self.logger.warning('Failed to parse ctladm devlist XML output')
+            return
+        for lun in root.findall('.//lun'):
             lun_id = lun.attrib['id']
 
             path = lun.find('.//file').text

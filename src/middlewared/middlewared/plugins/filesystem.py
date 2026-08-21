@@ -16,7 +16,7 @@ import stat as pystat
 
 from middlewared.main import EventSource
 from middlewared.schema import Bool, Dict, Int, Ref, List, Str, UnixPerm, accepts
-from middlewared.service import private, CallError, Service, job
+from middlewared.service import private, CallError, Service, ValidationError, job
 from middlewared.utils import filter_list, osc
 from middlewared.plugins.pwenc import PWENC_FILE_SECRET
 from middlewared.plugins.smb import SMBBuiltin
@@ -24,6 +24,10 @@ from middlewared.plugins.smb import SMBBuiltin
 OS_TYPE_FREEBSD = 0x01
 OS_TYPE_LINUX = 0x02
 OS_FLAG = int(osc.IS_FREEBSD) + (int(osc.IS_LINUX) << 1)
+
+# FreeBSD pathconf(2) constant for NFS4 ACL support detection.
+# Not in Python's os.pathconf_names but stable across FreeBSD versions.
+_PC_ACL_NFS4 = 64
 
 
 class ACLType(enum.Enum):
@@ -345,6 +349,25 @@ class FilesystemService(Service):
         Raises:
             CallError(ENOENT) - Path not found
         """
+        if bsd is None:
+            try:
+                st = os.statvfs(path)
+            except FileNotFoundError:
+                raise CallError('Path not found.', errno.ENOENT)
+            return {
+                'flags': st.f_flag,
+                'bsize': st.f_bsize,
+                'total_blocks': st.f_blocks,
+                'free_blocks': st.f_bfree,
+                'avail_blocks': st.f_bavail,
+                'files': st.f_files,
+                'free_files': st.f_ffree,
+                'name_max': st.f_namemax,
+                'fstype': '',
+                'total_bytes': st.f_blocks * st.f_frsize,
+                'free_bytes': st.f_bfree * st.f_frsize,
+                'avail_bytes': st.f_bavail * st.f_frsize,
+            }
         try:
             statfs = bsd.statfs(path)
         except FileNotFoundError:
@@ -460,9 +483,12 @@ class FilesystemService(Service):
             posix1e_acl = self.getacl_posix1e(path, True)
             return True if len(posix1e_acl['acl']) == 3 else False
 
-        if not os.pathconf(path, 64):
+        if not os.pathconf(path, _PC_ACL_NFS4):
             return True
 
+        if acl is None:
+            raise CallError('py-bsd acl module not available — ABI rebuild required for FreeBSD 15',
+                            errno.EOPNOTSUPP)
         return acl.ACL(file=path).is_trivial
 
     @accepts(
@@ -569,7 +595,12 @@ class FilesystemService(Service):
 
         if mode is not None:
             mode = int(mode, 8)
+            if mode == 0:
+                raise ValidationError('filesystem.setperm.mode', 'Empty permissions are not permitted.')
 
+        if acl is None:
+            raise CallError('py-bsd acl module not available — ABI rebuild required for FreeBSD 15',
+                            errno.EOPNOTSUPP)
         a = acl.ACL(file=data['path'])
         a.strip()
         a.apply(data['path'])
@@ -751,6 +782,9 @@ class FilesystemService(Service):
 
     @private
     def getacl_nfs4(self, path, simplified):
+        if acl is None:
+            raise CallError('py-bsd acl module not available — ABI rebuild required for FreeBSD 15',
+                            errno.EOPNOTSUPP)
         stat = os.stat(path)
 
         a = acl.ACL(file=path)
@@ -828,7 +862,7 @@ class FilesystemService(Service):
         if not os.path.exists(path):
             raise CallError('Path not found.', errno.ENOENT)
 
-        if osc.IS_LINUX or not os.pathconf(path, 64):
+        if osc.IS_LINUX or not os.pathconf(path, _PC_ACL_NFS4):
             return self.getacl_posix1e(path, simplified)
 
         return self.getacl_nfs4(path, simplified)
@@ -891,13 +925,44 @@ class FilesystemService(Service):
         job.set_progress(100, 'Finished setting POSIX1e ACL.')
 
     @private
+    def nfs4_unsupported_message(self, path):
+        """The ENOTSUP text for an NFSv4 ACL write on `path`.
+
+        the internal development record: a pool imported from TrueNAS SCALE/CE carries acltype=posix, which
+        FreeBSD OpenZFS treats as no ACLs at all; the bare message named neither the cause nor the fix.
+        The prefix is unchanged for every other reason pathconf says no.
+        """
+        message = f"NFSv4 ACLS are not supported on path {path}"
+        try:
+            result = subprocess.run(['zfs', 'get', '-H', '-o', 'value', 'acltype', path],
+                                    capture_output=True, text=True, check=False)
+            acltype = result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            acltype = None
+        if acltype == 'posix':
+            message += (
+                ': the dataset has acltype=posix (a TrueNAS SCALE/CE default) and FreeBSD has no POSIX ACL '
+                'support. Run "zfs set acltype=nfsv4 <dataset>" and set the permissions again; existing mode '
+                'bits are kept.'
+            )
+        return message
+
+    @private
     def setacl_nfs4(self, job, data):
+        if acl is None:
+            raise CallError('py-bsd acl module not available — ABI rebuild required for FreeBSD 15',
+                            errno.EOPNOTSUPP)
         job.set_progress(0, 'Preparing to set acl.')
         options = data['options']
         dacl = data.get('dacl', [])
 
-        if osc.IS_LINUX or not os.pathconf(data['path'], 64):
-            raise CallError(f"NFSv4 ACLS are not supported on path {data['path']}", errno.EOPNOTSUPP)
+        # The schema requires no key of an entry and also accepts a POSIX1e entry; check the shape here
+        aclcheck = ACLType.NFS4.validate(data)
+        if not aclcheck['is_valid']:
+            raise CallError(f"NFSv4 ACL is invalid: {' '.join(aclcheck['errors'])}", errno.EINVAL)
+
+        if osc.IS_LINUX or not os.pathconf(data['path'], _PC_ACL_NFS4):
+            raise CallError(self.nfs4_unsupported_message(data['path']), errno.EOPNOTSUPP)
 
         self._common_perm_path_validate(data['path'])
 

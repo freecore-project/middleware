@@ -6,10 +6,12 @@ def setup(middleware):
     os.makedirs("/var/run/proftpd", exist_ok=True)
 
     open("/var/run/proftpd/proftpd.delay", "w+").close()
-    open("/etc/hosts.allow", "w+").close()
-    open("/etc/hosts.deny", "w+").close()
+    # Create these if missing but never truncate: the TCP wrapper files are shared with
+    # sshd, inetd and rpcbind, and wtmp holds the login history.
+    open("/etc/hosts.allow", "a").close()
+    open("/etc/hosts.deny", "a").close()
 
-    open("/var/log/wtmp", "w+").close()
+    open("/var/log/wtmp", "a").close()
     os.chmod("/var/log/wtmp", 0o644)
 
     ftp = middleware.call_sync("ftp.config")

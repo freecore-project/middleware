@@ -7,6 +7,7 @@ import glob
 
 from licenselib.license import License
 
+SESUTIL = '/usr/sbin/sesutil'
 GETENCSTAT = '/usr/sbin/getencstat'
 ZSERIES = 'SD_9GV12P1J_12R6K4'
 XSERIES = 'Enclosure Name: CELESTIC (P3215-O|P3217-B)'
@@ -18,14 +19,22 @@ def main():
     result = {'hardware': 'MANUAL', 'node': '', 'licensed': False}
     try:
         for enclosure in glob.iglob('/dev/ses*'):
-            # grab the getencstat output
-            cp = subprocess.run(
-                [GETENCSTAT, '-V', enclosure],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            if cp.stdout:
-                encstat = cp.stdout.decode('utf8', 'ignore').strip()
+            # grab enclosure status (sesutil on FB14+, getencstat on older)
+            encstat = None
+            for cmd in ([SESUTIL, '-u', enclosure, 'map'], [GETENCSTAT, '-V', enclosure]):
+                try:
+                    cp = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                    )
+                    if cp.returncode == 0 and cp.stdout:
+                        encstat = cp.stdout.decode('utf8', 'ignore').strip()
+                        break
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    continue
+            if encstat:
                 if re.search(ZSERIES, encstat, re.M):
                     # echostream (Z-series)
                     result['hardware'] = 'ECHOSTREAM'
@@ -41,11 +50,15 @@ def main():
                     result['hardware'] = 'PUMA'
 
                     # now get node position
-                    smp = subprocess.run(
-                        ['/sbin/camcontrol', 'smpphylist', enclosure, '-q'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
+                    try:
+                        smp = subprocess.run(
+                            ['/sbin/camcontrol', 'smpphylist', enclosure, '-q'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=10,
+                        )
+                    except (subprocess.TimeoutExpired, FileNotFoundError):
+                        continue
                     if smp.stdout:
                         smp = smp.stdout.decode('utf8', 'ignore').strip()
 

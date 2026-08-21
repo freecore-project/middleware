@@ -188,7 +188,8 @@ def filter_list(_list, filters=None, options=None):
         return len(rv)
 
     if options.get('order_by'):
-        for o in options.get('order_by'):
+        # Stable sorts applied last key first, so the first key is the primary one (as in SQL ORDER BY)
+        for o in reversed(options.get('order_by')):
             if o.startswith('-'):
                 o = o[1:]
                 reverse = True
@@ -219,11 +220,9 @@ def filter_getattrs(filters):
     if not filters:
         return attrs
 
-    f = filters.copy()
-    while f:
-        filter_ = f.pop()
+    for filter_ in filters:
         if len(filter_) == 2:
-            f.append(filter_[1])
+            attrs |= filter_getattrs(filter_[1])
         elif len(filter_) == 3:
             attrs.add(filter_[0])
         else:

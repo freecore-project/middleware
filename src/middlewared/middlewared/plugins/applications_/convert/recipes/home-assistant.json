@@ -1,0 +1,55 @@
+{
+  "app": "home-assistant",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Home Assistant",
+  "comment": "Home Assistant's /config (configuration.yaml, .storage/, home-assistant_v2.db) carries as one tree; the Daemonless image uses the same /config. Custom components and HACS-installed integrations are Python and carry; add-ons do not exist outside the supervised installation. There is no FreeBSD package; only a Linux export is a source.",
+  "target": {
+    "catalog_id": "daemonless:home-assistant",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8123
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "ghcr.io/home-assistant/home-assistant",
+        "docker.io/homeassistant/home-assistant",
+        "homeassistant/home-assistant",
+        "lscr.io/linuxserver/homeassistant",
+        "ghcr.io/linuxserver/homeassistant",
+        "docker.io/linuxserver/homeassistant"
+      ],
+      "data": "/config",
+      "uid": 0,
+      "export": {
+        "image": "lscr.io/linuxserver/homeassistant",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "app": "transmission",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Transmission",
+  "comment": "Transmission's -g directory (settings.json, resume/, torrents/, stats.json) carries as one tree; the Daemonless image runs it with -g /config. Download paths inside settings.json still name the source's paths; bind the same dataset at /downloads and adjust download-dir if it differs.",
+  "target": {
+    "catalog_id": "daemonless:transmission",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 9091
+  },
+  "sources": {
+    "jail": {
+      "pkg": "transmission-daemon",
+      "rc_script": "transmission",
+      "rc_data_var": "transmission_conf_dir",
+      "detect": [
+        "usr/local/etc/rc.d/transmission"
+      ],
+      "data": "usr/local/etc/transmission/home",
+      "uid": 921
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/transmission",
+        "ghcr.io/linuxserver/transmission",
+        "docker.io/linuxserver/transmission"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/transmission",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

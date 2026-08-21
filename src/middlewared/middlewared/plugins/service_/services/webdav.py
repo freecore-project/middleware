@@ -3,6 +3,7 @@ from .base import SimpleService
 
 class WebDAVService(SimpleService):
     name = "webdav"
+    reloadable = True
 
     etc = ["webdav"]
 

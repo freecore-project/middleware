@@ -84,3 +84,13 @@ def test__filter_list_OR_eq2():
         ['number', '=', 1],
         ['number', '=', 2],
     ]]])) == 2
+
+
+def test__filter_list_order_by_first_key_is_primary():
+    data = [{'a': 2, 'b': 1}, {'a': 1, 'b': 2}, {'a': 1, 'b': 1}]
+    assert [(i['a'], i['b']) for i in filter_list(data, [], {'order_by': ['a', 'b']})] == [(1, 1), (1, 2), (2, 1)]
+
+
+def test__filter_list_order_by_reverse_first_key():
+    data = [{'builtin': True, 'gid': 65534}, {'builtin': False, 'gid': 1000}, {'builtin': True, 'gid': 0}]
+    assert [i['gid'] for i in filter_list(data, [], {'order_by': ['-builtin', 'gid']})] == [0, 65534, 1000]

@@ -1,0 +1,51 @@
+{
+  "app": "n8n",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "n8n",
+  "comment": "n8n keeps everything in one .n8n directory (database.sqlite, encryptionKey, workflow data); the official image uses /home/node/.n8n and the Daemonless image reads the same tree from /config. The encryption key must carry or every stored credential is lost -- it lives in the directory, so one carry covers it. Webhook URLs referencing the old host carry as data and need editing. There is no FreeBSD package; only a Linux source applies.",
+  "target": {
+    "catalog_id": "daemonless:n8n",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 5678
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "docker.n8n.io/n8nio/n8n",
+        "docker.io/n8nio/n8n",
+        "n8nio/n8n"
+      ],
+      "data": "/home/node/.n8n",
+      "uid": 1000,
+      "export": {
+        "image": "docker.n8n.io/n8nio/n8n",
+        "tag_template": "{version}",
+        "user": "user"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

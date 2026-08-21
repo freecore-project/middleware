@@ -44,11 +44,17 @@
             return self.safe_call('activedirectory.config')['enable']
 
         def pam_auth(self):
+            # the internal development record: local accounts first. With AD enabled winbind also serves the box's own user
+            # database, and on success pam_winbind renames PAM_USER to its canonical MACHINE\user, which is no unix
+            # account: local users with SMB access could not log in (13.3 denies in account, OpenSSH 10.1+ at once).
+            # pam_unix authenticates a local account under its own name; a domain user fails it, and pam_winbind
+            # takes the same password (try_first_pass).
+            unix = "auth\t\tsufficient\tpam_unix.so\t\tno_warn try_first_pass"
             module = self.pam_winbind
             args = ["try_first_pass", "krb5_auth", "krb5_ccache_type=FILE"]
             module_args = " ".join(args)
 
-            return f"auth\t\tsufficient\t{module}\t{module_args}"
+            return f"{unix}\nauth\t\tsufficient\t{module}\t{module_args}"
 
         def pam_account(self):
             module = self.pam_winbind

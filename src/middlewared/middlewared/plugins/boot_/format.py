@@ -29,7 +29,10 @@ class BootService(Service):
         commands = []
         partitions = []
         efi_boot = (await self.middleware.call('boot.get_boot_type')) == 'EFI'
-        commands.append(('gpart', 'create', '-s', 'gpt', '-f', 'active', f'/dev/{dev}'))
+        # Removed invalid '-f active' flag — gpart create does not accept
+        # -f active (it was silently ignored on FB13 but may error on FB15).
+        # The disk is already wiped above so no force flag is needed.
+        commands.append(('gpart', 'create', '-s', 'gpt', f'/dev/{dev}'))
         # 272629760 bytes ( 260 mb ) are required by FreeBSD
         # for EFI partition and 524288 bytes ( 512kb ) if it's bios
         partitions.append(

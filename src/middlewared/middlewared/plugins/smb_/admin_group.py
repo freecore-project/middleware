@@ -93,7 +93,10 @@ class SMBService(Service):
             admin_group = smb['admin_group']
 
         # We must use GIDs because wbinfo --name-to-sid expects a domain prefix "FREENAS\user"
-        group = await self.middleware.call("dscache.get_uncached_group", admin_group)
+        try:
+            group = await self.middleware.call("dscache.get_uncached_group", admin_group)
+        except KeyError:
+            group = None
         if not group:
             verrors.add('smb_update.admin_group', f"Failed to validate group: {admin_group}")
             raise verrors

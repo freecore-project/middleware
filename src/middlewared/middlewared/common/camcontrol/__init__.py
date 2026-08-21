@@ -27,9 +27,11 @@ async def camcontrol_list():
     hptctlr = defaultdict(int)
 
     re_drv_cid_bus = re.compile(r'.* on (?P<drv>.*?)(?P<cid>[0-9]+) bus (?P<bus>[0-9]+)', re.S | re.M)
+    # Match device entries with 2 or more device names, e.g.:
+    #   (pass0,da0) or (pass0,nda0,nvme0) on FB15 NVMe CAM
     re_tgt = re.compile(
-        r'target (?P<tgt>[0-9]+) .*?lun (?P<lun>[0-9]+) .*\((?P<dv1>[a-z]+[0-9]+),(?P<dv2>[a-z]+[0-9]+)\)', re.S | re.M)
-    drv, cid, bus, tgt, lun, dev, devtmp = (None,) * 7
+        r'target (?P<tgt>[0-9]+) .*?lun (?P<lun>[0-9]+) .*\((?P<devs>[a-z][a-z0-9,]+)\)', re.S | re.M)
+    drv, cid, bus, tgt, lun, dev = (None,) * 6
 
     camcontrol = {}
     proc = await run(['camcontrol', 'devlist', '-v'], encoding="utf8")
@@ -51,10 +53,9 @@ async def camcontrol_list():
                 continue
             tgt = reg.group('tgt')
             lun = reg.group('lun')
-            dev = reg.group('dv1')
-            devtmp = reg.group('dv2')
-            if dev.startswith('pass'):
-                dev = devtmp
+            devs = reg.group('devs').split(',')
+            # Pick the first non-pass device name
+            dev = next((d for d in devs if not d.startswith('pass')), devs[0])
             camcontrol[dev] = {
                 'driver': drv,
                 'controller_id': int(cid),

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from collections import deque
 import contextlib
 import enum
@@ -21,7 +22,9 @@ import uuid
 from collections import defaultdict
 
 import sysctl
-from middlewared.alert.base import AlertCategory, AlertClass, AlertLevel, SimpleOneShotAlertClass
+from middlewared.alert.base import (
+    Alert, AlertCategory, AlertClass, AlertLevel, OneShotAlertClass, SimpleOneShotAlertClass,
+)
 from middlewared.plugins.disk_.overprovision_base import CanNotBeOverprovisionedException
 from middlewared.plugins.pool_.utils import get_dataset_parents
 from middlewared.plugins.zfs import ZFSSetPropertyError
@@ -43,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 GELI_KEYPATH = '/data/geli'
 
-RE_HISTORY_ZPOOL_SCRUB_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+zpool (scrub|create)', re.MULTILINE)
+RE_HISTORY_ZPOOL_SCRUB_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+(py-libzfs: )?zpool (scrub|create)', re.MULTILINE)
 ZFS_CHECKSUM_CHOICES = [
     'ON', 'OFF', 'FLETCHER2', 'FLETCHER4', 'SHA256', 'SHA512', 'SKEIN',
 ]
@@ -59,6 +62,41 @@ ZPOOL_CACHE_FILE = '/data/zfs/zpool.cache'
 ZPOOL_KILLCACHE = '/data/zfs/killcache'
 
 
+# TrueNAS 13.3 supplied this ACL as the schema default for
+# ``pool.dataset.permission``.  Keep it scoped to SMB dataset creation: the internal development record
+# deliberately made an omitted ACL mean "no ACL update" for general callers.
+SMB_DATASET_DEFAULT_ACL = [
+    {
+        'tag': 'owner@',
+        'id': None,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'FULL_CONTROL'},
+        'flags': {'BASIC': 'INHERIT'},
+    },
+    {
+        'tag': 'group@',
+        'id': None,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'FULL_CONTROL'},
+        'flags': {'BASIC': 'INHERIT'},
+    },
+    {
+        'tag': 'GROUP',
+        'id': 545,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'MODIFY'},
+        'flags': {'BASIC': 'INHERIT'},
+    },
+    {
+        'tag': 'everyone@',
+        'id': None,
+        'type': 'ALLOW',
+        'perms': {'BASIC': 'TRAVERSE'},
+        'flags': {'BASIC': 'NOINHERIT'},
+    },
+]
+
+
 class ZfsDeadmanAlertClass(AlertClass, SimpleOneShotAlertClass):
     category = AlertCategory.SYSTEM
     level = AlertLevel.WARNING
@@ -68,6 +106,45 @@ class ZfsDeadmanAlertClass(AlertClass, SimpleOneShotAlertClass):
     expires_after = timedelta(hours=4)
 
     proactive_support = True
+
+
+class PoolMountpointsNotResetAlertClass(AlertClass, OneShotAlertClass):
+    # the internal development record: one per pool, raised by pool.reset_mountpoints.
+    category = AlertCategory.STORAGE
+    level = AlertLevel.WARNING
+    title = 'Pool Datasets Are Not Mounted Where FreeCORE Expects Them'
+    text = (
+        'Pool %(pool)s was imported, but the mountpoint of %(datasets)s could not be reset (%(error)s), '
+        'so they are not mounted below /mnt/%(pool)s. Export the pool and import it again once nothing uses them.'
+    )
+
+    deleted_automatically = False
+
+    async def create(self, args):
+        return Alert(self.__class__, args, _key=args['pool'])
+
+    async def delete(self, alerts, query):
+        return [alert for alert in alerts if alert.key != query]
+
+
+class PoolPosixAclTypeAlertClass(AlertClass, OneShotAlertClass):
+    # the internal development record: one per pool, raised by pool.check_acltype after an import.
+    category = AlertCategory.STORAGE
+    level = AlertLevel.WARNING
+    title = 'Imported Pool Has Datasets With POSIX ACLs, Which FreeBSD Cannot Use'
+    text = (
+        'Pool %(pool)s was imported with acltype=posix on %(datasets)s (a TrueNAS SCALE/CE default). FreeBSD has '
+        'no POSIX ACL support, so setting permissions or an ACL on these datasets fails with ENOTSUP. Run '
+        '"zfs set acltype=nfsv4 <dataset>" on each and set the permissions again; existing mode bits are kept.'
+    )
+
+    deleted_automatically = False
+
+    async def create(self, args):
+        return Alert(self.__class__, args, _key=args['pool'])
+
+    async def delete(self, alerts, query):
+        return [alert for alert in alerts if alert.key != query]
 
 
 class ZFSKeyFormat(enum.Enum):
@@ -252,8 +329,6 @@ class EncryptedDiskModel(sa.Model):
 
 class PoolService(CRUDService):
 
-    GELI_KEYPATH = '/data/geli'
-
     class Config:
         datastore = 'storage.volume'
         datastore_extend = 'pool.pool_extend'
@@ -352,11 +427,25 @@ class PoolService(CRUDService):
         except CallError:
             return False
 
-    @accepts(Int('id'))
+    @accepts(
+        Int('id'),
+        Dict(
+            'options',
+            Bool('confirm_rollback_loss', default=False),
+        ),
+    )
     @item_method
-    async def upgrade(self, oid):
+    async def upgrade(self, oid, options):
         """
         Upgrade pool of `id` to latest version with all feature flags.
+
+        Upgrading feature flags is irreversible, and while a return-to-13.3 rollback
+        window is open it is worse than that: 13.3 cannot import an upgraded data pool,
+        and cannot boot from an upgraded boot pool.  Rolling back afterwards would leave
+        the user on 13.3 unable to reach their data, so `confirm_rollback_loss` must be
+        set to proceed while a window is open (see the internal development record / the internal development record).
+        With no window open this is unchanged - no consent is required and nothing else
+        happens.
 
         .. examples(websocket)::
 
@@ -370,11 +459,27 @@ class PoolService(CRUDService):
                 "params": [1]
             }
         """
+        pool = await self.get_instance(oid)
+
+        rollback = await self.middleware.call('system.rollback.available')
+        if rollback['available'] and not options['confirm_rollback_loss']:
+            window = await self.middleware.call('system.rollback.config')
+            raise CallError(
+                f'Upgrading the feature flags on pool {pool["name"]!r} is irreversible and will end the '
+                f'rollback back to boot environment {window["origin_be"]!r}. TrueNAS 13.3 cannot import '
+                f'a pool whose '
+                f'feature flags have been upgraded, and cannot boot from an upgraded boot pool, so after '
+                f'this you will not be able to go back. Pass confirm_rollback_loss to proceed.'
+            )
+
         # Should we check first if upgrade is required ?
-        await self.middleware.call(
-            'zfs.pool.upgrade',
-            (await self.get_instance(oid))['name']
-        )
+        await self.middleware.call('zfs.pool.upgrade', pool['name'])
+
+        if rollback['available']:
+            # The window is now a promise we cannot keep - close it rather than leave it
+            # advertised, and let the close path release the pin and the snapshots.
+            await self.middleware.call('system.rollback.close', 'pool_upgraded')
+
         return True
 
     @private
@@ -445,6 +550,7 @@ class PoolService(CRUDService):
             pool.update({
                 'status': zpool['status'],
                 'scan': zpool['scan'],
+                'expand': zpool.get('expand'),
                 'topology': self.transform_topology(zpool['groups']),
                 'healthy': zpool['healthy'],
                 'status_detail': zpool['status_detail'],
@@ -454,6 +560,7 @@ class PoolService(CRUDService):
             pool.update({
                 'status': 'OFFLINE',
                 'scan': None,
+                'expand': None,
                 'topology': None,
                 'healthy': False,
                 'status_detail': None,
@@ -853,7 +960,7 @@ class PoolService(CRUDService):
                     'pool.convert_topology_to_vdevs', data['topology'], enc_options
                 )
                 if enc_options['enc_keypath']:
-                    # encrypt the disks
+                    # Encrypt disks added to existing GELI pools.
                     await self.middleware.call('pool.encrypt_disks', job, enc_disks, enc_options)
                 job.set_progress(90, 'Extending ZFS Pool')
 
@@ -864,7 +971,7 @@ class PoolService(CRUDService):
                     await self.middleware.call('pool.save_encrypteddisks', id, enc_disks, disks_cache)
 
                 if pool['encrypt'] >= 2:
-                    # FIXME: ask current passphrase and validate
+                    # Existing API does not ask for the current passphrase here.
                     await self.middleware.call('disk.geli_passphrase', pool, None)
                     await self.middleware.call(
                         'datastore.update', 'storage.volume', id, {'encrypt': 1}, {'prefix': 'vol_'},
@@ -1051,8 +1158,7 @@ class PoolService(CRUDService):
                 args = ('datastore.query', 'storage.encrypteddisk', [('encrypted_volume', '=', pool['id'])])
                 for prov in filter(lambda x: x['encrypted_provider'], (await self.middleware.call(*args))):
                     # Use encrypted_provider and not disk because a disk is not a guarantee
-                    # to point to correct device if its locked and its not in the system
-                    # (e.g. temporarily). See #50291
+                    # to point to correct device if it is locked or temporarily absent.
                     provider = prov['encrypted_provider']
                     if disk_name := await self.middleware.call('disk.label_to_disk', provider, False, cache):
                         for d in filter(lambda x: x['name'] == disk_name, disks_in_db):
@@ -1343,10 +1449,20 @@ class PoolService(CRUDService):
             with open('/sys/module/zfs/parameters/zfs_vdev_scrub_max_active', 'w') as f:
                 f.write(str(scrub_max_active))
         else:
-            sysctl.filter('vfs.zfs.resilver_min_time_ms')[0].value = resilver_min_time_ms
-            sysctl.filter('vfs.zfs.vdev.nia_credit')[0].value = nia_credit
-            sysctl.filter('vfs.zfs.vdev.nia_delay')[0].value = nia_delay
-            sysctl.filter('vfs.zfs.vdev.scrub_max_active')[0].value = scrub_max_active
+            self._set_zfs_sysctl('vfs.zfs.resilver_min_time_ms', 'vfs.zfs.resilver_min_time_ms', resilver_min_time_ms)
+            self._set_zfs_sysctl('vfs.zfs.vdev.nia_credit', 'vfs.zfs.vdev.nia_credit', nia_credit)
+            self._set_zfs_sysctl('vfs.zfs.vdev.nia_delay', 'vfs.zfs.vdev.nia_delay', nia_delay)
+            self._set_zfs_sysctl('vfs.zfs.vdev.scrub_max_active', 'vfs.zfs.vdev.scrub_max_active', scrub_max_active)
+
+    def _set_zfs_sysctl(self, new_name, old_name, value):
+        """Set a ZFS sysctl, trying the new dotted name first, then the old underscore name."""
+        result = sysctl.filter(new_name)
+        if not result:
+            result = sysctl.filter(old_name)
+        if result:
+            result[0].value = value
+        else:
+            self.logger.warning('ZFS sysctl not found: %s (or %s)', new_name, old_name)
 
     @accepts()
     @job()
@@ -1365,7 +1481,7 @@ class PoolService(CRUDService):
                 continue
             # Exclude pools with same guid as existing pools (in database)
             # It could be the pool is in the database but was exported/detached for some reason
-            # See #6808
+            # See the internal development record
             if pool['guid'] in existing_guids:
                 continue
             entry = {}
@@ -1474,16 +1590,12 @@ class PoolService(CRUDService):
                 },
             })
 
-            try:
-                # Reset all mountpoints
-                await self.middleware.call('zfs.dataset.inherit', pool_name, 'mountpoint', True)
-            except Exception as e:
-                # Let's not make this fatal
-                self.middleware.logger.debug(
-                    f'Failed to inherit mountpoints recursively for imported {pool_name} pool: {e}'
-                )
+            # Reset all mountpoints. Never fatal: a dataset it cannot reset raises an alert.
+            await self.middleware.call('pool.reset_mountpoints', pool_name)
 
             if osc.IS_FREEBSD:
+                # A SCALE/CE pool carries acltype=posix, which FreeBSD cannot use. Never fatal: an alert.
+                await self.middleware.call('pool.check_acltype', pool_name)
                 await self.middleware.call('pool.sync_encrypted', pool_id)
         except Exception:
             if pool_id:
@@ -1575,6 +1687,69 @@ class PoolService(CRUDService):
             if await self.middleware.call('keyvalue.has_key', enable_on_import_key):
                 enable_on_import = await self.middleware.call('keyvalue.get', enable_on_import_key)
 
+        previous_enable_on_import = copy.deepcopy(enable_on_import)
+        attempted_attachments = []
+        try:
+            await self._export_impl(job, pool, options, enable_on_import, attempted_attachments)
+        except BaseException as error:
+            recovery = asyncio.ensure_future(self._rollback_export(
+                pool, attempted_attachments, enable_on_import, previous_enable_on_import,
+            ))
+            # A cancelled caller must not abandon attachment recovery halfway through.
+            while not recovery.done():
+                try:
+                    await asyncio.shield(recovery)
+                except asyncio.CancelledError:
+                    continue
+            failures = recovery.result()
+            if failures:
+                detail = '; '.join(failures)
+                self.logger.error('Pool %r export recovery failed: %s', pool['name'], detail)
+                if not isinstance(error, asyncio.CancelledError):
+                    raise CallError(
+                        f'{error} Attachment recovery failed: {detail}',
+                        getattr(error, 'errno', errno.EFAULT),
+                    ) from error
+            raise
+
+    async def _rollback_export(self, pool, attempted, enable_on_import, previous):
+        if not attempted:
+            return []
+        try:
+            # Export may have succeeded before a later cleanup failed. Never restart
+            # attachments against an exported pool or its now-empty mountpoint.
+            imported = await self.middleware.call('zfs.pool.query', [['name', '=', pool['name']]])
+            if not any(str(item['guid']) == str(pool['guid']) for item in imported):
+                return []
+        except Exception as error:
+            return [f'unable to verify that the pool remains imported: {error}']
+
+        failures = []
+        restored = False
+        for delegate, attachments in reversed(attempted):
+            try:
+                if await delegate.rollback_export(attachments):
+                    restored = True
+                    if delegate.name in previous:
+                        enable_on_import[delegate.name] = previous[delegate.name]
+                    else:
+                        enable_on_import.pop(delegate.name, None)
+            except Exception as error:
+                failures.append(f'{delegate.title}: {error}')
+        if restored:
+            key = f'pool:{pool["name"]}:enable_on_import'
+            try:
+                if enable_on_import:
+                    await self.middleware.call('keyvalue.set', key, enable_on_import)
+                else:
+                    await self.middleware.call('keyvalue.delete', key)
+            except Exception as error:
+                failures.append(f'restore attachment import state: {error}')
+        return failures
+
+    async def _export_impl(self, job, pool, options, enable_on_import, attempted_attachments):
+        oid = pool['id']
+        enable_on_import_key = f'pool:{pool["name"]}:enable_on_import'
         for i, delegate in enumerate(PoolDatasetService.attachment_delegates):
             job.set_progress(
                 i, f'{"Deleting" if options["cascade"] else "Disabling"} pool attachments: {delegate.title}')
@@ -1584,6 +1759,9 @@ class PoolService(CRUDService):
                 if options["cascade"]:
                     await delegate.delete(attachments)
                 else:
+                    # Include partially failed toggles: stopping several workloads is
+                    # not necessarily atomic. Destructive deletes are never rolled back.
+                    attempted_attachments.append((delegate, attachments))
                     await delegate.toggle(attachments, False)
                     enable_on_import[delegate.name] = list(
                         set(enable_on_import.get(delegate.name, [])) |
@@ -1724,6 +1902,94 @@ class PoolService(CRUDService):
             job.set_progress(None, read)
 
     @private
+    async def reset_mountpoints(self, name):
+        """Reset every local mountpoint in pool ``name`` to inherited, deepest dataset first.
+
+        the internal development record: ``zfs inherit -r`` resets a parent before its children, and has to
+        unmount it while a child with a mountpoint of its own is still mounted inside it: EBUSY. A
+        XigmaNAS pool (root at /mnt/<pool>, Bastille's datasets with mountpoints of their own) then
+        stayed mounted under /mnt/mnt/<pool>. Deepest first, every unmount a step needs is in that
+        step's own change list. The datasets reset are the ones the recursive inherit resets.
+
+        Never raises. Returns the datasets it could not reset; those raise
+        PoolMountpointsNotReset, and a reset that leaves none clears it.
+        """
+        failed = {}
+        result = await run(
+            'zfs', 'get', '-H', '-r', '-t', 'filesystem', '-s', 'local', '-o', 'name', 'mountpoint', name,
+            check=False, encoding='utf8', errors='ignore',
+        )
+        if result.returncode:
+            failed[name] = result.stderr.strip() or f'zfs get exited with {result.returncode}'
+            datasets = []
+        else:
+            datasets = sorted(
+                (line for line in result.stdout.splitlines() if line),
+                key=lambda dataset: (-dataset.count('/'), dataset),
+            )
+        for dataset in datasets:
+            try:
+                await self.middleware.call('zfs.dataset.inherit', dataset, 'mountpoint')
+            except Exception as error:
+                failed[dataset] = getattr(error, 'errmsg', str(error))
+
+        try:
+            if failed:
+                self.logger.warning('Unable to reset the mountpoints of pool %s: %s', name, failed)
+                names = sorted(failed)
+                await self.middleware.call('alert.oneshot_create', 'PoolMountpointsNotReset', {
+                    'pool': name,
+                    'datasets': ', '.join(names[:10]) + (f' and {len(names) - 10} more' if len(names) > 10 else ''),
+                    'error': failed[names[0]],
+                })
+            else:
+                await self.middleware.call('alert.oneshot_delete', 'PoolMountpointsNotReset', name)
+        except Exception:
+            self.logger.warning('Unable to update the mountpoint alert of pool %s', name, exc_info=True)
+        return sorted(failed)
+
+    @private
+    async def check_acltype(self, name):
+        """Name the filesystems of pool ``name`` that carry acltype=posix; FreeBSD cannot use them.
+
+        the internal development record: TrueNAS SCALE/CE sets acltype=posix on every pool it creates and FreeBSD
+        OpenZFS has no POSIX ACL implementation, so on an imported SCALE pool every NFSv4 ACL write (the
+        ACL editor, the share presets, setperm) fails with ENOTSUP and nothing says why. One entry per
+        subtree root (local or received source), not every inherited child.
+
+        Never raises. Returns the datasets found; those raise PoolPosixAclType, and none clears it.
+        """
+        found = []
+        try:
+            result = await run(
+                'zfs', 'get', '-H', '-r', '-t', 'filesystem', '-s', 'local,received', '-o', 'name,value',
+                'acltype', name, check=False, encoding='utf8', errors='ignore',
+            )
+        except Exception:
+            self.logger.warning('Unable to read the acltype of pool %s', name, exc_info=True)
+            return found
+        if result.returncode:
+            self.logger.warning('Unable to read the acltype of pool %s: %s', name, result.stderr.strip())
+            return found
+        for line in result.stdout.splitlines():
+            dataset, _, value = line.partition('\t')
+            if dataset and value.strip() == 'posix':
+                found.append(dataset)
+        found.sort()
+        try:
+            if found:
+                self.logger.warning('Pool %s has acltype=posix on %s; FreeBSD cannot write ACLs there', name, found)
+                await self.middleware.call('alert.oneshot_create', 'PoolPosixAclType', {
+                    'pool': name,
+                    'datasets': ', '.join(found[:10]) + (f' and {len(found) - 10} more' if len(found) > 10 else ''),
+                })
+            else:
+                await self.middleware.call('alert.oneshot_delete', 'PoolPosixAclType', name)
+        except Exception:
+            self.logger.warning('Unable to update the acltype alert of pool %s', name, exc_info=True)
+        return found
+
+    @private
     @job()
     def import_on_boot(self, job):
         cachedir = os.path.dirname(ZPOOL_CACHE_FILE)
@@ -1819,9 +2085,7 @@ class PoolService(CRUDService):
                 try:
                     if os.path.isdir('/mnt/mnt'):
                         # Reset all mountpoints
-                        self.middleware.call_sync(
-                            'zfs.dataset.inherit', pool['name'], 'mountpoint', True
-                        )
+                        self.middleware.call_sync('pool.reset_mountpoints', pool['name'])
                 except Exception:
                     self.logger.warn(
                         'Failed to inherit mountpoints for %s', pool['name'], exc_info=True,
@@ -1854,6 +2118,21 @@ class PoolService(CRUDService):
 
         if os.path.exists(ZPOOL_CACHE_FILE):
             shutil.copy(ZPOOL_CACHE_FILE, zpool_cache_saved)
+
+        # The rollback capture has one safe point: data pools must be imported, but
+        # `.system` must not have been mounted by the pool-import checkpoint yet.
+        try:
+            self.middleware.call_sync('system.rollback.capture_on_boot')
+        except Exception:
+            # `capture_on_boot` consumes its marker and raises a visible one-shot alert.
+            # Losing rollback must not prevent the appliance itself from booting.
+            self.logger.error('Automatic captured-return creation failed', exc_info=True)
+
+        try:
+            self.middleware.call_sync('system.rollback.cleanup')
+        except Exception:
+            # Cleanup is idempotent and the hourly task will retry it.
+            self.logger.error('Captured-return cleanup failed during pool import', exc_info=True)
 
         self.middleware.call_sync('etc.generate_checkpoint', 'pool_import')
 
@@ -2136,15 +2415,12 @@ class PoolDatasetService(CRUDService):
                 key = secrets.token_hex(32)
             elif not key and job:
                 job.check_pipe('input')
-                key = job.pipes.input.r.read(64)
+                key = job.pipes.input.r.read(64).decode(errors='replace')
                 # We would like to ensure key matches specified key format
-                try:
-                    key = hex(int(key, 16))[2:]
-                    if len(key) != 64:
-                        raise ValueError('Invalid key')
-                except ValueError:
+                if not re.fullmatch(r'[0-9a-fA-F]{64}', key):
                     verrors.add(f'{schema}.key_file', 'Please specify a valid key')
                     return {}
+                key = key.lower()
 
             opts = {
                 'keyformat': (ZFSKeyFormat.PASSPHRASE if passphrase_key_format else ZFSKeyFormat.HEX).value.lower(),
@@ -2214,13 +2490,13 @@ class PoolDatasetService(CRUDService):
             return
 
         for dataset, status in zip(db_datasets, check_key_job.result):
-            if not status['result']:
-                to_remove.append(dataset)
-            elif status['error']:
+            if status['error']:
                 if dataset not in encrypted_roots:
                     to_remove.append(dataset)
                 else:
                     self.middleware.logger.error(f'Failed to check encryption status for {dataset}: {status["error"]}')
+            elif not status['result']:
+                to_remove.append(dataset)
 
         self.middleware.call_sync('pool.dataset.delete_encrypted_datasets_from_db', [['name', 'in', to_remove]])
 
@@ -2246,18 +2522,7 @@ class PoolDatasetService(CRUDService):
         sync_job.wait_sync()
 
         datasets = self.query_encrypted_roots_keys([['OR', [['name', '=', id], ['name', '^', f'{id}/']]]])
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-                temp_path = f.name
-                os.chmod(temp_path, 0o600)
-                f.write(json.dumps(datasets))
-
-            with open(temp_path, 'rb') as f:
-                shutil.copyfileobj(f, job.pipes.output.w)
-        finally:
-            if os.path.exists(temp_path or ''):
-                os.unlink(temp_path)
+        job.pipes.output.w.write(json.dumps(datasets).encode())
 
     @accepts(
         Str('id'),
@@ -2278,7 +2543,7 @@ class PoolDatasetService(CRUDService):
 
         keys = self.query_encrypted_roots_keys([['name', '=', id]])
         if id not in keys:
-            raise CallError('Specified dataset does not have it\'s own encryption key.', errno.EINVAL)
+            raise CallError('Specified dataset does not have its own encryption key.', errno.EINVAL)
 
         key = keys[id]
 
@@ -2312,20 +2577,52 @@ class PoolDatasetService(CRUDService):
         elif id == (await self.middleware.call('systemdataset.config'))['pool']:
             raise CallError(f'Please move system dataset to another pool before locking {id}')
 
+        affected_delegates = set()
+        detach_tasks = []
+
         async def detach(delegate):
-            await delegate.stop((await delegate.query(self.__attachments_path(ds), True)))
+            attachments = await delegate.query(self.__attachments_path(ds), True)
+            if attachments:
+                affected_delegates.add(delegate.name)
+            await delegate.stop(attachments)
 
         try:
             await self.middleware.call('cache.put', 'about_to_lock_dataset', id)
 
-            coroutines = [detach(dg) for dg in self.attachment_delegates]
-            await asyncio.gather(*coroutines)
+            detach_tasks = [asyncio.create_task(detach(dg)) for dg in self.attachment_delegates]
+            results = await asyncio.gather(*detach_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
 
             await self.middleware.call(
                 'zfs.dataset.unload_key', id, {
                     'umount': True, 'force_umount': options['force_umount'], 'recursive': True
                 }
             )
+        except BaseException:
+            # When this job is cancelled, gather cancels its children. Await every teardown
+            # task before deciding whether Bastille needs recovery.
+            for task in detach_tasks:
+                if not task.done():
+                    task.cancel()
+            if detach_tasks:
+                await asyncio.gather(*detach_tasks, return_exceptions=True)
+
+            # Attachment teardown can make the active Bastille store unavailable before a
+            # later delegate or ZFS operation fails. Restore its guarded rc state when the
+            # dataset is still usable; pool_available deliberately remains fail-closed if not.
+            if 'bastille' in affected_delegates:
+                with contextlib.suppress(Exception):
+                    state = await self.middleware.call(
+                        'bastille.pool_available', ds['name'].split('/', 1)[0]
+                    )
+                    if (
+                        state['matched'] and state['enabled'] and
+                        await self.middleware.call('system.ready')
+                    ):
+                        await self.middleware.call('service.start', 'bastille')
+            raise
         finally:
             await self.middleware.call('cache.pop', 'about_to_lock_dataset')
 
@@ -2578,7 +2875,7 @@ class PoolDatasetService(CRUDService):
         for i, ds in enumerate(options['datasets']):
             if all(ds.get(k) for k in ('key', 'passphrase')):
                 verrors.add(
-                    f'unlock_options.datasets.{i}.dataset.key',
+                    f'encryption_root_summary_options.datasets.{i}.dataset.key',
                     f'Must not be specified when passphrase for {ds["name"]} is supplied'
                 )
             keys_supplied[ds['name']] = ds.get('key') or ds.get('passphrase')
@@ -2656,6 +2953,9 @@ class PoolDatasetService(CRUDService):
         """
         Change encryption properties for `id` encrypted dataset.
 
+        If `change_key_options.key_file` is set, the new key (64 hexadecimal characters) is read from the
+        uploaded file. In that case this method needs to be called using /_upload/ endpoint.
+
         Changing dataset encryption to use passphrase instead of a key is not allowed if:
 
         1) It has encrypted roots as children which are encrypted with a key
@@ -2696,11 +2996,11 @@ class PoolDatasetService(CRUDService):
                         'different pool before changing key_format.'
                     )
             else:
-                if not options['generate_key'] and not options['key']:
-                    for k in ('key', 'passphrase', 'generate_key'):
+                if not options['generate_key'] and not options['key'] and not options['key_file']:
+                    for k in ('key', 'passphrase', 'generate_key', 'key_file'):
                         verrors.add(
                             f'change_key_options.{k}',
-                            'Either Key or passphrase must be provided.'
+                            'One of key, passphrase, generate_key or key_file must be provided.'
                         )
                 elif id.count('/') and await self.middleware.call(
                     'pool.dataset.query', [
@@ -2767,7 +3067,7 @@ class PoolDatasetService(CRUDService):
                 raise CallError('This operation requires the parent dataset to be encrypted')
             else:
                 parent_encrypted_root = await self.get_instance(parent['encryption_root'])
-                if ZFSKeyFormat(parent_encrypted_root['key_format']['value']) == ZFSKeyFormat.PASSPHRASE.value:
+                if ZFSKeyFormat(parent_encrypted_root['key_format']['value']) == ZFSKeyFormat.PASSPHRASE:
                     if any(
                         d['name'] == d['encryption_root']
                         for d in await self.middleware.run_in_thread(
@@ -2790,7 +3090,7 @@ class PoolDatasetService(CRUDService):
     def _retrieve_keys_from_file(self, job):
         job.check_pipe('input')
         try:
-            data = json.loads(job.pipes.input.r.read(10240))
+            data = json.loads(job.pipes.input.r.read(10 * 1024 * 1024))
         except json.JSONDecodeError:
             raise CallError('Input file must be a valid JSON file')
 
@@ -2815,12 +3115,19 @@ class PoolDatasetService(CRUDService):
         there is for their children. This retrieval type is slightly slower because of duplicates in each object.
         The second type is hierarchical, where only top level datasets are returned in the list. They contain all the
         children in the `children` key. This retrieval type is slightly faster.
-        These options are controlled by the `query-options.extra.flat` attribute (default true). Please note that
-        this option is not available using the REST protocol but are available using the websocket protocol.
+        These options are controlled by the `query-options.extra.flat` attribute (default true).
+        `query-options.extra.retrieve_children` set to false (default true) returns every dataset with empty
+        `children`; with no filters that is just the pools' root datasets. Please note that
+        these options are not available using the REST protocol but are available using the websocket protocol.
         """
         # Optimization for cases in which they can be filtered at zfs.dataset.query
         zfsfilters = []
         filters = filters or []
+        extra = options.get('extra', {})
+        retrieve_children = extra.get('retrieve_children', True)
+        # Unfiltered, a query without children wants only the root datasets and nothing below them is read.
+        # A filter of the caller's own may match any dataset, so then the whole tree is still read.
+        read_children = retrieve_children or bool(filters)
         sys_config = self.middleware.call_sync('systemdataset.config')
         if sys_config['basename']:
             filters.extend([
@@ -2836,11 +3143,14 @@ class PoolDatasetService(CRUDService):
                 zfsfilters.append(['id', '=', f[2]])
                 break
 
-        return filter_list(
-            self.__transform(self.middleware.call_sync(
-                'zfs.dataset.query', zfsfilters, {'extra': {'flat': options.get('extra', {}).get('flat', True)}})
-            ), filters, options
-        )
+        datasets = self.__transform(self.middleware.call_sync('zfs.dataset.query', zfsfilters, {'extra': {
+            # Without children there is no hierarchy to keep.
+            'flat': extra.get('flat', True) or not retrieve_children, 'retrieve_children': read_children,
+        }}))
+        if not retrieve_children:
+            for dataset in datasets:
+                dataset['children'] = []
+        return filter_list(datasets, filters, options)
 
     def __transform(self, datasets):
         """
@@ -3019,6 +3329,9 @@ class PoolDatasetService(CRUDService):
                     'pool_dataset_create.name',
                     f'{data["name"].rsplit("/", 1)[0]} must be unlocked to create {data["name"]}.'
                 )
+        else:
+            # The encryption checks below query the parent and its ancestors, which do not exist
+            raise verrors
 
         encryption_dict = {}
         inherit_encryption_properties = data.pop('inherit_encryption')
@@ -3155,7 +3468,12 @@ class PoolDatasetService(CRUDService):
         await self.middleware.call('zfs.dataset.mount', data['name'])
 
         if data['type'] == 'FILESYSTEM' and data['share_type'] == 'SMB':
-            await self.middleware.call('pool.dataset.permission', data['id'], {'mode': None})
+            # the internal development record: pool.dataset.permission is a job; wait for it, so the dataset this call
+            # returns already carries its SMB ACL and a directory made right after inherits it.
+            permission_job = await self.middleware.call('pool.dataset.permission', data['id'], {
+                'acl': copy.deepcopy(SMB_DATASET_DEFAULT_ACL),
+            })
+            await permission_job.wait(raise_error=True)
 
         return await self.get_instance(data['id'])
 
@@ -3204,7 +3522,7 @@ class PoolDatasetService(CRUDService):
                 "msg": "method",
                 "method": "pool.dataset.update,
                 "params": ["tank/myuser", {
-                    "comments": "Dataset for myuser, UPDATE #1"
+                    "comments": "Dataset for myuser, UPDATE the internal development record"
                 }]
             }
         """
@@ -3302,7 +3620,7 @@ class PoolDatasetService(CRUDService):
                 # is set to readonly=on.
                 verrors.add(
                     f'{schema}.readonly',
-                    f'Turn off readonly mode on {parent["id"]} to create {data["name"].rsplit("/")[0]}'
+                    f'Turn off readonly mode on {parent["id"]} to create {data["name"]}'
                 )
 
         if data['type'] == 'FILESYSTEM':
@@ -3338,6 +3656,10 @@ class PoolDatasetService(CRUDService):
             ):
                 if i in data:
                     verrors.add(f'{schema}.{i}', 'This field is not valid for VOLUME')
+
+            # share_type defaults to GENERIC; SMB sets casesensitivity and aclmode, which libzfs refuses on a zvol
+            if data.get('share_type') == 'SMB':
+                verrors.add(f'{schema}.share_type', 'This field is not valid for VOLUME')
 
             if 'volsize' in data and parent:
 
@@ -3405,17 +3727,29 @@ class PoolDatasetService(CRUDService):
             }
         """
 
-        if not options['recursive'] and await self.middleware.call('zfs.dataset.query', [['id', '^', f'{id}/']]):
+        dataset = await self.get_instance(id)
+        if not options['recursive'] and dataset['children']:
             raise CallError(f'Failed to delete dataset: cannot destroy {id!r}: filesystem has children',
                             errno.ENOTEMPTY)
 
-        dataset = await self.get_instance(id)
+        # Deleted attachments are not put back if the destroy fails: refuse what ZFS or a delegate would refuse
+        # before deleting any of them.
+        await self.middleware.call('zfs.dataset.delete', id, {
+            'force': options['force'],
+            'recursive': options['recursive'],
+            'dry_run': True,
+        })
         path = self.__attachments_path(dataset)
+        to_delete = []
         if path:
             for delegate in self.attachment_delegates:
                 attachments = await delegate.query(path, True)
                 if attachments:
-                    await delegate.delete(attachments)
+                    await delegate.check_delete(attachments)
+                    to_delete.append((delegate, attachments))
+
+        for delegate, attachments in to_delete:
+            await delegate.delete(attachments)
 
         result = await self.middleware.call('zfs.dataset.delete', id, {
             'force': options['force'],
@@ -3502,36 +3836,7 @@ class PoolDatasetService(CRUDService):
                         ),
                     )
                 ],
-                default=[
-                    {
-                        "tag": "owner@",
-                        "id": None,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "FULL_CONTROL"},
-                        "flags": {"BASIC": "INHERIT"}
-                    },
-                    {
-                        "tag": "group@",
-                        "id": None,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "FULL_CONTROL"},
-                        "flags": {"BASIC": "INHERIT"}
-                    },
-                    {
-                        "tag": "GROUP",
-                        "id": 545,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "MODIFY"},
-                        "flags": {"BASIC": "INHERIT"}
-                    },
-                    {
-                        "tag": "everyone@",
-                        "id": None,
-                        "type": "ALLOW",
-                        "perms": {"BASIC": "TRAVERSE"},
-                        "flags": {"BASIC": "NOINHERIT"}
-                    },
-                ],
+                default=[],
             ),
             Dict(
                 'options',
@@ -3570,7 +3875,8 @@ class PoolDatasetService(CRUDService):
             }
 
         """
-        path = (await self.get_instance(id))['mountpoint']
+        dataset = await self.get_instance(id)
+        path = dataset['mountpoint']
         user = data.get('user', None)
         group = data.get('group', None)
         uid = gid = -1
@@ -3580,29 +3886,38 @@ class PoolDatasetService(CRUDService):
         pjob = None
 
         verrors = ValidationErrors()
+        if path is None:
+            # A zvol has no mountpoint, nor does an unmounted filesystem; every branch below needs a path
+            if dataset['type'] == 'VOLUME':
+                verrors.add('id', 'Permissions cannot be set on a VOLUME')
+            else:
+                verrors.add('id', f'{id} is not mounted')
+            raise verrors
+
         if user is not None:
+            # getpwnam() raises KeyError for an unknown name; an empty name returns {}
             try:
                 uid = (await self.middleware.call('dscache.get_uncached_user', user))['pw_uid']
-            except Exception as e:
-                verrors.add('pool_dataset_permission.user', str(e))
+            except KeyError:
+                verrors.add('pool_dataset_permission.user', f'Provided user "{user}" does not exist')
 
         if group is not None:
             try:
                 gid = (await self.middleware.call('dscache.get_uncached_group', group))['gr_gid']
-            except Exception as e:
-                verrors.add('pool_dataset_permission.group', str(e))
+            except KeyError:
+                verrors.add('pool_dataset_permission.group', f'Provided group "{group}" does not exist')
 
         if acl and mode:
             verrors.add('pool_dataset_permission.mode',
                         'setting mode and ACL simultaneously is not permitted.')
 
         if acl and options['stripacl']:
-            verrors.add('pool_dataset_permissions.acl',
+            verrors.add('pool_dataset_permission.acl',
                         'Simultaneously setting and removing ACL is not permitted.')
 
         if mode and not options['stripacl']:
             if not await self.middleware.call('filesystem.acl_is_trivial', path):
-                verrors.add('pool_dataset_permissions.options',
+                verrors.add('pool_dataset_permission.options',
                             f'{path} has an extended ACL. The option "stripacl" must be selected.')
 
         if verrors:

@@ -1,0 +1,51 @@
+{
+  "app": "code-server",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "code-server",
+  "comment": "code-server under the LinuxServer /config contract keeps settings, extensions and workspace state in one tree, which the Daemonless image shares. The Coder-official image splits state across ~/.config and ~/.local and is deliberately not claimed by this recipe -- it falls to the as-is lift. There is no FreeBSD package.",
+  "target": {
+    "catalog_id": "daemonless:code-server",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8080
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/code-server",
+        "ghcr.io/linuxserver/code-server",
+        "docker.io/linuxserver/code-server"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/code-server",
+        "tag_template": "version-v{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

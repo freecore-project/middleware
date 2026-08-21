@@ -1,0 +1,51 @@
+{
+  "app": "nocodb",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "NocoDB",
+  "comment": "NocoDB keeps its SQLite database and uploads in one data directory; the official image uses /usr/app/data and the Daemonless image reads the same tree from /config. External-database deployments keep their connection settings in the environment, which the plan carries as declared. There is no FreeBSD package; only a Linux source applies.",
+  "target": {
+    "catalog_id": "daemonless:nocodb",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8080
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "docker.io/nocodb/nocodb",
+        "nocodb/nocodb"
+      ],
+      "data": "/usr/app/data",
+      "uid": 0,
+      "export": {
+        "image": "docker.io/nocodb/nocodb",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 0
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

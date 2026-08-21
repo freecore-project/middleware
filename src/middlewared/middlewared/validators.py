@@ -23,7 +23,7 @@ class Email:
         if value is None or (self.empty and not value):
             return
         elif len(value) > self.max_path:
-            raise ValueError("Maximum length is {self.max_path} characters.")
+            raise ValueError(f"Maximum length is {self.max_path} characters.")
         else:
             right_most_atsign = value.rfind("@")
             if right_most_atsign == -1:
@@ -114,7 +114,10 @@ class Match:
         self.regex = re.compile(pattern, flags)
 
     def __call__(self, value):
-        if value is not None and not self.regex.match(value):
+        # `$` also matches just before a trailing newline, so a pattern anchored at the end must match the
+        # whole value ("027\n" does not pass "^[0-7]{3}$"). An unanchored pattern only has to match a prefix.
+        match = self.regex.fullmatch if self.pattern.endswith('$') else self.regex.match
+        if value is not None and not match(value):
             raise ValueError(self.explanation or f"Does not match {self.pattern}")
 
     def __deepcopy__(self, memo):
@@ -322,7 +325,9 @@ def validate_attributes(schema, data, additional_attrs=False, attr_key="attribut
     try:
         schema.validate(data[attr_key])
     except ValidationErrors as e:
-        verrors.extend(e)
+        # `Dict.validate` prefixes errors with the dict name, `clean` errors above are not
+        for error in e.errors:
+            verrors.add(error.attribute.removeprefix(f"{schema.name}."), error.errmsg, error.errno)
 
     return verrors
 

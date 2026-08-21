@@ -10,11 +10,16 @@
 # auth
 auth		sufficient	pam_rootok.so		no_warn
 auth		sufficient	pam_self.so		no_warn
-% if dsp.enabled() and dsp.name() != 'NIS':
+% if dsp.enabled() and dsp.name() not in ('NIS', 'ActiveDirectory'):
 ${dsp.pam_auth()}
 % endif
 #auth		sufficient	pam_krb5.so		no_warn try_first_pass
 auth		requisite	pam_group.so		no_warn group=wheel root_only ruser
+## the internal development record: the AD block starts with a sufficient pam_unix, so it comes after the wheel check;
+## before it, a non-wheel user who knows root's password would become root.
+% if dsp.enabled() and dsp.name() == 'ActiveDirectory':
+${dsp.pam_auth()}
+% endif
 auth		include		system
 
 # account

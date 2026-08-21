@@ -1,0 +1,11 @@
+# the internal development record: init(8) runs the installer on every console, not
+# only on the primary one, the way it runs logins: getty(8) opens the tty,
+# makes it the controlling terminal and, through the autologin entries in
+# /etc/gettytab, starts /etc/install-session.sh on it.  ttyv0 whenever a
+# display exists, ttyu0 whenever the serial port is a kernel console
+# (primary or secondary).  install.sh serialises the install itself.
+#
+# name	getty					type	status		comments
+console	none					unknown	off secure
+ttyv0	"/usr/libexec/getty installer"		xterm	onifexists secure
+ttyu0	"/usr/libexec/getty installer.serial"	vt100	onifconsole secure

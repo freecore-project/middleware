@@ -95,7 +95,7 @@ class WebDAVSharingService(SharingService):
         Update Webdav Share of `id`.
         """
 
-        old = await self.query(filters=[('id', '=', id)], options={'get': True})
+        old = await self.get_instance(id)
         new = old.copy()
 
         new.update(data)
@@ -129,8 +129,10 @@ class WebDAVSharingService(SharingService):
     )
     async def do_delete(self, id):
         """
-        Update Webdav Share of `id`.
+        Delete Webdav Share of `id`.
         """
+
+        await self.get_instance(id)
 
         response = await self.middleware.call(
             'datastore.delete',

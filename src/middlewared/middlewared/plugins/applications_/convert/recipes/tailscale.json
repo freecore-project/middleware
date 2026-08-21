@@ -1,0 +1,68 @@
+{
+  "app": "tailscale",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Tailscale",
+  "comment": "tailscaled's state directory (tailscaled.state with the node key and the machine's identity) carries as one tree; the Daemonless image runs tailscaled with --state=/config/tailscaled.state in userspace-networking mode, so the node keeps its identity but routes and exit-node advertisements are TS_EXTRA_ARGS on the application, and the jail's kernel tun is not carried. No port is published. Target ownership corrected 2026-09-29 (static re-validation against the current image contract): the image runs tailscaled as root and declares no PUID/PGID, so carried state stays root-owned.",
+  "target": {
+    "catalog_id": "daemonless:tailscale",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 0,
+    "gid": 0,
+    "port": null
+  },
+  "sources": {
+    "jail": {
+      "pkg": "tailscale",
+      "rc_script": "tailscaled",
+      "rc_data_var": "tailscaled_state_dir",
+      "detect": [
+        "usr/local/etc/rc.d/tailscaled"
+      ],
+      "data": "var/db/tailscale",
+      "uid": 0
+    },
+    "linux": {
+      "images": [
+        "docker.io/tailscale/tailscale",
+        "tailscale/tailscale"
+      ],
+      "data": "/var/lib/tailscale",
+      "uid": 0,
+      "export": {
+        "image": "docker.io/tailscale/tailscale",
+        "tag_template": "v{version}",
+        "user": "image",
+        "image_uid": 0,
+        "environment": {
+          "TS_STATE_DIR": "/var/lib/tailscale"
+        },
+        "drop": [
+          "network capabilities: the compose file cannot grant them; add cap_add NET_ADMIN and the /dev/net/tun device on the Linux host before the first start"
+        ]
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}
