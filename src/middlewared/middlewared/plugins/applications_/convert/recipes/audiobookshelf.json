@@ -1,0 +1,77 @@
+{
+  "app": "audiobookshelf",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Audiobookshelf",
+  "comment": "Audiobookshelf keeps its database and settings in /config and its covers and cached metadata in /metadata; the official Linux image and the Daemonless image share both mount points and names. /config is required; /metadata is optional (covers and caches rebuild, at the cost of a rescan). The audiobook library itself is an install-time media volume, never carried. There is no FreeBSD port, so only a Linux source applies. Multi-volume recipe (the internal development record).",
+  "target": {
+    "catalog_id": "daemonless:audiobookshelf",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 13378,
+    "volumes": {
+      "metadata": {
+        "uid": 1000,
+        "gid": 1000
+      }
+    }
+  },
+  "sources": {
+    "linux": {
+      "images": [
+        "ghcr.io/advplyr/audiobookshelf",
+        "docker.io/advplyr/audiobookshelf",
+        "advplyr/audiobookshelf"
+      ],
+      "data": "/config",
+      "uid": 0,
+      "paths": {
+        "metadata": "/metadata"
+      },
+      "export": {
+        "image": "ghcr.io/advplyr/audiobookshelf",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 0,
+        "environment": {
+          "CONFIG_PATH": "/config",
+          "METADATA_PATH": "/config"
+        },
+        "volumes": [
+          {
+            "from": "",
+            "target": "/config"
+          }
+        ]
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    },
+    {
+      "from": "{metadata}",
+      "to": "",
+      "volume": "metadata",
+      "optional": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

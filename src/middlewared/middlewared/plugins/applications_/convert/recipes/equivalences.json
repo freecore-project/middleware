@@ -1,0 +1,168 @@
+{
+  "schema": 1,
+  "comment": "Linux image reference patterns and the Daemonless application they correspond to (the internal development record). A match means the same upstream project has a native image; whether state can be carried is the recipe's business.",
+  "entries": [
+    {
+      "match": "docker.io/grafana/grafana",
+      "app": "grafana",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/grafana/grafana-oss",
+      "app": "grafana",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/grafana/grafana-enterprise",
+      "app": null,
+      "kind": "table",
+      "refuse": "Grafana Enterprise is a different edition"
+    },
+    {
+      "match": "docker.io/library/postgres",
+      "app": "postgres",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/library/mariadb",
+      "app": "mariadb",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/library/redis",
+      "app": "redis",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/jellyfin/jellyfin",
+      "app": "jellyfin",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/vaultwarden/server",
+      "app": "vaultwarden",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/louislam/uptime-kuma",
+      "app": "uptime-kuma",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/adguard/adguardhome",
+      "app": "adguardhome",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/library/traefik",
+      "app": "traefik",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/gitea/gitea",
+      "app": "gitea",
+      "kind": "table"
+    },
+    {
+      "match": "codeberg.org/forgejo/forgejo",
+      "app": "forgejo",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/plexinc/pms-docker",
+      "app": "plex",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/n8nio/n8n",
+      "app": "n8n",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/home-assistant/home-assistant",
+      "app": "home-assistant",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/paperless-ngx/paperless-ngx",
+      "app": "paperless-ngx",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/immich-app/immich-server",
+      "app": "immich-server",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/gethomepage/homepage",
+      "app": "homepage",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/tailscale/tailscale",
+      "app": "tailscale",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/cloudflare/cloudflared",
+      "app": "cloudflared",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/advplyr/audiobookshelf",
+      "app": "audiobookshelf",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/tautulli/tautulli",
+      "app": "tautulli",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/tautulli/tautulli",
+      "app": "tautulli",
+      "kind": "table"
+    },
+    {
+      "match": "docker.n8n.io/n8nio/n8n",
+      "app": "n8n",
+      "kind": "table"
+    },
+    {
+      "match": "ghcr.io/mealie-recipes/mealie",
+      "app": "mealie",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/nocodb/nocodb",
+      "app": "nocodb",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/library/haproxy",
+      "app": "haproxy",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/library/caddy",
+      "app": "caddy",
+      "kind": "table"
+    },
+    {
+      "match": "docker.io/valkey/valkey",
+      "app": "redis",
+      "kind": "table"
+    }
+  ],
+  "families": [
+    {
+      "id": "linuxserver",
+      "prefixes": [
+        "lscr.io/linuxserver/",
+        "ghcr.io/linuxserver/",
+        "docker.io/linuxserver/"
+      ],
+      "comment": "Same /config plus PUID/PGID/TZ contract as the Daemonless images; the repository name is the application name when the provider publishes one."
+    }
+  ]
+}

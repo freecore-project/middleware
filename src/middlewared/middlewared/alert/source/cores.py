@@ -10,7 +10,7 @@ class CoreFilesArePresentAlertClass(AlertClass):
     level = AlertLevel.WARNING
     title = "Core Files Found in System Database"
     text = ("The following system core files were found: %(corefiles)s. Please create a ticket at "
-            "https://ixsystems.atlassian.net/ and attach the relevant core files along with a system debug. "
+            "the FreeCORE issue tracker and attach the relevant core files along with a system debug. "
             "Once the core files have been archived and attached to the ticket, they may be removed "
             "by running the following command in shell: 'rm /var/db/system/cores/*'.")
 

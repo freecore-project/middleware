@@ -14,7 +14,7 @@ class BootService(Service, BootLoaderBase):
             with tempfile.TemporaryDirectory() as tmpdirname:
                 await run('mount', '-t', 'msdosfs', f'/dev/{dev}p1', tmpdirname, check=False)
                 os.makedirs(f'{tmpdirname}/efi/boot', exist_ok=True)
-                await run('cp', '/boot/boot1.efi', f'{tmpdirname}/efi/boot/BOOTx64.efi', check=False)
+                await run('cp', '/boot/loader.efi', f'{tmpdirname}/efi/boot/BOOTx64.efi', check=False)
                 await run('umount', tmpdirname, check=False)
         else:
             await run(

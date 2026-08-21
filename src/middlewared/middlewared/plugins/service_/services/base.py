@@ -29,6 +29,9 @@ class ServiceInterface:
     async def before_start(self):
         pass
 
+    async def before_enable(self):
+        pass
+
     async def after_start(self):
         pass
 

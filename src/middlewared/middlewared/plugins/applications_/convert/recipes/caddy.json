@@ -1,0 +1,102 @@
+{
+  "app": "caddy",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "Caddy",
+  "comment": "Caddy's state is the Caddyfile plus its XDG storage: data/ (ACME account and certificates -- carrying it avoids re-issuance and rate limits) and config/ (autosave.json). The FreeBSD rc script sets XDG under caddy_directory (default /var/db/caddy) with the Caddyfile at /usr/local/etc/caddy/Caddyfile and runs as root; the official Linux image uses /etc/caddy/Caddyfile, /data and /config; the Daemonless image sets XDG_CONFIG_HOME=/config (Caddyfile beside it) and XDG_DATA_HOME=/data. Site roots and log paths inside the carried Caddyfile name source locations and need editing. Multi-volume recipe (the internal development record); every source location is a named path because the two sources do not share one root.",
+  "target": {
+    "catalog_id": "daemonless:caddy",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 0,
+    "gid": 0,
+    "port": 443,
+    "volumes": {
+      "data": {
+        "uid": 0,
+        "gid": 0
+      }
+    }
+  },
+  "sources": {
+    "jail": {
+      "pkg": "caddy",
+      "rc_script": "caddy",
+      "detect": [
+        "usr/local/etc/rc.d/caddy"
+      ],
+      "data": "var/db/caddy",
+      "uid": 0,
+      "paths": {
+        "caddyfile": "usr/local/etc/caddy/Caddyfile",
+        "acme": "var/db/caddy/data",
+        "instance": "var/db/caddy/config"
+      }
+    },
+    "linux": {
+      "images": [
+        "docker.io/library/caddy",
+        "caddy"
+      ],
+      "data": "/config",
+      "uid": 0,
+      "paths": {
+        "caddyfile": "/etc/caddy/Caddyfile",
+        "acme": "/data",
+        "instance": "/config"
+      },
+      "export": {
+        "image": "docker.io/library/caddy",
+        "tag_template": "{version}",
+        "user": "image",
+        "image_uid": 0,
+        "volumes": [
+          {
+            "from": "Caddyfile",
+            "target": "/etc/caddy/Caddyfile"
+          },
+          {
+            "from": "",
+            "target": "/config",
+            "optional": true
+          }
+        ],
+        "drop": [
+          "ACME certificates and keys in the data volume: Caddy issues them again on the Linux host"
+        ]
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{caddyfile}",
+      "to": "Caddyfile",
+      "required": true
+    },
+    {
+      "from": "{acme}",
+      "to": "",
+      "volume": "data",
+      "optional": true
+    },
+    {
+      "from": "{instance}",
+      "to": "",
+      "optional": true
+    }
+  ],
+  "drop": [
+    "site roots and log files (paths inside the Caddyfile need editing)",
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "sidecar services"
+  ]
+}

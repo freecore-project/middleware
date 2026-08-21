@@ -46,7 +46,12 @@ class GeomCachedObjects:
 
     def get_xml(self, xml_class=None):
         if xml_class and xml_class in CLASSES:
-            return self.cache['xml'].find(f'.//class[name="{xml_class}"]')
+            result = self.cache['xml'].find(f'.//class[name="{xml_class}"]')
+            if result is None:
+                # Return an empty element so callers can safely use
+                # .iterfind()/.find()/.findall() without null checks.
+                return etree.Element('class')
+            return result
         elif not xml_class:
             return self.cache['xml']
 
@@ -60,12 +65,15 @@ class GeomCachedObjects:
         # make a copy of disk template
         disk = DISK_TEMPLATE.copy()
 
-        # sizes
+        # sizes — use defensive lookups in case GEOM XML fields change in FB15
+        mediasize = xmlelem.find('provider/mediasize')
+        sectorsize = xmlelem.find('provider/sectorsize')
+        stripesize = xmlelem.find('provider/stripesize')
         disk.update({
             'name': name,
-            'mediasize': int(xmlelem.find('provider/mediasize').text),
-            'sectorsize': int(xmlelem.find('provider/sectorsize').text),
-            'stripesize': int(xmlelem.find('provider/stripesize').text),
+            'mediasize': int(mediasize.text) if mediasize is not None and mediasize.text else 0,
+            'sectorsize': int(sectorsize.text) if sectorsize is not None and sectorsize.text else 512,
+            'stripesize': int(stripesize.text) if stripesize is not None and stripesize.text else 0,
         })
 
         if config := xmlelem.find('provider/config'):
@@ -122,10 +130,18 @@ class GeomCachedObjects:
     def fill_multipath_consumer_details(self, xmlelem, xml):
         children = []
         for i in xmlelem.findall('./consumer'):
-            consumer_status = i.find('./config/State').text
-            provref = i.find('./provider').attrib['ref']
-            prov = xml.findall(f'.//provider[@id="{provref}"]')[0]
-            da_name = prov.find('./name').text
+            state_elem = i.find('./config/State')
+            consumer_status = state_elem.text if state_elem is not None else 'UNKNOWN'
+            prov_elem = i.find('./provider')
+            if prov_elem is None:
+                continue
+            provref = prov_elem.attrib.get('ref', '')
+            provs = xml.findall(f'.//provider[@id="{provref}"]')
+            if not provs:
+                continue
+            prov = provs[0]
+            name_elem = prov.find('./name')
+            da_name = name_elem.text if name_elem is not None else ''
             try:
                 lun_id = prov.find('./config/lunid').text
             except Exception:
@@ -138,11 +154,13 @@ class GeomCachedObjects:
                 'lun_id': lun_id,
             })
 
-        multipath_name = 'multipath/' + xmlelem.find('./name').text
+        mp_name_elem = xmlelem.find('./name')
+        multipath_name = 'multipath/' + (mp_name_elem.text if mp_name_elem is not None else 'unknown')
+        state_elem = xmlelem.find('./config/State')
         info = {
             'type': 'root',
             'name': multipath_name,
-            'status': xmlelem.find('./config/State').text,
+            'status': state_elem.text if state_elem is not None else 'UNKNOWN',
             'children': children,
         }
 

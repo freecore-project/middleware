@@ -1,0 +1,62 @@
+{
+  "app": "sabnzbd",
+  "recipe_version": 1,
+  "kind": "generic",
+  "status": "draft",
+  "title": "SABnzbd",
+  "comment": "SABnzbd's configuration directory (sabnzbd.ini, admin/, logs/) carries as one tree; the Daemonless image runs it with --config-file /config/sabnzbd.ini and listens on 8080 regardless of the host/port inside the ini.",
+  "target": {
+    "catalog_id": "daemonless:sabnzbd",
+    "volume": "config",
+    "layout": {
+      "data": ""
+    },
+    "uid": 1000,
+    "gid": 1000,
+    "port": 8080
+  },
+  "sources": {
+    "jail": {
+      "pkg": "sabnzbd",
+      "rc_script": "sabnzbd",
+      "rc_data_var": "sabnzbd_conf_dir",
+      "detect": [
+        "usr/local/etc/rc.d/sabnzbd"
+      ],
+      "data": "usr/local/sabnzbd",
+      "uid": 350
+    },
+    "linux": {
+      "images": [
+        "lscr.io/linuxserver/sabnzbd",
+        "ghcr.io/linuxserver/sabnzbd",
+        "docker.io/linuxserver/sabnzbd"
+      ],
+      "data": "/config",
+      "uid": 1000,
+      "export": {
+        "image": "lscr.io/linuxserver/sabnzbd",
+        "tag_template": "version-{version}",
+        "user": "puid"
+      }
+    }
+  },
+  "config": {
+    "allow": [],
+    "deny": []
+  },
+  "carry": [
+    {
+      "from": "{data}",
+      "to": "",
+      "required": true
+    }
+  ],
+  "drop": [
+    "logs",
+    "cron entries",
+    "packages installed beside the application",
+    "TLS certificate files",
+    "sidecar services"
+  ]
+}

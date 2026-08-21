@@ -1,0 +1,2 @@
+Python Cython bindings for FreeBSD CAM, CTL, iSCSI, and NVMe subsystems.
+Used by TrueNAS middleware for disk/enclosure management and fenced.
