@@ -90,10 +90,6 @@ def smb_share(path, options=None):
         result = DELETE(f"/sharing/smb/id/{id}/")
         assert result.status_code == 200, result.text
 
-    assert results.status_code == 200, results.text
-    global next_uid
-    next_uid = results.json()
-
 
 def get_windows_sd(share, format="LOCAL", path="\\"):
     results = POST("/smb/get_remote_acl", {

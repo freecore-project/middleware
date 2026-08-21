@@ -1,5 +1,13 @@
 from middlewared.async_validators import check_path_resides_within_volume
 from middlewared.common.attachment import FSAttachmentDelegate
+from middlewared.plugins.vm_.arc import arc_max_reject_reason, effective_arc_min, minimum_valid_arc_max
+from middlewared.plugins.vm_.arch import (
+    ARCH_CHOICES, BHYVE, QEMU, arch_profile, device_rejection_reason, emulated_lane_reason,
+    hypervisor_for, is_emulated, normalize_arch,
+)
+from middlewared.plugins.vm_.bootloader import (
+    grub_bootloader_unsupported_reason, unsupported_bootloader_reason,
+)
 from middlewared.plugins.vm_.connection import LibvirtConnectionMixin
 from middlewared.schema import accepts, Error, Int, Str, Dict, List, Bool, Patch
 from middlewared.service import (
@@ -30,7 +38,6 @@ import psutil
 import random
 import re
 import stat
-import shutil
 import signal
 import subprocess
 import sys
@@ -38,8 +45,56 @@ try:
     import sysctl
 except ImportError:
     sysctl = None
-import time
 import threading
+import time
+
+
+def _sysctl_val(name):
+    """Read a sysctl value, falling back to subprocess if py-bsd unavailable."""
+    if sysctl is not None:
+        result = sysctl.filter(name)
+        return result[0].value if result else None
+    try:
+        r = subprocess.run(['/sbin/sysctl', '-n', name], capture_output=True, text=True, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                return int(r.stdout.strip())
+            except ValueError:
+                return r.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _sysctl_int(name):
+    value = _sysctl_val(name)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sysctl_set(name, value):
+    """Set a sysctl value, falling back to subprocess if py-bsd unavailable."""
+    if sysctl is not None:
+        sysctl.filter(name)[0].value = value
+        return
+    try:
+        r = subprocess.run(['/sbin/sysctl', f'{name}={value}'], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if r.returncode != 0:
+            raise OSError(errno.EINVAL, r.stderr.strip() or r.stdout.strip() or 'sysctl failed')
+
+
+def _arc_max_context():
+    all_memory = _sysctl_int('hw.physmem') or _sysctl_int('hw.realmem')
+    return {
+        'arc_min': _sysctl_int('vfs.zfs.arc.min'),
+        'arc_c_min': _sysctl_int('kstat.zfs.misc.arcstats.c_min'),
+        'all_memory': all_memory,
+    }
 
 from abc import ABC, abstractmethod
 from xml.etree import ElementTree as etree
@@ -61,6 +116,10 @@ ZFS_ARC_MAX_INITIAL = None
 ZVOL_CLONE_SUFFIX = '_clone'
 ZVOL_CLONE_RE = re.compile(rf'^(.*){ZVOL_CLONE_SUFFIX}\d+$')
 
+# The bridge iocage's product-default VNET jails use (`vnet0:bridge0`); Applications
+# reserve it empty for iocage (interface.reserve_jail_bridge).
+JAIL_BRIDGE = 'bridge0'
+
 
 def create_element(*args, **kwargs):
     attribute_dict = kwargs.pop('attribute_dict', {})
@@ -70,6 +129,16 @@ def create_element(*args, **kwargs):
     for child in attribute_dict.get('children', []):
         element.append(child)
     return element
+
+
+def qemu_disk_target(prefix, index):
+    """vda, vdb, ... vdz, vdaa: the names libvirt's QEMU driver validates."""
+    letters = ''
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord('a') + remainder) + letters
+    return f'{prefix}{letters}'
 
 
 class DomainState(enum.Enum):
@@ -86,10 +155,18 @@ class DomainState(enum.Enum):
 class VMSupervisor(LibvirtConnectionMixin):
 
     def __init__(self, vm_data, middleware=None):
+        if reason := unsupported_bootloader_reason(vm_data.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
+
+        # amd64 is the host's own architecture and runs on bhyve; anything else is
+        # emulated by QEMU through libvirt's second driver.  the internal development record
+        self.arch = normalize_arch(vm_data.get('arch'))
+        self.hypervisor = hypervisor_for(self.arch)
         self.vm_data = vm_data
         self.middleware = middleware
         self.devices = []
         self._check_setup_connection()
+        self.conn = self._connection_for(self.hypervisor)
 
         self.libvirt_domain_name = f'{self.vm_data["id"]}_{self.vm_data["name"]}'
         self.domain = self.stop_devices_thread = None
@@ -100,7 +177,7 @@ class VMSupervisor(LibvirtConnectionMixin):
         if update_devices:
             self.update_vm_data(vm_data)
         try:
-            self.domain = self.LIBVIRT_CONNECTION.lookupByName(self.libvirt_domain_name)
+            self.domain = self.conn.lookupByName(self.libvirt_domain_name)
         except libvirt.libvirtError:
             self.domain = None
         else:
@@ -116,32 +193,50 @@ class VMSupervisor(LibvirtConnectionMixin):
 
     def status(self):
         domain = self.domain
+        active = domain.isActive()
         return {
-            'state': 'STOPPED' if not domain.isActive() else 'RUNNING',
-            'pid': None if not domain.isActive() else self.domain.ID(),
+            'state': 'STOPPED' if not active else 'RUNNING',
+            'pid': self.host_pid() if active else None,
             'domain_state': DomainState(domain.state()[0]).name,
         }
+
+    def host_pid(self):
+        # The real OS pid of the process backing the guest, which every consumer of
+        # status()['pid'] wants (dashboard guest usage, the overcommit accounting in
+        # vm.get_available_memory). libvirt's bhyve driver uses the bhyve process pid
+        # as the domain id, so ID() is already the pid; the QEMU driver assigns a
+        # sequential domain id and records the real pid in its per-domain pidfile.
+        # the internal development record
+        if self.hypervisor == QEMU:
+            try:
+                with open(f'/var/run/libvirt/qemu/{self.libvirt_domain_name}.pid') as f:
+                    return int(f.read().strip())
+            except (OSError, ValueError):
+                return None
+        return self.domain.ID()
 
     def __define_domain(self):
         if self.domain:
             raise CallError(f'{self.libvirt_domain_name} domain has already been defined')
 
         vm_xml = etree.tostring(self.construct_xml()).decode()
-        if not self.LIBVIRT_CONNECTION.defineXML(vm_xml):
+        if not self.conn.defineXML(vm_xml):
             raise CallError(f'Unable to define persistent domain for {self.libvirt_domain_name}')
 
-        self.domain = self.LIBVIRT_CONNECTION.lookupByName(self.libvirt_domain_name)
+        self.domain = self.conn.lookupByName(self.libvirt_domain_name)
 
-    def undefine_domain(self):
+    def undefine_domain(self, remove_nvram=False):
         if self.domain.isActive():
             raise CallError(f'Domain {self.libvirt_domain_name} is active. Please stop it first')
 
-        if self.vm_data['bootloader'] == 'GRUB':
-            shutil.rmtree(
-                os.path.join('/tmp/grub', self.libvirt_domain_name), ignore_errors=True
+        if self.hypervisor == QEMU:
+            # A QEMU domain owns a per-VM firmware variable store and libvirt refuses a
+            # bare undefine while it exists: redefining keeps it, deleting the VM drops it.
+            self.domain.undefineFlags(
+                libvirt.VIR_DOMAIN_UNDEFINE_NVRAM if remove_nvram else libvirt.VIR_DOMAIN_UNDEFINE_KEEP_NVRAM
             )
-
-        self.domain.undefine()
+        else:
+            self.domain.undefine()
         self.domain = None
 
     def __getattribute__(self, item):
@@ -174,16 +269,6 @@ class VMSupervisor(LibvirtConnectionMixin):
                 f'VM will not start as {", ".join([str(d) for d in unavailable_devices])} device(s) are not available.'
             )
 
-        # Let's ensure that we are able to boot a GRUB based VM
-        if self.vm_data['bootloader'] == 'GRUB':
-            if not any(isinstance(d, RAW) and d.data['attributes'].get('boot') for d in self.devices):
-                raise CallError(f'Unable to find boot devices for {self.libvirt_domain_name!r} domain')
-            grub_config = (self.vm_data['grubconfig'] or '').strip()
-            if grub_config.startswith('/mnt') and not os.path.exists(grub_config):
-                raise CallError(
-                    f'Unable to locate {grub_config!r} grubconfig path for {self.libvirt_domain_name!r} domain'
-                )
-
         if len([d for d in self.devices if isinstance(d, VNC)]) > 1:
             raise CallError('Only one VNC device per VM is supported')
 
@@ -209,6 +294,8 @@ class VMSupervisor(LibvirtConnectionMixin):
             raise CallError('\n'.join(errors))
 
         try:
+            if self.hypervisor == QEMU:
+                self.prepare_console_device()
             self.update_domain(vm_data, update_devices=False)
             if self.domain.create() < 0:
                 raise CallError(f'Failed to boot {self.vm_data["name"]} domain')
@@ -292,7 +379,23 @@ class VMSupervisor(LibvirtConnectionMixin):
             if not self.destroy_vm_context():
                 raise
 
+    def console_master_path(self):
+        return f'/dev/nmdm{self.vm_data["id"]}A'
+
+    def prepare_console_device(self):
+        # nmdm(4) creates a pair on first open.  bhyve opens the A side itself; QEMU is
+        # handed the path by libvirt, which wants it to exist before the guest starts.
+        path = self.console_master_path()
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as e:
+            raise CallError(f'Failed to prepare console device {path}: {e}')
+        os.close(fd)
+
     def destroy_vm_context(self):
+        if self.hypervisor != BHYVE:
+            # The workaround below recreates a bhyve VM context; a QEMU domain has none.
+            return False
         # There is a race condition where poweroff/shutdown fail sometimes in libvirt which results in it trying
         # to destroy a VM whose context does not exist resulting in user having to reboot their machines in order
         # to get the VM back.
@@ -333,6 +436,8 @@ class VMSupervisor(LibvirtConnectionMixin):
         return None
 
     def construct_xml(self):
+        if self.hypervisor == QEMU:
+            return self.construct_qemu_xml()
         domain_children = [
             create_element('name', attribute_dict={'text': self.libvirt_domain_name}),
             create_element('title', attribute_dict={'text': self.vm_data['name']}),
@@ -395,6 +500,99 @@ class VMSupervisor(LibvirtConnectionMixin):
             attribute_dict={'children': domain_children}, nsmap=LIBVIRT_BHYVE_NSMAP,
         )
 
+    def construct_qemu_xml(self):
+        # The emulated lane: one libvirt domain of type qemu, run by the emulator for
+        # the guest architecture on its "virt" machine, TCG only.  No bhyve namespace,
+        # no hand-rolled PCI slots (the machine is PCIe and libvirt assigns addresses),
+        # no msrs feature (bhyve only).  the internal development record
+        profile = arch_profile(self.arch)
+        features = []
+        if profile.get('acpi'):
+            features.append(create_element('acpi'))
+        if profile.get('gic'):
+            features.append(create_element('gic', version=profile['gic']))
+        domain_children = [
+            create_element('name', attribute_dict={'text': self.libvirt_domain_name}),
+            create_element('title', attribute_dict={'text': self.vm_data['name']}),
+            create_element('description', attribute_dict={'text': self.vm_data['description']}),
+            *self.qemu_os_xml(profile),
+            create_element('vcpu', attribute_dict={
+                'text': str(self.vm_data['vcpus'] * self.vm_data['cores'] * self.vm_data['threads'])
+            }),
+            # mode=maximum is -cpu max: every feature TCG can emulate for this target.
+            create_element(
+                'cpu', mode='maximum', attribute_dict={
+                    'children': [
+                        create_element(
+                            'topology', sockets=str(self.vm_data['vcpus']), cores=str(self.vm_data['cores']),
+                            threads=str(self.vm_data['threads'])
+                        )
+                    ]
+                }
+            ),
+            create_element('memory', unit='M', attribute_dict={'text': str(self.vm_data['memory'])}),
+            *([create_element('features', attribute_dict={'children': features})] if features else []),
+            create_element('clock', offset='localtime' if self.vm_data['time'] == 'LOCAL' else 'utc'),
+            self.qemu_devices_xml(profile),
+        ]
+        return create_element(
+            'domain', type='qemu', id=str(self.vm_data['id']), attribute_dict={'children': domain_children},
+        )
+
+    def nvram_path(self):
+        # Keyed by id, not name, so a rename keeps the guest's UEFI variables.
+        return f'/var/lib/libvirt/qemu/nvram/vm{self.vm_data["id"]}_VARS.fd'
+
+    def qemu_os_xml(self, profile):
+        children = [
+            create_element('type', arch=self.arch, machine=profile['machine'], attribute_dict={'text': 'hvm'}),
+            create_element('loader', readonly='yes', type='pflash', attribute_dict={'text': profile['loader']}),
+            create_element(
+                'nvram', template=profile['nvram_template'], attribute_dict={'text': self.nvram_path()},
+            ),
+        ]
+        return [create_element('os', attribute_dict={'children': children})]
+
+    def qemu_devices_xml(self, profile):
+        devices = [create_element('emulator', attribute_dict={'text': profile['emulator']})]
+        disk_index = cdrom_index = boot_order = 0
+        needs_scsi = needs_usb = False
+        # Devices arrive sorted by their order attribute, so a CD-ROM (default order
+        # 1000) boots ahead of the disks (1001) exactly as the bhyve lane's firmware does.
+        for device in self.devices:
+            if isinstance(device, (DISK, RAW)):
+                boot_order += 1
+                devices.append(device.qemu_xml(target=qemu_disk_target('vd', disk_index), boot_order=boot_order))
+                disk_index += 1
+            elif isinstance(device, CDROM):
+                boot_order += 1
+                needs_scsi = True
+                devices.append(device.qemu_xml(target=qemu_disk_target('sd', cdrom_index), boot_order=boot_order))
+                cdrom_index += 1
+            elif isinstance(device, NIC):
+                devices.append(device.qemu_xml())
+            elif isinstance(device, VNC):
+                needs_usb = True
+                devices.extend(device.qemu_xml())
+            # PCI passthrough is refused for emulated guests at validation time.
+        if needs_scsi:
+            devices.append(create_element('controller', type='scsi', model='virtio-scsi'))
+        if needs_usb:
+            devices.append(create_element('controller', type='usb', model='qemu-xhci'))
+        # The same nmdm pair the bhyve lane uses, so vm.get_console and the serial
+        # shell (cu -l nmdm<id>B) work unchanged.
+        devices.append(
+            create_element(
+                'serial', type='dev', attribute_dict={
+                    'children': [
+                        create_element('source', path=self.console_master_path()),
+                        create_element('target', port='0'),
+                    ]
+                }
+            )
+        )
+        return create_element('devices', attribute_dict={'children': devices})
+
     def commandline_xml(self):
         commandline_args = self.commandline_args()
         return [create_element(
@@ -417,57 +615,14 @@ class VMSupervisor(LibvirtConnectionMixin):
     def os_xml(self):
         os_list = []
         children = [create_element('type', attribute_dict={'text': 'hvm'})]
-        if self.vm_data['bootloader'] in ('UEFI', 'UEFI_CSM'):
+        if self.vm_data['bootloader'] == 'UEFI':
             children.append(
                 create_element(
                     'loader', attribute_dict={
-                        'text': '/usr/local/share/uefi-firmware/BHYVE_UEFI'
-                        f'{"_CSM" if self.vm_data["bootloader"] == "UEFI_CSM" else ""}.fd'
+                        'text': '/usr/local/share/uefi-firmware/BHYVE_UEFI.fd'
                     }, readonly='yes', type='pflash',
                 ),
             )
-
-        if self.vm_data['bootloader'] == 'GRUB':
-            # Following is keeping compatibility with old code where we supported rancher/docker
-            # We can have two cases where the user has the path set pointing to his/her grub file or where
-            # the data inside grubconfig is saved and we write out a new file for it
-            # In either of these cases we require device map file to be written
-
-            device_map_data = '\n'.join(
-                f'(hd{i}) {d.data["attributes"]["path"]}' for i, d in enumerate(filter(
-                    lambda d: isinstance(d, RAW) and d.data['attributes'].get('boot'), self.devices
-                ))
-            )
-            # It will be ensured while starting that this VM is capable of starting i.e has boot devices
-
-            os_list.append(create_element(
-                'bootloader', attribute_dict={'text': '/usr/local/sbin/grub-bhyve'}
-            ))
-
-            device_map_dir = os.path.join('/tmp/grub', self.libvirt_domain_name)
-            device_map_file = os.path.join(device_map_dir, 'devices_map')
-            os.makedirs(device_map_dir, exist_ok=True)
-
-            with open(device_map_file, 'w') as f:
-                f.write(device_map_data)
-
-            if self.vm_data['grubconfig']:
-                grub_config = self.vm_data['grubconfig'].strip()
-                if grub_config.startswith('/mnt'):
-                    grub_dir = os.path.dirname(grub_config)
-                else:
-                    grub_dir = device_map_dir
-                    with open(os.path.join(grub_dir, 'grub.cfg'), 'w') as f:
-                        f.write(grub_config)
-
-                os_list.append(create_element(
-                    'bootloader_args', attribute_dict={
-                        'text': ' '.join([
-                            '-m', device_map_file, '-r', 'host', '-M', str(self.vm_data['memory']),
-                            '-d', grub_dir, self.libvirt_domain_name
-                        ])
-                    }
-                ))
 
         os_list.append(create_element('os', attribute_dict={'children': children}))
 
@@ -477,13 +632,35 @@ class VMSupervisor(LibvirtConnectionMixin):
         devices = []
         pci_slot = Nid(3)
         controller_index = Nid(1)
+        # libvirt adds an implicit controller for every index gap below the highest one a
+        # disk references, per controller type; NVMe controllers count from 0 on their own
+        # so that no empty nvme emulation is added.  the internal development record
+        nvme_index = Nid(0)
         controller_base = {'index': None, 'slot': None, 'function': 0, 'devices': 0}
         ahci_current_controller = controller_base.copy()
         virtio_current_controller = controller_base.copy()
         ppt_maps = []
 
         for device in self.devices:
-            if isinstance(device, (DISK, CDROM, RAW)):
+            if isinstance(device, (DISK, RAW)) and device.data['attributes'].get('type') == 'NVME':
+                # the internal development record: libvirt's bhyve driver renders one nvme emulation per
+                # <controller type='nvme'> at function 0 of the controller's slot, so every NVMe
+                # disk is its own controller on its own slot; the AHCI/VirtIO layout below is untouched.
+                index = nvme_index()
+                devices.append(create_element(
+                    'controller', type='nvme', index=str(index), attribute_dict={
+                        'children': [
+                            create_element('address', type='pci', slot=str(pci_slot()), function='0'),
+                        ]
+                    }
+                ))
+                device_xml = device.xml(
+                    child_element=create_element(
+                        'address', type='drive', controller=str(index), bus='0', target='0', unit='0',
+                    ),
+                    nvme_controller=index,
+                )
+            elif isinstance(device, (DISK, CDROM, RAW)):
                 # We classify all devices in 2 types:
                 # 1) AHCI
                 # 2) VIRTIO
@@ -562,7 +739,7 @@ class VMSupervisor(LibvirtConnectionMixin):
                     }
 
                 device_xml = device.xml(child_element=create_element('address', **address_dict))
-            elif isinstance(device, NIC):
+            elif isinstance(device, (NIC, FILESYSTEM)):
                 device_xml = device.xml(slot=pci_slot())
             elif isinstance(device, PCI):
                 # PCI passthru section begins here
@@ -628,6 +805,9 @@ class Device(ABC):
     def bhyve_args(self, *args, **kwargs):
         pass
 
+    def qemu_xml(self, *args, **kwargs):
+        raise NotImplementedError(f'{self.__class__.__name__} devices are not available to emulated guests')
+
     def __str__(self):
         return f'{self.__class__.__name__} Device: {self.identity()}'
 
@@ -643,9 +823,20 @@ class StorageDevice(Device):
     def is_available(self):
         return os.path.exists(self.identity())
 
+    # target bus and device-name prefix per disk mode; the drive address comes from devices_xml()
+    TARGETS = {'AHCI': ('sata', 'hdc'), 'VIRTIO': ('virtio', 'vdb')}
+
     def xml(self, *args, **kwargs):
         child_element = kwargs.pop('child_element')
-        virtio = self.data['attributes']['type'] == 'VIRTIO'
+        mode = self.data['attributes'].get('type') or 'AHCI'
+        if mode == 'NVME':
+            # libvirt's bhyve driver reads the controller out of the name (nvme<ctrl>n<namespace>)
+            # and allows one disk per controller, so the name carries the controller devices_xml()
+            # created for this disk.  the internal development record
+            bus, dev = 'nvme', f'nvme{kwargs["nvme_controller"]}n1'
+        else:
+            bus, prefix = self.TARGETS[mode]
+            dev = f'{prefix}{self.data["id"]}'
         logical_sectorsize = self.data['attributes']['logical_sectorsize']
         physical_sectorsize = self.data['attributes']['physical_sectorsize']
 
@@ -653,11 +844,29 @@ class StorageDevice(Device):
             'disk', type='file', device='disk', attribute_dict={
                 'children': [
                     create_element('source', file=self.data['attributes']['path']),
-                    create_element(
-                        'target', bus='sata' if not virtio else 'virtio',
-                        dev=f'{"hdc" if not virtio else "vdb"}{self.data["id"]}'
-                    ),
+                    create_element('target', bus=bus, dev=dev),
                     child_element,
+                    *([] if not logical_sectorsize else [create_element(
+                        'blockio', logical_block_size=str(logical_sectorsize), **({} if not physical_sectorsize else {
+                            'physical_block_size': str(physical_sectorsize)
+                        })
+                    )]),
+                ]
+            }
+        )
+
+    def qemu_xml(self, *args, **kwargs):
+        path = self.data['attributes']['path']
+        block = path.startswith('/dev/')
+        logical_sectorsize = self.data['attributes']['logical_sectorsize']
+        physical_sectorsize = self.data['attributes']['physical_sectorsize']
+        return create_element(
+            'disk', type='block' if block else 'file', device='disk', attribute_dict={
+                'children': [
+                    create_element('driver', name='qemu', type='raw'),
+                    create_element('source', **({'dev': path} if block else {'file': path})),
+                    create_element('target', dev=kwargs['target'], bus='virtio'),
+                    create_element('boot', order=str(kwargs['boot_order'])),
                     *([] if not logical_sectorsize else [create_element(
                         'blockio', logical_block_size=str(logical_sectorsize), **({} if not physical_sectorsize else {
                             'physical_block_size': str(physical_sectorsize)
@@ -673,7 +882,7 @@ class DISK(StorageDevice):
     schema = Dict(
         'attributes',
         Str('path'),
-        Str('type', enum=['AHCI', 'VIRTIO'], default='AHCI'),
+        Str('type', enum=['AHCI', 'VIRTIO', 'NVME'], default='AHCI'),
         Bool('create_zvol'),
         Str('zvol_name'),
         Int('zvol_volsize'),
@@ -708,19 +917,67 @@ class CDROM(Device):
             }
         )
 
+    def qemu_xml(self, *args, **kwargs):
+        # The virt machine has no SATA; optical media rides a virtio-scsi controller.
+        return create_element(
+            'disk', type='file', device='cdrom', attribute_dict={
+                'children': [
+                    create_element('driver', name='qemu', type='raw'),
+                    create_element('source', file=self.data['attributes']['path']),
+                    create_element('target', dev=kwargs['target'], bus='scsi'),
+                    create_element('readonly'),
+                    create_element('boot', order=str(kwargs['boot_order'])),
+                ]
+            }
+        )
+
 
 class RAW(StorageDevice):
 
     schema = Dict(
         'attributes',
         Str('path', required=True),
-        Str('type', enum=['AHCI', 'VIRTIO'], default='AHCI'),
+        Str('type', enum=['AHCI', 'VIRTIO', 'NVME'], default='AHCI'),
         Bool('exists'),
         Bool('boot', default=False),
         Int('size', default=None, null=True),
         Int('logical_sectorsize', enum=[None, 512, 4096], default=None, null=True),
         Int('physical_sectorsize', enum=[None, 512, 4096], default=None, null=True),
     )
+
+
+class FILESYSTEM(Device):
+    """A host directory shared into a bhyve guest over virtio-9p (the internal development record).
+
+    libvirt renders `<filesystem type='mount' accessmode='passthrough'>` as
+    `-s <slot>:<fn>,virtio-9p,<tag>=<source>[,ro]`; the guest mounts it by the tag
+    (`mount -t p9fs <tag> /mnt` on FreeBSD, `mount -t 9p -o trans=virtio <tag> /mnt` on Linux).
+    """
+
+    schema = Dict(
+        'attributes',
+        Str('source', required=True, empty=False),
+        Str('tag', required=True, validators=[Match(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')]),
+        Bool('readonly', default=False),
+    )
+
+    def identity(self):
+        return self.data['attributes']['source']
+
+    def is_available(self):
+        return os.path.isdir(self.identity())
+
+    def xml(self, *args, **kwargs):
+        return create_element(
+            'filesystem', type='mount', accessmode='passthrough', attribute_dict={
+                'children': [
+                    create_element('source', dir=self.data['attributes']['source']),
+                    create_element('target', dir=self.data['attributes']['tag']),
+                    *([create_element('readonly')] if self.data['attributes'].get('readonly') else []),
+                    create_element('address', type='pci', slot=str(kwargs['slot']), function='0'),
+                ]
+            }
+        )
 
 
 class PCI(Device):
@@ -806,13 +1063,11 @@ class NIC(Device):
         self.bridge = self.bridge_created = None
 
     def identity(self):
-        nic_attach = self.data['attributes'].get('nic_attach')
-        if not nic_attach:
-            nic_attach = netif.RoutingTable().default_route_ipv4.interface
-        return nic_attach
+        return self.data['attributes'].get('nic_attach')
 
     def is_available(self):
-        return self.identity() in netif.list_interfaces()
+        nic_attach = self.identity()
+        return bool(nic_attach) and nic_attach in netif.list_interfaces()
 
     @staticmethod
     def random_mac():
@@ -823,21 +1078,20 @@ class NIC(Device):
 
     def pre_start_vm(self, *args, **kwargs):
         nic_attach = self.data['attributes'].get('nic_attach')
+        if not nic_attach:
+            raise CallError(
+                'VM NIC device requires nic_attach to be set explicitly. Falling back '
+                'to the host default route interface silently bridges the management '
+                'NIC into the VM bridge and breaches VLAN isolation.'
+            )
         interfaces = netif.list_interfaces()
         bridge = None
-        if nic_attach and nic_attach not in interfaces:
+        if nic_attach not in interfaces:
             raise CallError(f'{nic_attach} not found.')
-        elif nic_attach and nic_attach.startswith('bridge'):
+        elif nic_attach.startswith('bridge'):
             bridge = interfaces[nic_attach]
         else:
-            if not nic_attach:
-                try:
-                    nic_attach = netif.RoutingTable().default_route_ipv4.interface
-                    nic = netif.get_interface(nic_attach)
-                except Exception as e:
-                    raise CallError(f'Unable to retrieve default interface: {e}')
-            else:
-                nic = netif.get_interface(nic_attach)
+            nic = netif.get_interface(nic_attach)
 
             if netif.InterfaceFlags.UP not in nic.flags:
                 nic.up()
@@ -848,14 +1102,49 @@ class NIC(Device):
                     bridge = interfaces[iface]
                     break
             else:
-                bridge = netif.get_interface(netif.create_interface('bridge'))
-                bridge.add_member(nic_attach)
-                self.bridge_created = True
+                claimed = self.claim_jail_bridge(nic_attach)
+                if claimed:
+                    bridge = netif.get_interface(claimed)
+                else:
+                    bridge = netif.get_interface(netif.create_interface('bridge'))
+                    bridge.add_member(nic_attach)
+                    self.bridge_created = True
 
         if netif.InterfaceFlags.UP not in bridge.flags:
             bridge.up()
 
         self.bridge = bridge.name
+
+    def claim_jail_bridge(self, nic_attach):
+        """Put iocage's own uplink on the jail bridge instead of a new one (the internal development record).
+
+        13.3 created the lowest free bridge here, which was bridge0 until something else had
+        claimed it, so a VM and the product-default DHCP VNET jails (`vnet_default_interface=auto`,
+        `vnet0:bridge0`) shared the uplink in either start order. On 15.1 Applications reserve
+        bridge0 empty for iocage (#365), so the create lands on bridge1; iocage's later
+        `ifconfig bridge0 addm <uplink>` then fails silently (an interface joins one bridge) and
+        the jail starts on a bridge without the uplink: "Acquiring DHCP address: FAILED".
+
+        Only the interface iocage itself would add -- the IPv4 default-route interface, else the
+        IPv6 one -- claims bridge0, through interface.ensure_jail_bridge as LAN-attached
+        applications do (#483). A VM on any other interface keeps a bridge of its own, so it never
+        brings a second network onto the jail bridge. Returns None (the 13.3 create above) when
+        the uplink is not iocage's or the jail bridge already carries another host interface.
+        The claimed bridge is shared runtime state, so the rollback never destroys it.
+        """
+        try:
+            routing_table = netif.RoutingTable()
+            default_route = routing_table.default_route_ipv4 or routing_table.default_route_ipv6
+        except Exception:
+            default_route = None
+        if default_route is None or default_route.interface != nic_attach:
+            return None
+        try:
+            return self.middleware.call_sync('interface.ensure_jail_bridge', nic_attach, JAIL_BRIDGE)
+        except Exception as e:
+            # Never a reason for the VM not to start: fall back to the bridge 13.3 would create.
+            logger.warning('VM NIC on %r keeps a bridge of its own: %s', nic_attach, e)
+            return None
 
     def pre_start_vm_rollback(self, *args, **kwargs):
         if self.bridge_created and self.bridge in netif.list_interfaces():
@@ -873,6 +1162,20 @@ class NIC(Device):
                         self.data['attributes'].get('mac') else self.random_mac()
                     ),
                     create_element('address', type='pci', slot=str(kwargs['slot'])),
+                ]
+            }
+        )
+
+    def qemu_xml(self, *args, **kwargs):
+        return create_element(
+            'interface', type='bridge', attribute_dict={
+                'children': [
+                    create_element('source', bridge=self.bridge or ''),
+                    create_element('model', type='virtio'),
+                    create_element(
+                        'mac', address=self.data['attributes']['mac'] if
+                        self.data['attributes'].get('mac') else self.random_mac()
+                    ),
                 ]
             }
         )
@@ -912,6 +1215,28 @@ class VNC(Device):
             }
         ), create_element('input', type='tablet', bus='usb')
 
+    def qemu_xml(self, *args, **kwargs):
+        # QEMU's own VNC server replaces bhyve's fbuf; websockify in post_start_vm
+        # fronts it exactly as before.  'wait' has no QEMU equivalent and is refused
+        # for emulated guests at validation time.
+        attrs = self.data['attributes']
+        width, height = (attrs.get('vnc_resolution') or '1024x768').split('x')
+        graphics = {'type': 'vnc', 'port': str(attrs['vnc_port']), 'autoport': 'no', 'listen': attrs['vnc_bind']}
+        if attrs.get('vnc_password'):
+            graphics['passwd'] = attrs['vnc_password']
+        return (
+            create_element('graphics', **graphics),
+            create_element('video', attribute_dict={
+                'children': [
+                    create_element('model', type='virtio', attribute_dict={
+                        'children': [create_element('resolution', x=width, y=height)]
+                    }),
+                ]
+            }),
+            create_element('input', type='tablet', bus='usb'),
+            create_element('input', type='keyboard', bus='usb'),
+        )
+
     def bhyve_args(self, *args, **kwargs):
         attrs = self.data['attributes']
         width, height = (attrs.get('vnc_resolution') or '1024x768').split('x')
@@ -932,6 +1257,16 @@ class VNC(Device):
         split_port = int(str(vnc_port)[:2]) - 1
         return int(str(split_port) + str(vnc_port)[2:])
 
+    # A wildcard is a valid address to *listen* on and never a valid address to
+    # *connect* to. FreeBSD 13.3 quietly substituted a local address when asked
+    # to connect to one; FreeBSD 15 returns ENETUNREACH, which websockify only
+    # reports to the browser as a 1011 close.
+    WILDCARD_DIAL_TARGETS = {'0.0.0.0': '127.0.0.1', '::': '::1'}
+
+    @classmethod
+    def get_vnc_dial_target(cls, vnc_bind, vnc_port):
+        return f'{cls.WILDCARD_DIAL_TARGETS.get(vnc_bind, vnc_bind)}:{vnc_port}'
+
     def post_start_vm(self, *args, **kwargs):
         vnc_port = self.data['attributes']['vnc_port']
         vnc_bind = self.data['attributes']['vnc_bind']
@@ -940,8 +1275,9 @@ class VNC(Device):
         web_bind = f':{vnc_web_port}' if vnc_bind == '0.0.0.0' else f'{vnc_bind}:{vnc_web_port}'
         self.web_process = subprocess.Popen(
             [
-                '/usr/local/libexec/novnc/utils/websockify/run', '--web',
-                '/usr/local/libexec/novnc/', '--wrap-mode=ignore', web_bind, f'{vnc_bind}:{vnc_port}'
+                '/usr/local/bin/websockify', '--web',
+                '/usr/local/libexec/novnc/', '--wrap-mode=ignore', web_bind,
+                self.get_vnc_dial_target(vnc_bind, vnc_port)
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
@@ -964,11 +1300,11 @@ class VMModel(sa.Model):
     memory = sa.Column(sa.Integer())
     autostart = sa.Column(sa.Boolean(), default=False)
     time = sa.Column(sa.String(5), default='LOCAL')
-    grubconfig = sa.Column(sa.Text(), nullable=True)
     bootloader = sa.Column(sa.String(50), default='UEFI')
     cores = sa.Column(sa.Integer(), default=1)
     threads = sa.Column(sa.Integer(), default=1)
     shutdown_timeout = sa.Column(sa.Integer(), default=90)
+    arch = sa.Column(sa.String(20), default='amd64')
 
 
 class VMDeviceModel(sa.Model):
@@ -993,26 +1329,47 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         self.vms = {}
 
     @accepts()
+    def grub_inventory(self):
+        """
+        Return the minimal read-only tombstone inventory for stored GRUB VM records.
+
+        This deliberately reads the datastore rather than initializing a VM or inspecting guest
+        storage. Update admission exposes only these bounded identifiers, never `grubconfig`.
+        """
+        vms = sorted([
+            {'id': vm.get('id'), 'name': vm.get('name')}
+            for vm in self.middleware.call_sync('datastore.query', 'vm.vm')
+            if grub_bootloader_unsupported_reason(vm.get('bootloader'))
+        ], key=lambda vm: vm.get('id') or 0)
+
+        return {
+            'count': len(vms),
+            'removal_safe': not vms,
+            'vms': vms[:20],
+            'omitted_count': max(0, len(vms) - 20),
+        }
+
+    @accepts()
     def flags(self):
         """Returns a dictionary with CPU flags for bhyve."""
         data = {}
-        intel = True if 'Intel' in sysctl.filter('hw.model')[0].value else \
-            False
+        hw_model = _sysctl_val('hw.model')
+        intel = True if hw_model and 'Intel' in hw_model else False
 
-        vmx = sysctl.filter('hw.vmm.vmx.initialized')
-        data['intel_vmx'] = True if vmx and vmx[0].value else False
+        vmx = _sysctl_val('hw.vmm.vmx.initialized')
+        data['intel_vmx'] = True if vmx else False
 
-        ug = sysctl.filter('hw.vmm.vmx.cap.unrestricted_guest')
-        data['unrestricted_guest'] = True if ug and ug[0].value else False
+        ug = _sysctl_val('hw.vmm.vmx.cap.unrestricted_guest')
+        data['unrestricted_guest'] = True if ug else False
 
         # If virtualisation is not supported on AMD, the sysctl value will be -1 but as an unsigned integer
         # we should make sure we check that accordingly.
-        rvi = sysctl.filter('hw.vmm.svm.features')
-        data['amd_rvi'] = True if rvi and rvi[0].value != 0xffffffff and not intel \
+        rvi = _sysctl_val('hw.vmm.svm.features')
+        data['amd_rvi'] = True if rvi is not None and rvi != 0xffffffff and not intel \
             else False
 
-        asids = sysctl.filter('hw.vmm.svm.num_asids')
-        data['amd_asids'] = True if asids and asids[0].value != 0 else False
+        asids = _sysctl_val('hw.vmm.svm.num_asids')
+        data['amd_asids'] = True if asids and asids != 0 else False
 
         return data
 
@@ -1025,16 +1382,45 @@ class VMService(CRUDService, LibvirtConnectionMixin):
                 bool: True if compatible otherwise False.
         """
         compatible_hp = ('VMwareVMware', 'Microsoft Hv', 'KVMKVMKVM', 'bhyve bhyve')
-        identify_hp = sysctl.filter('hw.hv_vendor')[0].value.strip()
+        identify_hp = _sysctl_val('hw.hv_vendor')
+        if identify_hp is None:
+            return False
 
-        if identify_hp in compatible_hp:
+        if identify_hp.strip() in compatible_hp:
             return True
         return False
+
+    @accepts()
+    def arch_choices(self):
+        """
+        Guest architectures this system can run, keyed by the value `vm.create` accepts as `arch`.
+
+        `hypervisor` is derived from the architecture, never chosen: amd64 runs natively on bhyve,
+        every other architecture is emulated by QEMU (TCG) with no hardware acceleration, which is
+        usable and slow. `available` is false, with a `reason`, when that lane cannot run here.
+        """
+        flags = self.flags()
+        native_reason = None if flags['intel_vmx'] or flags['amd_rvi'] else (
+            'This system does not support hardware virtualization.'
+        )
+        choices = {}
+        for arch in ARCH_CHOICES:
+            profile = arch_profile(arch)
+            reason = native_reason if profile['hypervisor'] == BHYVE else emulated_lane_reason(arch)
+            choices[arch] = {
+                'label': profile['label'],
+                'hypervisor': profile['hypervisor'],
+                'emulated': profile['hypervisor'] == QEMU,
+                'available': reason is None,
+                'reason': reason,
+            }
+        return choices
 
     @private
     async def extend_vm(self, vm):
         vm['devices'] = await self.middleware.call('vm.device.query', [('vm', '=', vm['id'])])
         vm['status'] = await self.middleware.call('vm.status', vm['id'])
+        vm['hypervisor'] = hypervisor_for(vm.get('arch'))
         return vm
 
     @accepts(Int('id'))
@@ -1165,11 +1551,15 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         # swap used space is accounted for used physical memory because
         # 1. processes (including VMs) can be swapped out
         # 2. we want to avoid using swap
-        swap_used = psutil.swap_memory().used * sysctl.filter('hw.pagesize')[0].value
+        pagesize = _sysctl_int('hw.pagesize') or 4096
+        swap_used = psutil.swap_memory().used * pagesize
 
         # Difference between current ARC total size and the minimum allowed
-        arc_total = sysctl.filter('kstat.zfs.misc.arcstats.size')[0].value
-        arc_min = sysctl.filter('vfs.zfs.arc.min')[0].value
+        arc_total = _sysctl_int('kstat.zfs.misc.arcstats.size') or 0
+        arc_min = effective_arc_min(
+            _sysctl_int('vfs.zfs.arc.min'),
+            _sysctl_int('kstat.zfs.misc.arcstats.c_min'),
+        )
         arc_shrink = max(0, arc_total - arc_min)
 
         vms_memory_used = 0
@@ -1208,15 +1598,31 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         if memory_bytes > memory_available:
             return False
 
-        arc_max = sysctl.filter('vfs.zfs.arc.max')[0].value
-        arc_min = sysctl.filter('vfs.zfs.arc.min')[0].value
+        arc_max = _sysctl_int('vfs.zfs.arc.max')
+        if arc_max in (None, 0):
+            return True
 
-        if arc_max > arc_min:
-            new_arc_max = max(arc_min, arc_max - memory_bytes)
+        arc_max_context = _arc_max_context()
+        minimum_arc_max = minimum_valid_arc_max(**arc_max_context)
+        if minimum_arc_max is None:
+            self.logger.warning('===> Not reserving guest memory because there is no valid ARC max value')
+            return True
+
+        new_arc_max = max(minimum_arc_max, arc_max - memory_bytes)
+        if new_arc_max < arc_max:
+            if reason := arc_max_reject_reason(new_arc_max, **arc_max_context):
+                self.logger.warning(f'===> Not reserving guest memory by setting ARC max: {reason}')
+                return True
+
             self.logger.info(
                 f'===> Setting ARC FROM: {arc_max} TO: {new_arc_max}'
             )
-            sysctl.filter('vfs.zfs.arc.max')[0].value = new_arc_max
+            try:
+                _sysctl_set('vfs.zfs.arc.max', new_arc_max)
+            except OSError as e:
+                if e.errno != errno.EINVAL:
+                    raise
+                self.logger.warning(f'===> Failed to reserve guest memory by setting ARC max: {e}')
         return True
 
     @private
@@ -1247,8 +1653,8 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         Int('cores', default=1),
         Int('threads', default=1),
         Int('memory', required=True),
-        Str('bootloader', enum=['UEFI', 'UEFI_CSM', 'GRUB'], default='UEFI'),
-        Str('grubconfig', null=True),
+        Str('bootloader', enum=['UEFI'], default='UEFI'),
+        Str('arch', enum=ARCH_CHOICES, default='amd64'),
         List('devices', default=[], items=[Patch('vmdevice_create', 'vmdevice_update', ('rm', {'name': 'vm'}))]),
         Bool('autostart', default=True),
         Str('time', enum=['LOCAL', 'UTC'], default='LOCAL'),
@@ -1258,9 +1664,6 @@ class VMService(CRUDService, LibvirtConnectionMixin):
     async def do_create(self, data):
         """
         Create a Virtual Machine (VM).
-
-        `grubconfig` may either be a path for the grub.cfg file or the actual content
-        of the file to be used with GRUB bootloader.
 
         `devices` is a list of virtualized hardware to add to the newly created Virtual Machine.
         Failure to attach a device destroys the VM and any resources allocated by the VM devices.
@@ -1273,6 +1676,11 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         `shutdown_timeout` indicates the time in seconds the system waits for the VM to cleanly shutdown. During system
         shutdown, if the VM hasn't exited after a hardware shutdown signal has been sent by the system within
         `shutdown_timeout` seconds, system initiates poweroff for the VM to stop it.
+
+        `arch` is the guest architecture, `amd64` by default. amd64 guests run natively on bhyve; any other
+        architecture is emulated by QEMU (TCG) with no hardware acceleration, which is usable and slow. See
+        `vm.arch_choices` for what this system can run. An emulated guest takes VirtIO disks and network
+        adapters only, no PCI passthrough and no VNC `wait`. The architecture cannot be changed afterwards.
         """
         async with LIBVIRT_LOCK:
             await self.middleware.run_in_thread(self._check_setup_connection)
@@ -1332,9 +1740,14 @@ class VMService(CRUDService, LibvirtConnectionMixin):
 
     async def __common_validation(self, verrors, schema_name, data, old=None):
 
+        arch = normalize_arch(data.get('arch'))
+        if old is not None and arch != normalize_arch(old.get('arch')):
+            # Disk images and firmware variables are architecture-specific.
+            verrors.add(f'{schema_name}.arch', 'The architecture of an existing VM cannot be changed.')
+
         vcpus = data['vcpus'] * data['cores'] * data['threads']
         if vcpus:
-            flags = await self.middleware.call('vm.flags')
+            flags = {} if is_emulated(arch) else await self.middleware.call('vm.flags')
             if vcpus > 16:
                 verrors.add(
                     f'{schema_name}.vcpus',
@@ -1342,6 +1755,10 @@ class VMService(CRUDService, LibvirtConnectionMixin):
                     f'Please ensure the product of "{schema_name}.vcpus", "{schema_name}.cores" and '
                     f'"{schema_name}.threads" is less then 16.'
                 )
+            elif is_emulated(arch):
+                # TCG needs no VT-x; what it needs is the lane's packages.
+                if reason := emulated_lane_reason(arch):
+                    verrors.add(f'{schema_name}.arch', f'{arch} guests cannot run on this system: {reason}')
             elif flags['intel_vmx']:
                 if vcpus > 1 and flags['unrestricted_guest'] is False:
                     verrors.add(
@@ -1393,7 +1810,7 @@ class VMService(CRUDService, LibvirtConnectionMixin):
                     verrors.add(f'{schema_name}.devices.{i}.{attribute}', errmsg, enumber)
 
         # Let's validate that the VM has the correct no of slots available to accommodate currently configured devices
-        if self.validate_slots(data):
+        if not is_emulated(arch) and self.validate_slots(data):
             verrors.add(
                 f'{schema_name}.devices',
                 'Please adjust the devices attached to this VM. A maximum of 30 PCI slots are allowed.'
@@ -1409,6 +1826,8 @@ class VMService(CRUDService, LibvirtConnectionMixin):
             else:
                 if device['attributes'].get('type') == 'VIRTIO':
                     virtio_disk_devices += 1
+                elif device['attributes'].get('type') == 'NVME':
+                    other_devices += 1  # one nvme controller per disk, one slot each (#468)
                 else:
                     raw_ahci_disk_devices += 1
         used_slots = other_devices
@@ -1467,6 +1886,9 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         3) Devices that do not have an `id` attribute are created and attached to `id` VM.
         """
         old = await self.get_instance(id)
+        if reason := unsupported_bootloader_reason(old.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
+
         new = old.copy()
         new.update(data)
 
@@ -1485,6 +1907,7 @@ class VMService(CRUDService, LibvirtConnectionMixin):
 
         devices = new.pop('devices', [])
         new.pop('status', None)
+        new.pop('hypervisor', None)
         if devices != old['devices']:
             await self.safe_devices_updates(devices)
             await self.__do_update_devices(id, devices)
@@ -1515,14 +1938,18 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         """Delete a VM."""
         async with LIBVIRT_LOCK:
             vm = await self.get_instance(id)
-            await self.middleware.run_in_thread(self._check_setup_connection)
+            unsupported_reason = unsupported_bootloader_reason(vm.get('bootloader'))
+            if not unsupported_reason:
+                await self.middleware.run_in_thread(self._check_setup_connection)
             status = await self.middleware.call('vm.status', id)
             if status.get('state') == 'RUNNING':
                 await self.middleware.call('vm.poweroff', id)
                 # We would like to wait at least 7 seconds to have the vm
                 # complete it's post vm actions which might require interaction with it's domain
                 await asyncio.sleep(7)
-            elif status.get('state') == 'ERROR' and not data.get('force'):
+            elif (
+                status.get('state') == 'ERROR' and not unsupported_reason and not data.get('force')
+            ):
                 raise CallError('Unable to retrieve VM status. Failed to destroy VM')
 
             if data['zvols']:
@@ -1541,9 +1968,14 @@ class VMService(CRUDService, LibvirtConnectionMixin):
 
             await self.middleware.call('vm.undefine_vm', vm)
 
-            # We remove vm devices first
+            # Public device mutation methods reject retired-bootloader tombstones, but deleting the
+            # whole VM record must remain possible. Preserve normal device delete hooks
+            # and query events for supported VMs.
             for device in vm['devices']:
-                await self.middleware.call('vm.device.delete', device['id'])
+                if unsupported_reason:
+                    await self.middleware.call('datastore.delete', 'vm.device', device['id'])
+                else:
+                    await self.middleware.call('vm.device.delete', device['id'])
             result = await self.middleware.call('datastore.delete', 'vm.vm', id)
             if not await self.middleware.call('vm.query'):
                 await self.middleware.call('vm.close_libvirt_connection')
@@ -1553,10 +1985,22 @@ class VMService(CRUDService, LibvirtConnectionMixin):
 
     @private
     def undefine_vm(self, vm):
+        if unsupported_bootloader_reason(vm.get('bootloader')):
+            if not self.LIBVIRT_CONNECTION:
+                return
+            try:
+                domain = self.LIBVIRT_CONNECTION.lookupByName(f'{vm["id"]}_{vm["name"]}')
+            except libvirt.libvirtError:
+                return
+            if domain.isActive():
+                raise CallError(f'Domain {vm["id"]}_{vm["name"]} is active. Please stop it first')
+            domain.undefine()
+            return
+
         if vm['name'] in self.vms:
-            self.vms.pop(vm['name']).undefine_domain()
+            self.vms.pop(vm['name']).undefine_domain(remove_nvram=True)
         else:
-            VMSupervisor(vm, self.middleware).undefine_domain()
+            VMSupervisor(vm, self.middleware).undefine_domain(remove_nvram=True)
 
     @item_method
     @accepts(Int('id'), Dict('options', Bool('overcommit', default=False)))
@@ -1573,22 +2017,29 @@ class VMService(CRUDService, LibvirtConnectionMixin):
             ENOMEM(12): not enough free memory to run the VM without overcommit
         """
         vm = self.middleware.call_sync('vm.get_instance', id)
+        if reason := unsupported_bootloader_reason(vm.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
+
         self._check_setup_connection()
         if vm['status']['state'] == 'RUNNING':
             raise CallError(f'{vm["name"]} is already running')
 
-        if self.validate_slots(vm):
-            raise CallError(
-                'Please adjust the devices attached to this VM. '
-                f'A maximum of {LIBVIRT_AVAILABLE_SLOTS} PCI slots are allowed.'
-            )
+        if is_emulated(vm.get('arch')):
+            if reason := emulated_lane_reason(vm['arch']):
+                raise CallError(f'{vm["arch"]} guests cannot run on this system: {reason}', errno.EOPNOTSUPP)
+        else:
+            if self.validate_slots(vm):
+                raise CallError(
+                    'Please adjust the devices attached to this VM. '
+                    f'A maximum of {LIBVIRT_AVAILABLE_SLOTS} PCI slots are allowed.'
+                )
 
-        flags = self.flags()
+            flags = self.flags()
 
-        if not flags['intel_vmx'] and not flags['amd_rvi']:
-            raise CallError(
-                'This system does not support virtualization.'
-            )
+            if not flags['intel_vmx'] and not flags['amd_rvi']:
+                raise CallError(
+                    'This system does not support virtualization.'
+                )
 
         # Perhaps we should have a default config option for VMs?
         self.middleware.call_sync('vm.init_guest_vmemory', vm, options['overcommit'])
@@ -1619,6 +2070,9 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         not already stopped within the specified `shutdown_timeout`.
         """
         vm_data = self.middleware.call_sync('vm.get_instance', id)
+        if reason := unsupported_bootloader_reason(vm_data.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
+
         self._check_setup_connection()
         vm = self.vms[vm_data['name']]
 
@@ -1636,6 +2090,9 @@ class VMService(CRUDService, LibvirtConnectionMixin):
     @accepts(Int('id'))
     def poweroff(self, id):
         vm_data = self.middleware.call_sync('vm.get_instance', id)
+        if reason := unsupported_bootloader_reason(vm_data.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
+
         self._check_setup_connection()
         self.vms[vm_data['name']].poweroff()
         self.middleware.call_sync('vm.teardown_guest_vmemory', id)
@@ -1646,6 +2103,9 @@ class VMService(CRUDService, LibvirtConnectionMixin):
     def restart(self, job, id):
         """Restart a VM."""
         vm = self.middleware.call_sync('vm.get_instance', id)
+        if reason := unsupported_bootloader_reason(vm.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
+
         self._check_setup_connection()
         self.vms[vm['name']].restart(vm_data=vm, shutdown_timeout=vm['shutdown_timeout'])
 
@@ -1657,20 +2117,32 @@ class VMService(CRUDService, LibvirtConnectionMixin):
 
         vm = await self.middleware.call('datastore.query', 'vm.vm', [('id', '=', id)])
         guest_memory = vm[0].get('memory', 0) * 1024 * 1024
-        arc_max = sysctl.filter('vfs.zfs.arc.max')[0].value
-        arc_min = sysctl.filter('vfs.zfs.arc.min')[0].value
+        arc_max = _sysctl_int('vfs.zfs.arc.max')
+        if arc_max is None:
+            return
+
+        if arc_max == 0:
+            return
+        initial_arc_max = await self.middleware.call('vm.get_initial_arc_max')
+        if initial_arc_max is None:
+            return
+
         new_arc_max = min(
-            await self.middleware.call('vm.get_initial_arc_max'),
+            initial_arc_max,
             arc_max + guest_memory
         )
         if arc_max != new_arc_max:
-            if new_arc_max > arc_min:
-                self.logger.debug(f'===> Give back guest memory to ARC: {new_arc_max}')
-                sysctl.filter('vfs.zfs.arc.max')[0].value = new_arc_max
+            arc_max_context = _arc_max_context()
+            if reason := arc_max_reject_reason(new_arc_max, **arc_max_context):
+                self.logger.warning(f'===> Not giving back guest memory to ARC: {reason}')
             else:
-                self.logger.warn(
-                    f'===> Not giving back memory to ARC because new arc_max ({new_arc_max}) <= arc_min ({arc_min})'
-                )
+                self.logger.debug(f'===> Giving back guest memory to ARC: {new_arc_max}')
+                try:
+                    _sysctl_set('vfs.zfs.arc.max', new_arc_max)
+                except OSError as e:
+                    if e.errno != errno.EINVAL:
+                        raise
+                    self.logger.warning(f'===> Failed to give back guest memory to ARC: {e}')
 
     @item_method
     @accepts(Int('id'))
@@ -1682,6 +2154,22 @@ class VMService(CRUDService, LibvirtConnectionMixin):
             - pid, process id if RUNNING
         """
         vm = self.middleware.call_sync('datastore.query', 'vm.vm', [['id', '=', id]], {'get': True})
+
+        if reason := unsupported_bootloader_reason(vm.get('bootloader')):
+            return {
+                'state': 'ERROR',
+                'pid': None,
+                'domain_state': 'UNSUPPORTED',
+                'error': reason,
+            }
+
+        if is_emulated(vm.get('arch')) and (reason := emulated_lane_reason(vm['arch'])):
+            return {
+                'state': 'ERROR',
+                'pid': None,
+                'domain_state': 'UNAVAILABLE',
+                'error': f'{vm["arch"]} guests cannot run on this system: {reason}',
+            }
 
         try:
             if not self._is_connection_alive():
@@ -1773,10 +2261,13 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         If not provided it will append the next number available to the VM name.
         """
         vm = await self.get_instance(id)
+        if reason := unsupported_bootloader_reason(vm.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
 
         origin_name = vm['name']
         del vm['id']
         del vm['status']
+        vm.pop('hypervisor', None)
 
         vm['name'] = await self.__next_clone_name(vm['name'])
 
@@ -1874,6 +2365,8 @@ class VMService(CRUDService, LibvirtConnectionMixin):
     @private
     async def wait_for_libvirtd(self, timeout):
         async def libvirtd_started(middleware):
+            # The QEMU driver's daemon configuration (etc_files/local/libvirt/qemu.conf).
+            await middleware.call('etc.generate', 'libvirt')
             await middleware.call('service.start', 'libvirtd')
             while not await middleware.call('service.started', 'libvirtd'):
                 await asyncio.sleep(2)
@@ -1899,6 +2392,9 @@ class VMService(CRUDService, LibvirtConnectionMixin):
         if LibvirtConnectionMixin.LIBVIRT_CONNECTION:
             for vm_data in self.middleware.call_sync('datastore.query', 'vm.vm'):
                 vm_data['devices'] = self.middleware.call_sync('vm.device.query', [['vm', '=', vm_data['id']]])
+                if reason := unsupported_bootloader_reason(vm_data.get('bootloader')):
+                    self.middleware.logger.warning('Not initializing VM %r: %s', vm_data['name'], reason)
+                    continue
                 try:
                     self.vms[vm_data['name']] = VMSupervisor(vm_data, self.middleware)
                 except Exception as e:
@@ -1927,6 +2423,7 @@ class VMDeviceService(CRUDService):
         'NIC': NIC.schema,
         'PCI': PCI.schema,
         'VNC': VNC.schema,
+        'FILESYSTEM': FILESYSTEM.schema,
     }
 
     class Config:
@@ -1938,6 +2435,14 @@ class VMDeviceService(CRUDService):
         super(VMDeviceService, self).__init__(*args, **kwargs)
         self.pptdevs = {}
         self.iommu_type = None
+
+    @private
+    async def ensure_parent_vm_supported(self, vm_id):
+        vm = await self.middleware.call(
+            'datastore.query', 'vm.vm', [('id', '=', vm_id)], {'get': True},
+        )
+        if reason := unsupported_bootloader_reason(vm.get('bootloader')):
+            raise CallError(reason, errno.EOPNOTSUPP)
 
     @private
     async def failover_nic_check(self, vm_device, verrors, schema):
@@ -2075,7 +2580,7 @@ class VMDeviceService(CRUDService):
     @accepts(
         Dict(
             'vmdevice_create',
-            Str('dtype', enum=['NIC', 'DISK', 'CDROM', 'PCI', 'VNC', 'RAW'],
+            Str('dtype', enum=['NIC', 'DISK', 'CDROM', 'PCI', 'VNC', 'RAW', 'FILESYSTEM'],
                 required=True),
             Int('vm', required=True),
             Dict('attributes', additional_attrs=True, default=None),
@@ -2093,6 +2598,7 @@ class VMDeviceService(CRUDService):
         If `dtype` is of `DISK` type and a new Zvol is to be created, `attributes.create_zvol` will be passed as
         true with valid `attributes.zvol_name` and `attributes.zvol_volsize` values.
         """
+        await self.ensure_parent_vm_supported(data['vm'])
         data = await self.validate_device(data)
         data = await self.update_device(data)
 
@@ -2117,6 +2623,10 @@ class VMDeviceService(CRUDService):
         device = await self.get_instance(id)
         new = device.copy()
         new.update(data)
+
+        await self.ensure_parent_vm_supported(device['vm'])
+        if new['vm'] != device['vm']:
+            await self.ensure_parent_vm_supported(new['vm'])
 
         new = await self.validate_device(new, device)
         new = await self.update_device(new, device)
@@ -2157,7 +2667,9 @@ class VMDeviceService(CRUDService):
         """
         Delete a VM device of `id`.
         """
-        await self.delete_resource(options, await self.get_instance(id))
+        device = await self.get_instance(id)
+        await self.ensure_parent_vm_supported(device['vm'])
+        await self.delete_resource(options, device)
         return await self.middleware.call('datastore.delete', self._config.datastore, id)
 
     async def __reorder_devices(self, id, vm_id, order):
@@ -2260,6 +2772,12 @@ class VMDeviceService(CRUDService):
         # vm_instance usages SHOULD NOT rely on device `id` field to uniquely identify objects as it's possible
         # VMService is creating a new VM with devices and the id's don't exist yet
 
+        # An emulated guest gets what the QEMU virt machine has: VirtIO disks and NICs,
+        # no passthrough, no waiting for VNC.  the internal development record
+        if rejection := device_rejection_reason(vm_instance.get('arch'), device):
+            attribute, message = rejection
+            verrors.add(attribute, message)
+
         if device.get('dtype') == 'DISK':
             create_zvol = device['attributes'].get('create_zvol')
             path = device['attributes'].get('path')
@@ -2296,11 +2814,11 @@ class VMDeviceService(CRUDService):
             elif path and not os.path.exists(path):
                 verrors.add('attributes.path', f'Disk path {path} does not exist.', errno.ENOENT)
 
-            if path and len(path) > 63:
-                # SPECNAMELEN is not long enough (63) in 12, 13 will be 255
+            if path and len(path) > 255:
+                # SPECNAMELEN increased from 63 (FB12/13) to 255 (FB14+)
                 verrors.add(
                     'attributes.path',
-                    f'Disk path {path} is too long, reduce to less than 63'
+                    f'Disk path {path} is too long, reduce to less than 255'
                     ' characters',
                     errno.ENAMETOOLONG
                 )
@@ -2345,6 +2863,29 @@ class VMDeviceService(CRUDService):
                 verrors.add('attributes.path', f'Unable to locate CDROM device at {path}')
             elif not await self.disk_uniqueness_integrity_check(device, vm_instance):
                 verrors.add('attributes.path', f'{vm_instance["name"]} has "{path}" already configured')
+        elif device.get('dtype') == 'FILESYSTEM':
+            source = device['attributes'].get('source')
+            if not source or not source.startswith('/mnt/'):
+                verrors.add('attributes.source', 'Shared directory must be an absolute path under /mnt/.')
+            elif not os.path.isdir(source):
+                verrors.add('attributes.source', f'Shared directory {source} does not exist.', errno.ENOENT)
+            else:
+                await check_path_resides_within_volume(verrors, self.middleware, 'attributes.source', source)
+            if vm_instance:
+                same_tag = [
+                    d for d in vm_instance['devices']
+                    if d['dtype'] == 'FILESYSTEM' and d['attributes'].get('tag') == device['attributes'].get('tag')
+                ]
+                if all(not d.get('id') for d in vm_instance['devices']):
+                    # the VM is being created: this device is in the list itself, without an id
+                    duplicate = len(same_tag) > 1
+                else:
+                    duplicate = any(d.get('id') != device.get('id') for d in same_tag)
+                if duplicate:
+                    verrors.add(
+                        'attributes.tag',
+                        f'{vm_instance["name"]} already shares a directory as "{device["attributes"].get("tag")}".'
+                    )
         elif device.get('dtype') == 'NIC':
             nic = device['attributes'].get('nic_attach')
             if nic:
@@ -2395,10 +2936,18 @@ class VMDeviceService(CRUDService):
 
 async def kmod_load():
     kldstat = (await (await Popen(['/sbin/kldstat'], stdout=subprocess.PIPE)).communicate())[0].decode()
+    # On FB15 vmm/nmdm may be compiled into the kernel rather than loadable modules.
+    # kldload returns non-zero if already loaded or built-in, so ignore errors.
     if 'vmm.ko' not in kldstat:
-        await Popen(['/sbin/kldload', 'vmm'])
+        try:
+            await run(['/sbin/kldload', 'vmm'], check=False)
+        except Exception:
+            pass
     if 'nmdm.ko' not in kldstat:
-        await Popen(['/sbin/kldload', 'nmdm'])
+        try:
+            await run(['/sbin/kldload', 'nmdm'], check=False)
+        except Exception:
+            pass
 
 
 async def __event_system_ready(middleware, event_type, args):
@@ -2414,7 +2963,7 @@ async def __event_system_ready(middleware, event_type, args):
 
     if args['id'] == 'ready':
         global ZFS_ARC_MAX_INITIAL
-        ZFS_ARC_MAX_INITIAL = sysctl.filter('vfs.zfs.arc.max')[0].value
+        ZFS_ARC_MAX_INITIAL = _sysctl_val('vfs.zfs.arc.max')
 
         await middleware.call('vm.initialize_vms')
 
@@ -2448,10 +2997,10 @@ class VMFSAttachmentDelegate(FSAttachmentDelegate):
             )
         }
         for device in await self.middleware.call('datastore.query', 'vm.device'):
-            if (device['dtype'] not in ('DISK', 'RAW', 'CDROM')) or device['vm']['id'] in ignored_vms:
+            if (device['dtype'] not in ('DISK', 'RAW', 'CDROM', 'FILESYSTEM')) or device['vm']['id'] in ignored_vms:
                 continue
 
-            disk = device['attributes'].get('path')
+            disk = device['attributes'].get('source' if device['dtype'] == 'FILESYSTEM' else 'path')
             if not disk:
                 continue
 
@@ -2491,8 +3040,7 @@ class VMFSAttachmentDelegate(FSAttachmentDelegate):
 
 async def setup(middleware):
     global ZFS_ARC_MAX_INITIAL
-    if sysctl:
-        ZFS_ARC_MAX_INITIAL = sysctl.filter('vfs.zfs.arc.max')[0].value
+    ZFS_ARC_MAX_INITIAL = _sysctl_val('vfs.zfs.arc.max')
     if osc.IS_FREEBSD:
         middleware.create_task(kmod_load())
     middleware.create_task(middleware.call('pool.dataset.register_attachment_delegate',

@@ -19,7 +19,7 @@ async def annotate_disk_for_smart(context, disk):
 
 
 async def ensure_smart_enabled(args):
-    if any(arg.startswith("/dev/nvme") for arg in args):
+    if any(arg.startswith("/dev/nvme") or arg.startswith("/dev/nda") for arg in args):
         return True
 
     p = await smartctl(args + ["-i"], stderr=subprocess.STDOUT, check=False, encoding="utf8", errors="ignore")

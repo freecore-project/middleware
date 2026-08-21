@@ -9,6 +9,7 @@ import os
 from pytest_dependency import depends
 apifolder = os.getcwd()
 sys.path.append(apifolder)
+from time import sleep
 from auto_config import ha, interface, user, password
 from functions import fail, GET, PUT, SSH_TEST
 
@@ -60,7 +61,24 @@ else:
         # set nameservers
         for num, nameserver in enumerate(nameservers, start=1):
             payload[f'nameserver{num}'] = nameserver
-        results = PUT("/network/configuration/", payload)
+        # Setting the hostname makes middleware regenerate and restart nginx,
+        # which tears down this very request: the PUT returns an nginx 502 error
+        # page instead of a middleware response, even though the change itself
+        # applied. Seen on 3 of 5 13.3 baseline runs, and it is not survivable --
+        # fail() aborts the entire suite, so losing this coin flip costs a
+        # 40-minute run and produces a result that looks like a network defect.
+        # Rebooting the target beforehand does not avoid it; it is a race, not a
+        # settling problem.
+        #
+        # The call is idempotent -- identical values every attempt -- so retry
+        # until the API answers, then assert exactly as before. A target that
+        # genuinely refuses the config still fails, just after 60s instead of
+        # immediately.
+        for _ in range(12):
+            results = PUT("/network/configuration/", payload)
+            if results.status_code == 200:
+                break
+            sleep(5)
         if results.status_code != 200:
             fail(f'Network setup failed with config {payload}: {results.text}')
 
@@ -100,9 +118,15 @@ else:
 
     def test_10_enable_netwait():
         global payload, results
+        # 8.8.8.8 was the upstream choice; the TN TestTarget VLAN is not a
+        # general-egress network, and netwait blocks boot until every listed
+        # address answers. If a run aborts between here and test_15 the target
+        # is left with netwait pointing at an address it cannot reach, which
+        # stalls its next boot. Use two addresses that are reachable by
+        # construction so the rc.conf list assertion still means something.
         payload = {
             "netwait_enabled": True,
-            "netwait_ip": [gateway, '8.8.8.8'],
+            "netwait_ip": [gateway, ip],
         }
         results = PUT("/network/configuration/", payload)
         assert results.status_code == 200, results.text
@@ -128,7 +152,7 @@ else:
         ssh_results = SSH_TEST(cmd, user, password, ip)
         assert ssh_results['result'] is True, ssh_results['output']
         assert 'netwait_enable="YES"' in ssh_results['output'], ssh_results['output']
-        assert f'netwait_ip="{gateway} 8.8.8.8"' in ssh_results['output'], ssh_results['output']
+        assert f'netwait_ip="{gateway} {ip}"' in ssh_results['output'], ssh_results['output']
 
     def test_15_disable_netwait():
         global payload, results

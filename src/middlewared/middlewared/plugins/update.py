@@ -335,6 +335,8 @@ class UpdateService(Service):
         try:
             try:
                 self.middleware.call_sync('update.install_manual_impl', job, path, dest_extracted)
+            except CallError:
+                raise
             except Exception as e:
                 self.logger.debug('Applying manual update failed', exc_info=True)
                 raise CallError(str(e), errno.EFAULT)
@@ -346,9 +348,8 @@ class UpdateService(Service):
 
             if os.path.exists(dest_extracted):
                 shutil.rmtree(dest_extracted, ignore_errors=True)
-
-        if path.startswith(UPLOAD_LOCATION):
-            self.middleware.call_sync('update.destroy_upload_location')
+            if path.startswith(UPLOAD_LOCATION):
+                self.middleware.call_sync('update.destroy_upload_location')
 
     @accepts(Dict(
         'updatefile',
@@ -363,8 +364,9 @@ class UpdateService(Service):
         """
 
         dest = options.get('destination')
+        temporary_upload = not dest
 
-        if not dest:
+        if temporary_upload:
             try:
                 await self.middleware.call('update.create_upload_location')
                 dest = UPLOAD_LOCATION
@@ -386,7 +388,12 @@ class UpdateService(Service):
                     shutil.copyfileobj, job.pipes.input.r, f, 1048576,
                 )
 
-            await self.middleware.call('update.install_manual_impl', job, destfile, dest_extracted)
+            await self.middleware.call(
+                'update.install_manual_impl',
+                job,
+                destfile,
+                dest_extracted,
+            )
 
             job.set_progress(95, 'Cleaning up')
         finally:
@@ -395,9 +402,8 @@ class UpdateService(Service):
 
             if os.path.exists(dest_extracted):
                 shutil.rmtree(dest_extracted, ignore_errors=True)
-
-        if dest == UPLOAD_LOCATION:
-            await self.middleware.call('update.destroy_upload_location')
+            if temporary_upload:
+                await self.middleware.call('update.destroy_upload_location')
 
         job.set_progress(100, 'Update completed')
 

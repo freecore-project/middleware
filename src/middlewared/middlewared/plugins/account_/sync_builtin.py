@@ -1,7 +1,7 @@
 from collections import defaultdict
+from importlib.resources import files
 import itertools
 import os
-import pkg_resources
 
 from middlewared.service import private, Service
 from middlewared.utils import osc
@@ -58,7 +58,7 @@ class UserService(Service):
             )
         }
 
-        path = pkg_resources.resource_filename("middlewared", f"assets/account/builtin/{osc.SYSTEM.lower()}")
+        path = str(files("middlewared").joinpath("assets", "account", "builtin", osc.SYSTEM.lower()))
         group_file = []
         passwd_file = []
         if osc.IS_LINUX:
