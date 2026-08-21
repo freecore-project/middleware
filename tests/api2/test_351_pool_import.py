@@ -80,7 +80,14 @@ if not ha:
         assert results['result'] is True, f'out: {results["output"]}, err: {results["stderr"]}'
 
     def test_05_import_nonascii_msdosfs_fails(request):
-        depends(request, ["pool_04"], scope="session")
+        depends(request, ["pool_04", "ssh_password"], scope="session")
+        results = SSH_TEST(
+            f'rm -f {dataset_path}/Directory/File', user, password, ip
+        )
+        assert results['result'] is True, (
+            f'out: {results["output"]}, err: {results["stderr"]}'
+        )
+
         payload = {
             "device": IMAGES['msdosfs-nonascii'],
             "fs_type": "msdosfs",
@@ -94,13 +101,45 @@ if not ha:
 
         job = expect_state(job_id, "FAILED")
 
-        assert job["error"] == "rsync failed with exit code 23", job
+        version_results = GET("/system/version/")
+        assert version_results.status_code == 200, version_results.text
+        version = version_results.json()
 
-    def test_06_look_if_Directory_slash_File(request):
+        # FreeBSD changed invalid msdosfs OPEN/DELETE lookups from EINVAL to
+        # ENOENT in 0b2c159c8fa. Rsync therefore reports the same failed import
+        # as a generic partial transfer (23) on 13.3 and a vanished source (24)
+        # on FreeBSD 15. Keep both target contracts exact.
+        if version.startswith("TrueNAS-13.3"):
+            expected_error = "rsync failed with exit code 23"
+        elif version.startswith("FreeCORE-15.0"):
+            expected_error = "rsync failed with exit code 24"
+        else:
+            pytest.fail(
+                f"Unclassified msdosfs import behavior for {version!r}"
+            )
+
+        assert job["error"] == expected_error, job
+
+    def test_06_verify_failed_nonascii_import_state(request):
         depends(request, ["pool_04", "ssh_password"], scope="session")
-        cmd = f'test -f {dataset_path}/Directory/File'
+        cmd = f'find {dataset_path} -mindepth 1 -print'
         results = SSH_TEST(cmd, user, password, ip)
-        assert results['result'] is True, f'out: {results["output"]}, err: {results["stderr"]}'
+        assert results['result'] is True, (
+            f'out: {results["output"]}, err: {results["stderr"]}'
+        )
+        assert set(results['output'].splitlines()) == {
+            f'{dataset_path}/Directory',
+            f'{dataset_path}/Directory/File',
+        }, results['output']
+
+        import_path = os.path.join(
+            "/var/run/importcopy/tmpdir",
+            os.path.basename(IMAGES['msdosfs-nonascii']),
+        )
+        results = SSH_TEST(f'test ! -e {import_path}', user, password, ip)
+        assert results['result'] is True, (
+            f'out: {results["output"]}, err: {results["stderr"]}'
+        )
 
     def test_07_import_nonascii_msdosfs(request):
         depends(request, ["pool_04"], scope="session")

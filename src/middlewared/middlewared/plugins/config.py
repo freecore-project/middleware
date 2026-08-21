@@ -187,7 +187,7 @@ class ConfigService(Service):
                 file_path = os.path.join(tmpdir, filename)
                 if os.path.exists(file_path):
                     if filename == 'geli':
-                        # Let's only copy the geli keys and not overwrite the entire directory
+                        # Copy individual legacy pool keys without replacing the key directory.
                         os.makedirs(CONFIG_FILES['geli'], exist_ok=True)
                         for key_path in os.listdir(file_path):
                             move(
@@ -230,22 +230,6 @@ class ConfigService(Service):
         factorydb = f'{FREENAS_DATABASE}.factory'
         with contextlib.suppress(OSError):
             os.unlink(factorydb)
-
-        cp = subprocess.run(
-            ['migrate93', '-f', factorydb],
-            capture_output=True,
-        )
-        if cp.returncode != 0:
-            job.logs_fd.write(cp.stderr)
-            raise CallError('Factory reset has failed.')
-
-        cp = subprocess.run(
-            ['migrate113', '-f', factorydb],
-            capture_output=True,
-        )
-        if cp.returncode != 0:
-            job.logs_fd.write(cp.stderr)
-            raise CallError('Factory reset has failed.')
 
         cp = subprocess.run(
             ['migrate'],
