@@ -1,96 +1,48 @@
-FreeNAS 12 Source
-=============
-[![Build Status](https://builds.ixsystems.com/jenkins/buildStatus/icon?job=FreeNAS%20-%20Master%20-%20Incremental%20Build)](https://builds.ixsystems.com/jenkins/job/FreeNAS%20-%20Master%20-%20Incremental%20Build/)
+# middleware
 
-## IMPORTANT NOTE:  This is the master branch of freenas, which is used for the creation and testing of 11-Nightlies builds. Submit Pull Requests here if you want to get changes into the next major release of FreeNAS. To build this source repo, checkout https://github.com/freenas/build
+[FreeCORE](https://freecore.org) carries the TrueNAS CORE 13.3 system forward as an
+independently maintained operating system on FreeBSD. TrueNAS CORE 13.3 systems
+upgrade straight to FreeCORE 15.0 in place, then continue on the project’s
+update train.
 
-## Pull Request Instructions / Jenkins Commands
+Not affiliated with or endorsed by iXsystems, Inc.
 
-When submitting a pull-request, Jenkins will attempt to verify the changes to ensure it does not break our builds and/or passes QA tests.
+## What this repository is
 
-The following commands may be used to interact with that service:
+`middleware` forked from [`truenas/middleware`](https://github.com/truenas/middleware) at:
 
-    "ok to test" to accept this pull request for testing
-    "test this please" for a one time test run
-    "add to whitelist" to add the author to the whitelist
+| | |
+|---|---|
+| **Base commit** | `2147134704a9fa615dd223bc55ed352285da31ce` |
+| **Base** | truenas/13.3-u1-stable @ 2024-08-07 |
+| **Licence** | LGPL-3.0 — unchanged from upstream |
 
-If the build fails for other various reasons you can rebuild.
+## How to read the history
 
-    "retest this please" to start a new build
-    "retest this please CLEAN" to start a new build, non-incremental
+Upstream history is preserved verbatim below the base commit: original commits,
+original authors, original dates. Everything FreeCORE changed sits above it.
 
+```sh
+git log --oneline 2147134704a9..HEAD      # the entire FreeCORE delta
+git diff 2147134704a9..HEAD               # ...as one diff
+```
 
-If your Pull-Request depends upon another repo / branch to build properly, you can specify that using the following syntax in the Pull-Request description:
+The FreeCORE commits are a compact **release history**, generated from the
+reviewed source-state difference rather than copied from the development
+repositories. Private commit subjects, issue references, dates, and intermediate
+churn are not mirrored here. Only tagged release commits are states that were
+built and tested.
 
-```DEPENDS: https://github.com/freenas/ports/tree/kris/testbranch```
+## Releases
 
-An example would be, sending a pull-request for the freenas/samba repo, but it depends upon port changes in the freenas/ports repo. You would first
-push your port changes to a branch in freenas/ports (kris/testbranch in this example). Then when creating your pull-request for freenas/samba, you would
-insert text into the pull-request description field as shown above.
+Tags mark states that were actually built, installed and validated.
 
+## Contributing
 
-If your Pull-Request needs to build aginst another build profile (I.E. fn_head) add the following to the PR description:
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go to
+security@freecore.org, not to the issue tracker — see [SECURITY.md](SECURITY.md).
 
-```PROFILE: fn_head```
+## Licence and attribution
 
-
-
-## Build Branch / Version Matrix
-
-#### FreeNAS 11 Master / Nightlies
-(This branch will become the next feature release, I.E. 11.1)
-
-| Repo         | Branch            | Description |
-|:-------------|:-----------------:|-------------|
-| **build**  | [master](https://github.com/freenas/build/tree/master/) | FreeNAS Build System (build profile: freenas)|
-| **freenas**  | [master](https://github.com/freenas/freenas/tree/master/) | Core FreeNAS Sources - Legacy UI and Middleware/API |
-| **os**  | [freenas/11-stable](https://github.com/freenas/os/tree/freenas/11-stable/) | FreeBSD Operating System - [Upstream](https://github.com/freebsd/freebsd/tree/11-stable) |
-| **ports**  | [freenas/master](https://github.com/freenas/ports/tree/freenas/master/) | FreeBSD Ports Tree - [Upstream](https://github.com/freebsd/freebsd-ports/tree/master) |
-| **webui**  | [master](https://github.com/freenas/webui/tree/master/) | New Angular UI |
-| **freenas-docs**  | [master](https://github.com/freenas/freenas-docs/tree/master/) | Handbook |
-| **samba**  | [freenas/master](https://github.com/freenas/samba/tree/freenas/master) | Samba Sources |
-| **py-libzfs**  | [master](https://github.com/freenas/py-libzfs/tree/master/) | Python interface to libzfs |
-
-
-#### FreeNAS 12 Nightlies
-(This branch will become the FreeNAS 12.0 feature release)
-
-| Repo         | Branch            | Description |
-|:-------------|:-----------------:|-------------|
-| **trueos**  | [freenas/12-stable](https://github.com/trueos/trueos/tree/freenas/12-stable/) | FreeNAS / TrueOS Build System|
-| **ports**  | [freenas/12-stable](https://github.com/trueos/trueos-ports/tree/freenas/12-stable/) | TrueOS Ports Tree|
-| **freenas**  | [freenas/12-devel](https://github.com/freenas/freenas/tree/12-devel/) | Core FreeNAS Sources - Middleware/API |
-| **webui**  | [master](https://github.com/freenas/webui/tree/master/) | New Angular UI |
-| **freenas-docs**  | [master](https://github.com/freenas/freenas-docs/tree/master/) | Handbook |
-| **samba**  | [freenas/master](https://github.com/freenas/samba/tree/freenas/master) | Samba Sources |
-| **py-libzfs**  | [master](https://github.com/freenas/py-libzfs/tree/master/) | Python interface to libzfs |
-
-
-
-#### FreeNAS HEAD Nightlies
-(This branch will become the next major OS feature release, I.E. 13.0)
-
-| Repo         | Branch            | Description |
-|:-------------|:-----------------:|-------------|
-| **trueos**  | [freenas/master](https://github.com/trueos/trueos/tree/freenas/master/) | FreeNAS / TrueOS Build System|
-| **ports**  | [freenas/master](https://github.com/trueos/trueos-ports/tree/freenas/master/) | TrueOS Ports Tree|
-| **freenas**  | [master](https://github.com/freenas/freenas/tree/master/) | Core FreeNAS Sources - Legacy UI and Middleware/API |
-| **webui**  | [master](https://github.com/freenas/webui/tree/master/) | New Angular UI |
-| **freenas-docs**  | [master](https://github.com/freenas/freenas-docs/tree/master/) | Handbook |
-| **samba**  | [freenas/master](https://github.com/freenas/samba/tree/freenas/master) | Samba Sources |
-| **py-libzfs**  | [master](https://github.com/freenas/py-libzfs/tree/master/) | Python interface to libzfs |
-
-
-#### FreeNAS STABLE Branch
-(This branch will become the next minor update release, I.E. 11.0-U4)
-
-| Repo         | Branch            | Description |
-|:-------------|:-----------------:|-------------|
-| **build**  | [freenas/11.0-stable](https://github.com/freenas/build/tree/freenas/11.0-stable/) | FreeNAS Build System (build profile: freenas)|
-| **freenas**  | [freenas/11.0-stable](https://github.com/freenas/freenas/tree/freenas/11.0-stable/) | Core FreeNAS Sources - Legacy UI and Middleware/API |
-| **os**  | [freenas/11.0-stable](https://github.com/freenas/os/tree/freenas/11.0-stable/) | FreeBSD Operating System - [Upstream](https://github.com/freebsd/freebsd/tree/stable/11) |
-| **ports**  | [freenas/11.0-stable](https://github.com/freenas/ports/tree/freenas/11.0-stable/) | FreeBSD Ports Tree - [Upstream](https://github.com/freebsd/freebsd-ports/tree/branches/2017Q2) |
-| **webui**  | [freenas/11.0-stable](https://github.com/freenas/webui/tree/freenas/11.0-stable/) | New Angular UI |
-| **freenas-docs**  | [master](https://github.com/freenas/freenas-docs/tree/master/) | Handbook |
-| **samba**  | [freenas/11.0-stable](https://github.com/freenas/samba/tree/freenas/11.0-stable/) | Samba Sources |
-| **py-libzfs**  | [master](https://github.com/freenas/py-libzfs/tree/master/) | Python interface to libzfs |
+See [NOTICE](NOTICE) and [TRADEMARKS.md](TRADEMARKS.md). Nothing here is
+relicensed; upstream copyright notices and licence texts are preserved.
