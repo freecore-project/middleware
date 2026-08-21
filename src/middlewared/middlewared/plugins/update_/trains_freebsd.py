@@ -3,10 +3,40 @@ import re
 
 import requests
 
-from freenasOS import Configuration, Train
-from freenasOS.Update import CheckForUpdates, GetServiceDescription
+try:
+    from freenasOS import Configuration, Train
+    from freenasOS.Exceptions import UpdateNetworkFileNotFoundException
+    from freenasOS.Update import CheckForUpdates, GetServiceDescription
+except ImportError:
+    from middlewared.utils.freenasOS import Configuration, Train
+    from middlewared.utils.freenasOS.Exceptions import UpdateNetworkFileNotFoundException
+    from middlewared.utils.freenasOS.Update import CheckForUpdates, GetServiceDescription
 
 from middlewared.service import private, Service
+
+
+FREECORE_UPDATE_SERVER = 'https://updates.freecore.org/FreeCORE'
+
+
+def manifest_build_time(manifest):
+    try:
+        value = manifest.dict().get('BuildTime')
+    except Exception:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def manifest_is_newer(current, latest):
+    current_build_time = manifest_build_time(current)
+    latest_build_time = manifest_build_time(latest)
+    if current_build_time is None or latest_build_time is None:
+        return True
+
+    return latest_build_time > current_build_time
 
 
 class CheckUpdateHandler(object):
@@ -116,9 +146,13 @@ class UpdateService(Service):
                 'sequence': train.LastSequence(),
             }
 
-        if not self.middleware.call_sync('system.is_enterprise'):
-            scale_trains = self.middleware.call_sync('update.get_scale_trains_data')
-            trains.update(**scale_trains['trains'])
+        master_update_server = (conf.UpdateServerMaster() or '').rstrip('/')
+        if not self.middleware.call_sync('system.is_enterprise') and master_update_server != FREECORE_UPDATE_SERVER:
+            try:
+                scale_trains = self.middleware.call_sync('update.get_scale_trains_data')
+                trains.update(**scale_trains['trains'])
+            except Exception:
+                self.logger.warning('Failed to retrieve SCALE trains', exc_info=True)
 
         return {
             'trains': trains,
@@ -155,13 +189,26 @@ class UpdateService(Service):
             return self.middleware.call_sync('update.get_scale_update', train, old_version)
 
         handler = CheckUpdateHandler()
-        manifest = CheckForUpdates(
-            diff_handler=handler.diff_call,
-            handler=handler.call,
-            train=train,
-        )
+        try:
+            manifest = CheckForUpdates(
+                diff_handler=handler.diff_call,
+                handler=handler.call,
+                train=train,
+            )
+        except UpdateNetworkFileNotFoundException as e:
+            self.logger.debug('FreeBSD update train %r has no latest manifest: %s', train, e)
+            return {'status': 'UNAVAILABLE'}
 
         if not manifest:
+            return {'status': 'UNAVAILABLE'}
+
+        conf = Configuration.Configuration()
+        sys_mani = conf.SystemManifest()
+        if sys_mani and not manifest_is_newer(sys_mani, manifest):
+            self.logger.debug(
+                'FreeBSD update train %r latest manifest %r is not newer than system manifest %r',
+                train, manifest.Version(), sys_mani.Version(),
+            )
             return {'status': 'UNAVAILABLE'}
 
         data = {
@@ -171,8 +218,6 @@ class UpdateService(Service):
             'notes': manifest.Notes(),
         }
 
-        conf = Configuration.Configuration()
-        sys_mani = conf.SystemManifest()
         if sys_mani:
             sequence = sys_mani.Sequence()
         else:
