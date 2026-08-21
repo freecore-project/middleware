@@ -12,14 +12,22 @@ MAINTAINER=	dev@ixsystems.com
 COMMENT=	Python wrappers for various BSD interfaces
 
 EXTRACT_ONLY=
-BUILD_DEPENDS=  ${PYTHON_PKGNAMEPREFIX}six>0:devel/py-six@${FLAVOR}
+NAS_SRC?=	/usr/nas_source/py-bsd
+WRKSRC=		${WRKDIR}/py-bsd
 
-WRKSRC=		/usr/nas_source/py-bsd
+BUILD_DEPENDS=	${LOCALBASE}/include/cdialog/dialog.h:devel/cdialog
+LIB_DEPENDS=	libcdialog.so:devel/cdialog
 
 USES=		python
 USE_PYTHON=	autoplist cython distutils
 
+CFLAGS+=	-I${LOCALBASE}/include -I${LOCALBASE}/include/cdialog
+
 checksum fetch:
 	${ECHO_CMD} ${.TARGET} not needed because building direct
+
+post-extract:
+	@${MKDIR} ${WRKSRC}
+	@${CP} -R ${NAS_SRC}/. ${WRKSRC}/
 
 .include <bsd.port.mk>

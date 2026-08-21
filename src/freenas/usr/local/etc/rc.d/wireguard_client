@@ -1,0 +1,111 @@
+#!/bin/sh
+#
+# PROVIDE: wireguard_client
+# REQUIRE: DAEMON middlewared
+# KEYWORD: shutdown
+
+# The net/wireguard-tools port ships a single "wireguard" rc script that acts on
+# every interface named in wireguard_interfaces, so it cannot give the client an
+# lifecycle independent of the server -- stopping one would stop both. This script
+# owns wg2 (the client) alone; wg1 (the server) stays with the port's script and
+# wg0 with TrueCommand.
+
+. /etc/rc.subr
+
+name="wireguard_client"
+rcvar="wireguard_client_enable"
+
+: ${wireguard_client_enable:="NO"}
+: ${wireguard_client_interface:="wg2"}
+: ${wireguard_client_timeout:="15"}
+
+start_cmd="wireguard_client_start"
+stop_cmd="wireguard_client_stop"
+status_cmd="wireguard_client_status"
+extra_commands="status"
+
+load_rc_config $name
+
+_wg_conf="/usr/local/etc/wireguard/${wireguard_client_interface}.conf"
+
+wireguard_client_up()
+{
+	/usr/local/bin/wg show "${wireguard_client_interface}" >/dev/null 2>&1
+}
+
+wireguard_client_start()
+{
+	if ! LD_LIBRARY_PATH=/usr/local/lib /usr/local/bin/midclt -t 30 call etc.generate wireguard_client >/dev/null 2>&1; then
+		echo "failed to generate the wireguard client configuration"
+		return 1
+	fi
+
+	if [ ! -r "${_wg_conf}" ]; then
+		echo "wireguard client is not configured"
+		return 1
+	fi
+
+	# middleware's SimpleService start is an rc restart, so start has to be a
+	# no-op on an interface that is already up rather than an error.
+	if wireguard_client_up; then
+		return 0
+	fi
+
+	# wg-quick(8) brings the interface up and then backgrounds a route-monitor
+	# daemon, but on FreeBSD 15 the script itself never returns -- measured
+	# three ways in the internal development record. Called in the foreground it would
+	# hang service(8), middleware's service.start, and /etc/rc at boot. Run it
+	# detached and wait for the interface, which is the real success condition.
+	/usr/local/bin/wg-quick up "${wireguard_client_interface}" >/dev/null 2>&1 &
+	_wg_pid=$!
+
+	_waited=0
+	_limit=$((wireguard_client_timeout * 4))
+	while [ "${_waited}" -lt "${_limit}" ]; do
+		if wireguard_client_up; then
+			return 0
+		fi
+		# wg-quick exiting without the interface is a real failure (unreadable
+		# config, bad key). Stop waiting for something that will never appear.
+		if ! kill -0 "${_wg_pid}" 2>/dev/null; then
+			echo "wg-quick exited without bringing ${wireguard_client_interface} up"
+			return 1
+		fi
+		sleep 0.25
+		_waited=$((_waited + 1))
+	done
+
+	echo "timed out after ${wireguard_client_timeout}s waiting for ${wireguard_client_interface}"
+	return 1
+}
+
+wireguard_client_stop()
+{
+	if ! wireguard_client_up; then
+		return 0
+	fi
+
+	# wg-quick down reads the config to tear down the routes it installed. If the
+	# config has since been removed (an incomplete config makes the etc template
+	# refuse to render, which unlinks it) wg-quick cannot run at all, and without
+	# this fallback the interface would be stranded up with no way to stop it.
+	if [ -r "${_wg_conf}" ]; then
+		/usr/local/bin/wg-quick down "${wireguard_client_interface}"
+	else
+		echo "${_wg_conf} is missing; destroying ${wireguard_client_interface} directly"
+		/sbin/ifconfig "${wireguard_client_interface}" destroy
+	fi
+}
+
+wireguard_client_status()
+{
+	if wireguard_client_up; then
+		echo "wireguard client ${wireguard_client_interface} is up"
+		return 0
+	fi
+
+	echo "wireguard client ${wireguard_client_interface} is down"
+	return 1
+}
+
+run_rc_command "$1"

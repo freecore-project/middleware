@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/local/bin/python3
 # Copyright 2017 iXsystems, Inc.
 # All rights reserved
 #
@@ -50,7 +50,7 @@ class Connection(object):
         self.client.close()
 
         if typ is not None:
-            raise ()
+            raise
 
 
 class ZFS(object):
@@ -144,7 +144,7 @@ class ZFS(object):
 
 
 class Migrate(object):
-    def __init__(self, jail, _dir, pool, verbose, loop):
+    def __init__(self, jail, _dir, pool, verbose):
         self.jail = jail
         self.dir = _dir
         self.meta = f"{self.dir}/.{self.jail}.meta"
@@ -154,7 +154,6 @@ class Migrate(object):
                               history_prefix="<warden-migration>")
         self.ZFS = ZFS(self.pool, self.dataset, self.zfs, verbose)
         self.thread_pool_executor = ThreadPoolExecutor(2)
-        self.loop = loop
         self.r_pipe, self.s_pipe = os.pipe()
         self.iocage_root = f"{self.pool}/iocage/jails/{self.jail}/root"
         self.warden_dataset = self.zfs.get_dataset_by_path(self.dataset)
@@ -216,8 +215,9 @@ class Migrate(object):
 
         self.create_jail(props, iocroot)
 
+        loop = asyncio.get_running_loop()
         await asyncio.gather(
-            asyncio.ensure_future(self.loop.run_in_executor(
+            loop.run_in_executor(
                 self.thread_pool_executor,
                 functools.partial(
                     self.ZFS.send_dataset,
@@ -225,15 +225,15 @@ class Migrate(object):
                     self.warden_dataset,
                     self.date
                 )
-            )),
-            asyncio.ensure_future(self.loop.run_in_executor(
+            ),
+            loop.run_in_executor(
                 self.thread_pool_executor,
                 functools.partial(
                     self.ZFS.recv_dataset,
                     self.r_pipe,
                     self.iocage_root
                 )
-            ))
+            )
         )
 
         self.warden_dataset.destroy_snapshot(f"WardenMigration_{self.date}")
@@ -374,7 +374,7 @@ class Migrate(object):
         return f'{jail_world}-RELEASE'
 
 
-async def main(argv, loop):
+async def main(argv):
     """
     :param argv: list of jails specified by -j and the iocage pool specified
     with -p
@@ -429,16 +429,11 @@ async def main(argv, loop):
 
     for jail in jails:
         print(f"-- Migrating: {jail} --")
-        await Migrate(jail, _dir, iocage_pool, verbose, loop).migrate_jail()
+        await Migrate(jail, _dir, iocage_pool, verbose).migrate_jail()
 
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
         sys.exit("Must be root to migrate jails!")
 
-    loop = asyncio.get_event_loop()
-
-    try:
-        loop.run_until_complete(main(sys.argv[1:], loop))
-    finally:
-        loop.close()
+    asyncio.run(main(sys.argv[1:]))
