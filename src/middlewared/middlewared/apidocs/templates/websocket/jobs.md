@@ -7,7 +7,7 @@ from the endpoint. With this job id, the client can query the status of the job
 to see the progress and status. Errors are shown
 in the output, or the output contains the result returned by the endpoint on completion.
 
-e.g. `ws://truenas.domain/websocket`
+e.g. `ws://freecore.domain/websocket`
 
 ### Example of connecting to endpoint marked as a job
 
@@ -70,7 +70,7 @@ Request:
         "id": "d8e715be-6bc7-11e6-8c28-00e04d680384",
         "msg": "method",
         "method": "core.download",
-        "params": ["config.save", [{}], "freenas-FreeNAS-11.3-MASTER-201910090828-20191017122016.db"]
+        "params": ["config.save", [{}], "freecore-FreeCORE-15.0-MASTER-202609071610-20260907172300.db"]
     }
 
 Response:
