@@ -1,6 +1,7 @@
 import sys
 import enum
 import subprocess
+import time
 from platform import system
 
 # sys.real_prefix only found in old virtualenv
@@ -28,6 +29,57 @@ from samba import credentials
 from samba import NTSTATUSError
 
 libsmb_has_rename = 'rename' in dir(libsmb.Conn)
+
+
+# smbd start-up was measured at ~2.4s on the 13.3 baseline ("smbd version 4.19.6
+# started" -> file_init_global), so 20s is an 8x margin on the condition being
+# waited for. It is deliberately NOT generous: ~311 test cases route through
+# these helpers, so a build where SMB is genuinely down would otherwise pay the
+# wait on every one of them and turn a 40 minute run into an overnight one.
+#
+# The give-up counter is the other half of that. Only a *fully exhausted* wait
+# counts -- an ordinary restart resolves in ~3s and never increments it -- so
+# three exhausted waits means SMB is down rather than starting, and every later
+# refusal then fails immediately. Tolerate start-up; fail fast on a broken build.
+_SMB_STARTUP_GRACE = 20
+_SMB_GIVE_UP_AFTER = 3
+_smb_exhausted_waits = 0
+
+
+def _smb_should_retry():
+    return _smb_exhausted_waits < _SMB_GIVE_UP_AFTER
+
+
+def _smb_note_exhausted():
+    global _smb_exhausted_waits
+    _smb_exhausted_waits += 1
+
+
+def _smb_subprocess(cmd):
+    """Run an smbclient/smbcacls/smbcquotas command, retrying a refused transport.
+
+    These helpers shell out from the runner and hit the same smbd start-up race
+    that SMB.connect() handles: the appliance is still bringing samba back up
+    after a share or service change, and the command exits non-zero with
+    "do_connect: Connection to <ip> failed (Error NT_STATUS_CONNECTION_REFUSED)".
+    That is what left test_437_smb_vss failing four times after SMB.connect()
+    was already retrying -- get_shadow_copies never goes through connect().
+
+    Only a refused connection is retried. Every other non-zero exit is returned
+    to the caller untouched, so each helper still raises for its own reason.
+    """
+    deadline = time.monotonic() + _SMB_STARTUP_GRACE
+    while True:
+        cp = subprocess.run(cmd, capture_output=True)
+        if cp.returncode == 0:
+            return cp
+        blob = (cp.stdout + cp.stderr).decode(errors='ignore').lower()
+        if 'refused' not in blob or not _smb_should_retry():
+            return cp
+        if time.monotonic() >= deadline:
+            _smb_note_exhausted()
+            return cp
+        time.sleep(1)
 
 
 class ACLControl(enum.IntFlag):
@@ -100,13 +152,40 @@ class SMB(object):
         self._smb1 = smb1
         self._username = username
         self._password = password
-        self._connection = libsmb.Conn(
-            host,
-            share,
-            self._lp,
-            self._cred,
-            force_smb1=smb1,
-        )
+
+        # Wait for smbd to actually accept connections.
+        #
+        # The SMB tests restart samba constantly -- creating a share, starting
+        # the service, toggling enable_smb1 -- and the middleware reports the
+        # cifs service RUNNING as soon as its rc script returns, which is well
+        # before smbd is listening. Measured on the 13.3 VM baseline: the
+        # samba log records "smbd version 4.19.6 started" and only reaches
+        # file_init_global ~2.4s later, while the callers do sleep(1) and then
+        # connect. That produced 7 consistent failures (test_425 x3,
+        # test_437 x4) as NT_STATUS_CONNECTION_REFUSED, on hardware slower than
+        # the lab this suite was written for.
+        #
+        # Only a refused transport is retried. A bad password, a missing share,
+        # or a failed protocol negotiation raises immediately, so every test
+        # still fails for its own reasons -- this widens no assertion.
+        deadline = time.monotonic() + _SMB_STARTUP_GRACE
+        while True:
+            try:
+                self._connection = libsmb.Conn(
+                    host,
+                    share,
+                    self._lp,
+                    self._cred,
+                    force_smb1=smb1,
+                )
+                return
+            except (NTSTATUSError, RuntimeError) as e:
+                if 'refused' not in str(e).lower() or not _smb_should_retry():
+                    raise
+                if time.monotonic() >= deadline:
+                    _smb_note_exhausted()
+                    raise
+                time.sleep(1)
 
     def disconnect(self):
         open_files = list(self._open_files.keys())
@@ -208,7 +287,7 @@ class SMB(object):
             cmd.extend(["-m", "NT1"])
 
         cmd.extend(["-c", f'rename {src} {dst}'])
-        cl = subprocess.run(cmd, capture_output=True)
+        cl = _smb_subprocess(cmd)
         if cl.returncode != 0:
             raise RuntimeError(cl.stdout.decode())
 
@@ -249,7 +328,7 @@ class SMB(object):
             cmd.extend(["-m", "NT1"])
 
         cmd.extend(["-c", f'allinfo {path}'])
-        cl = subprocess.run(cmd, capture_output=True)
+        cl = _smb_subprocess(cmd)
         if cl.returncode != 0:
             raise RuntimeError(cl.stderr.decode())
 
@@ -278,7 +357,7 @@ class SMB(object):
         if smb1:
             cmd.extend(["-m", "NT1"])
 
-        smbcquotas = subprocess.run(cmd, capture_output=True)
+        smbcquotas = _smb_subprocess(cmd)
         quotaout = smbcquotas.stdout.decode().splitlines()
         return self._parse_quota(quotaout)
 
@@ -300,7 +379,7 @@ class SMB(object):
         if smb1:
             cmd.extend(["-m", "NT1"])
 
-        smbcquotas = subprocess.run(cmd, capture_output=True)
+        smbcquotas = _smb_subprocess(cmd)
         quotaout = smbcquotas.stdout.decode().splitlines()
         return self._parse_quota(quotaout)
 
@@ -323,7 +402,7 @@ class SMB(object):
 
         cmd.append(path)
 
-        cl = subprocess.run(cmd, capture_output=True)
+        cl = _smb_subprocess(cmd)
         if cl.returncode != 0:
             raise RuntimeError(cl.stdout.decode() or cl.stderr.decode())
 
@@ -362,7 +441,7 @@ class SMB(object):
             cmd.extend(["-I", action.lower()])
 
         elif action == "PROPAGATE":
-            cmd.append('--propagate-iheritance')
+            cmd.append('--propagate-inheritance')
 
         else:
             raise ValueError(f"{action}: invalid action")
@@ -372,6 +451,6 @@ class SMB(object):
 
         cmd.append(path)
 
-        cl = subprocess.run(cmd, capture_output=True)
+        cl = _smb_subprocess(cmd)
         if cl.returncode != 0:
             raise RuntimeError(cl.stdout.decode() or cl.stderr.decode())

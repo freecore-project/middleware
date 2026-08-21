@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import enum
 import errno
@@ -9,9 +10,12 @@ import shutil
 import socket
 import subprocess
 import tdb
+import tempfile
 import time
 
 from dns import resolver
+from middlewared.plugins.activedirectory_.cache import augment_gencache_keys
+from middlewared.plugins.activedirectory_.spn import samba_keytab_sync_option, service_spn_targets
 from middlewared.plugins.smb import SMBCmd, SMBPath, WBCErr
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str
 from middlewared.service import job, private, ConfigService, ValidationError, ValidationErrors
@@ -20,7 +24,11 @@ import middlewared.sqlalchemy as sa
 from middlewared.utils import filter_list, run
 from middlewared.plugins.directoryservices import DSStatus
 from middlewared.plugins.idmap import DSType
-from middlewared.plugins.kerberos import krb5ccache
+from middlewared.plugins.kerberos import keytab, krb5ccache
+from middlewared.utils.krb5 import KRB5
+
+
+AD_KEYTAB_SYNC_LOCK = asyncio.Lock()
 
 
 class neterr(enum.Enum):
@@ -903,7 +911,7 @@ class ActiveDirectoryService(ConfigService):
             else:
                 wb_dcinfo = subprocess.run([SMBCmd.WBINFO.value, "--dc-info", data["domainname"]],
                                            capture_output=True, check=False)
-                if wb_dcinfo.returncode == 0:
+                if wb_dcinfo.returncode == 0 and wb_dcinfo.stdout.decode().strip():
                     # output "FQDN (ip address)"
                     our_dc = wb_dcinfo.stdout.decode().split()[0]
                     for dc_to_check in res:
@@ -1077,7 +1085,7 @@ class ActiveDirectoryService(ConfigService):
         return neterr.JOINED
 
     @private
-    async def net_keytab_add_update_ads(self, service_class):
+    async def net_keytab_add_update_ads(self, service_class, ad=None):
         """
         Only automatically add NFS SPN entries on domain join
         if kerberized nfsv4 is enabled.
@@ -1086,18 +1094,77 @@ class ActiveDirectoryService(ConfigService):
         if not (await self.middleware.call('nfs.config'))['v4_krb']:
             return False
 
-        cmd = [
+        common = [
             SMBCmd.NET.value,
             '--use-kerberos', 'required',
             '--use-krb5-ccache', krb5ccache.SYSTEM.value,
-            'ads', 'keytab',
-            'add_update_ads', service_class
         ]
 
-        netads = await run(cmd, check=False)
-        if netads.returncode != 0:
-            raise CallError('failed to set spn entry '
-                            f'[{service_class}]: {netads.stdout.decode().strip()}')
+        if KRB5.platform() == KRB5.HEIMDAL:
+            netads = await run(common + [
+                'ads', 'keytab', 'add_update_ads', service_class
+            ], check=False)
+            if netads.returncode != 0:
+                error = netads.stderr.decode().strip() or netads.stdout.decode().strip()
+                raise CallError(f'failed to set spn entry [{service_class}]: {error}')
+
+            return True
+
+        if ad is None:
+            ad = await self.config()
+
+        async with AD_KEYTAB_SYNC_LOCK:
+            current_spns = await self.get_spn_list()
+            targets = service_spn_targets(
+                service_class, current_spns, ad['netbiosname'], ad['domainname']
+            )
+            registered = {spn.casefold() for spn in current_spns}
+
+            for spn in targets:
+                if spn.casefold() in registered:
+                    continue
+
+                netads = await run(common + [
+                    'ads', 'setspn', 'add', spn
+                ], check=False)
+                if netads.returncode != 0:
+                    error = netads.stderr.decode().strip() or netads.stdout.decode().strip()
+                    raise CallError(f'failed to set spn entry [{spn}]: {error}')
+
+            keytab_dir = os.path.dirname(keytab.SAMBA.value)
+            fd, staged_keytab = tempfile.mkstemp(prefix='.samba.keytab.', dir=keytab_dir)
+            os.close(fd)
+            os.unlink(staged_keytab)
+            try:
+                netads = await run(common + [
+                    f'--option={samba_keytab_sync_option(staged_keytab)}',
+                    'ads', 'keytab', 'create'
+                ], check=False)
+                if netads.returncode != 0:
+                    error = netads.stderr.decode().strip() or netads.stdout.decode().strip()
+                    raise CallError(f'failed to synchronize machine account keytab: {error}')
+
+                if not os.path.isfile(staged_keytab) or os.path.getsize(staged_keytab) == 0:
+                    raise CallError('machine account keytab synchronization produced no output')
+
+                os.chmod(staged_keytab, 0o600)
+                stored = await self.middleware.call(
+                    'kerberos.keytab.store_samba_keytab', staged_keytab
+                )
+                if not stored:
+                    raise CallError('failed to store synchronized machine account keytab')
+
+                # Samba's synchronizer owns only its staged keytab.  Rebuild the
+                # mixed system keytab through the existing atomic renderer so
+                # uploaded keytabs survive this refresh.
+                await self.middleware.call('etc.generate', 'kerberos')
+                if not await self.middleware.call('kerberos.keytab.has_nfs_principal'):
+                    raise CallError('synchronized system keytab has no NFS principal')
+            finally:
+                try:
+                    os.unlink(staged_keytab)
+                except FileNotFoundError:
+                    pass
 
         return True
 
@@ -1156,7 +1223,7 @@ class ActiveDirectoryService(ConfigService):
         if ad is None:
             ad = await self.config()
 
-        ok = await self.net_keytab_add_update_ads('nfs')
+        ok = await self.net_keytab_add_update_ads('nfs', ad)
         if not ok:
             return False
 
@@ -1385,18 +1452,26 @@ class ActiveDirectoryService(ConfigService):
             'RID',
             'AUTORID'
         ]
+        passwd_entries = []
+        group_entries = []
         if not ad['disable_freenas_cache']:
             """
-            These calls populate the winbindd cache
+            These calls populate the winbindd cache. Retain the results because
+            Samba 4.24 may not create domain gencache entries during enumeration.
             """
-            pwd.getpwall()
-            grp.getgrall()
+            passwd_entries = pwd.getpwall()
+            group_entries = grp.getgrall()
         elif ad['bindname']:
-            id = subprocess.run(['/usr/bin/id', f"{smb['workgroup']}\\{ad['bindname']}"], capture_output=True)
+            id_cmd = shutil.which('id') or '/usr/bin/id'
+            id = subprocess.run([id_cmd, f"{smb['workgroup']}\\{ad['bindname']}"], capture_output=True)
             if id.returncode != 0:
                 self.logger.debug('failed to id AD bind account [%s]: %s', ad['bindname'], id.stderr.decode())
 
-        shutil.copyfile(f'{SMBPath.LOCKDIR.platform()}/gencache.tdb', '/tmp/gencache.tdb')
+        gencache_src = f'{SMBPath.LOCKDIR.platform()}/gencache.tdb'
+        if not os.path.exists(gencache_src):
+            self.logger.warning('gencache.tdb not found at %s, skipping AD cache fill', gencache_src)
+            return
+        shutil.copyfile(gencache_src, '/tmp/gencache.tdb')
 
         gencache = tdb.Tdb('/tmp/gencache.tdb', 0, tdb.DEFAULT, os.O_RDONLY)
         gencache_keys = [x for x in gencache.keys()]
@@ -1425,6 +1500,10 @@ class ActiveDirectoryService(ConfigService):
                     'high_id': d['range_high'],
                     'id_type_both': True if d['idmap_backend'] in id_type_both_backends else False,
                 })
+
+        gencache_keys = augment_gencache_keys(
+            gencache_keys, passwd_entries, group_entries, known_domains
+        )
 
         for key in gencache_keys:
             prefix = key[0:13]

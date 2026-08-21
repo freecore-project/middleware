@@ -17,7 +17,7 @@ from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, Ref, Str
 from middlewared.service import CallError, CRUDService, job, periodic, private, Service, skip_arg, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.validators import Email, IpAddress, Range
-from middlewared.utils import osc
+
 
 from acme import client, errors, messages
 from OpenSSL import crypto, SSL
@@ -327,7 +327,7 @@ class CryptoKeyService(Service):
             )
 
             try:
-                context = SSL.Context(SSL.TLSv1_2_METHOD)
+                context = SSL.Context(SSL.TLS_METHOD)
                 context.use_certificate(public_key_obj)
                 context.use_privatekey(private_key_obj)
                 context.check_privatekey()
@@ -477,11 +477,12 @@ class CryptoKeyService(Service):
         cert = self.generate_builder({
             'crypto_subject_name': {
                 'country_name': 'US',
-                'organization_name': 'iXsystems',
+                'organization_name': 'FreeCORE',
                 'common_name': 'localhost',
-                'email_address': 'info@ixsystems.com',
-                'state_or_province_name': 'Tennessee',
-                'locality_name': 'Maryville',
+                'email_address': 'dev@freecore.org',
+                # No state/locality: FreeCORE has no legal address, and generate_builder
+                # skips falsy values, so omitting them simply leaves them out of the
+                # subject rather than asserting somebody else's. the internal development record.
             },
             'lifetime': NOT_VALID_AFTER_DEFAULT,
             'san': self.normalize_san(['localhost'])
@@ -1380,6 +1381,12 @@ class CertificateService(CRUDService):
     @private
     def get_acme_client_and_key(self, acme_directory_uri, tos=False):
         data = self.middleware.call_sync('acme.registration.query', [['directory', '=', acme_directory_uri]])
+        if data and not data[0]['body']:
+            # An incomplete registration left by an interrupted create on an earlier
+            # version. It can never be used, and nothing public can remove it, so
+            # re-register instead of failing forever. acme.registration.create repairs
+            # the existing row in place rather than replacing it.
+            data = []
         if not data:
             data = self.middleware.call_sync(
                 'acme.registration.create',
@@ -1395,7 +1402,7 @@ class CertificateService(CRUDService):
             'uri': data['uri'],
             'terms_of_service': data['tos'],
             'body': {
-                'contact': [data['body']['contact']],
+                'contact': [data['body']['contact']] if data['body']['contact'] else [],
                 'status': data['body']['status'],
                 'key': {
                     'e': key_dict['e'],
@@ -1470,7 +1477,7 @@ class CertificateService(CRUDService):
         acme_client, key = self.get_acme_client_and_key(data['acme_directory_uri'], data['tos'])
         try:
             # perform operations and have a cert issued
-            order = acme_client.new_order(csr_data['CSR'])
+            order = acme_client.new_order(csr_data['CSR'].encode())
         except messages.Error as e:
             raise CallError(f'Failed to issue a new order for Certificate : {e}')
         else:
@@ -1622,11 +1629,7 @@ class CertificateService(CRUDService):
         if not os.path.exists(dhparam_path) or os.stat(dhparam_path).st_size == 0:
             with open('/dev/console', 'wb') as console:
                 with open(dhparam_path, 'wb') as f:
-                    if osc.IS_FREEBSD:
-                        rand = '/dev/random'
-                    else:
-                        rand = '/dev/urandom'
-                    subprocess.run(['openssl', 'dhparam', '-rand', rand, '2048'], stdout=f, stderr=console, check=True)
+                    subprocess.run(['openssl', 'dhparam', '2048'], stdout=f, stderr=console, check=True)
 
     # CREATE METHODS FOR CREATING CERTIFICATES
     # "do_create" IS CALLED FIRST AND THEN BASED ON THE TYPE OF THE CERTIFICATE WHICH IS TO BE CREATED THE
@@ -1753,8 +1756,8 @@ class CertificateService(CRUDService):
                     "city": "Nashville",
                     "common": "domain1.com",
                     "country": "US",
-                    "email": "dev@ixsystems.com",
-                    "organization": "iXsystems",
+                    "email": "dev@freecore.org",
+                    "organization": "FreeCORE",
                     "state": "Tennessee",
                     "digest_algorithm": "SHA256",
                     "signedby": 4,
@@ -2486,8 +2489,8 @@ class CertificateAuthorityService(CRUDService):
                     "city": "Nashville",
                     "common": "domain1.com",
                     "country": "US",
-                    "email": "dev@ixsystems.com",
-                    "organization": "iXsystems",
+                    "email": "dev@freecore.org",
+                    "organization": "FreeCORE",
                     "state": "Tennessee",
                     "digest_algorithm": "SHA256"
                     "create_type": "CA_CREATE_INTERNAL"

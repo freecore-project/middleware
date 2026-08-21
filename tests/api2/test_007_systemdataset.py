@@ -11,17 +11,42 @@ from auto_config import ha, dev_test, hostname, user, password
 # comment pytestmark for development testing with --dev-test
 pytestmark = pytest.mark.skipif(dev_test, reason='Skipping for test development testing')
 
+Reason = (
+    'ADNameServer, AD_DOMAIN, ADPASSWORD, ADUSERNAME, AD_NETBIOS, '
+    'or/and AD_CREATECOMPUTER are missing in config.py'
+)
 try:
-    from config import AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer
+    from config import (
+        AD_CREATECOMPUTER, AD_DOMAIN, AD_NETBIOS, ADPASSWORD, ADUSERNAME,
+        ADNameServer,
+    )
+    ad_test = pytest.mark.skipif(False, reason=Reason)
 except ImportError:
-    Reason = 'ADNameServer AD_DOMAIN, ADPASSWORD, or/and ADUSERNAME are missing in config.py"'
-    ad_test = pytest.mark.skip(reason=Reason)
+    ad_test = pytest.mark.skipif(True, reason=Reason)
 
 
 if ha and "virtual_ip" in os.environ:
     ip = os.environ["controller1_ip"]
 else:
     from auto_config import ip
+
+
+# test_11 starts every service only to prove the system dataset can move while
+# services are running. It is not a "every service is startable" test.
+#
+# Bastille and rar2fs are fork-added with no 13.3 counterparts -- there is no
+# inherited behaviour to compare them against -- and they decline with a 422
+# until the operator configures their required storage. Skipping them is
+# legitimate; the test predates them existing.
+#
+# Nothing else belongs in this list. WireGuard was briefly added here and should
+# not have been: it replaces 13.3's openvpn_server/openvpn_client one-for-one, and
+# those returned False through a 200 when unconfigured rather than refusing, so a
+# 422 there was a contract change rather than an opt-in service behaving correctly.
+# That is fixed in the service (the internal development record), not papered over here --
+# see the no-band-aids rule. If another service turns up returning 422, ask whether
+# it replaced something inherited before adding it.
+OPTIONAL_UNCONFIGURED_SERVICES = ('bastille', 'rar2fs')
 
 
 @pytest.fixture(scope='module')
@@ -161,6 +186,7 @@ def test_06_creating_a_second_pool_and_verify_it_doesnt_become_sysds(request, po
     assert results.json()['basename'] == 'first_pool/.system', results.text
 
 
+@ad_test
 def test_07_verify_changes_to_sysds_are_forbidden_while_AD_is_running(request):
     depends(request, ["second_pool"])
 
@@ -180,6 +206,7 @@ def test_07_verify_changes_to_sysds_are_forbidden_while_AD_is_running(request):
         "bindname": ADUSERNAME,
         "domainname": AD_DOMAIN,
         "netbiosname": hostname,
+        "createcomputer": AD_CREATECOMPUTER,
         "dns_timeout": 15,
         "verbose_logging": True,
         "enable": True
@@ -250,8 +277,49 @@ def test_10_verify_logs_after_sysds_is_moved_to_second_pool(logs_data):
 def test_11_verify_sysds_can_be_moved_while_services_are_running(request):
     depends(request, ["second_pool"])
     services = {i['service']: i for i in GET('/service').json()}
-    services_list = list(services.keys())
+    services_list = [
+        service for service in services
+        if service not in OPTIONAL_UNCONFIGURED_SERVICES
+    ]
+    unexpected_states = {
+        service: services[service]['state']
+        for service in services_list
+        if services[service]['state'] not in ('RUNNING', 'STOPPED')
+    }
+    assert not unexpected_states, (
+        'Cannot safely restore services with unknown states: '
+        f'{unexpected_states!r}'
+    )
+
+    started_services = []
+
+    def stop_started_services():
+        failures = []
+        for service in reversed(started_services):
+            try:
+                results = POST("/service/stop/", {"service": service})
+            except Exception as e:
+                failures.append(f'{service}: {e!r}')
+                continue
+
+            if results.status_code != 200:
+                failures.append(
+                    f'{service}: HTTP {results.status_code}: '
+                    f'{results.text.strip()}'
+                )
+
+        message = 'Failed to stop services started by test_11:\n{}'.format(
+            '\n'.join(failures)
+        )
+        assert not failures, message
+
+    request.addfinalizer(stop_started_services)
+
     for service in services_list:
+        if service != 'ssh' and services[service]['state'] == 'STOPPED':
+            # Record the mutation before attempting it so cleanup still runs if
+            # the request starts the service but its response is unsuccessful.
+            started_services.append(service)
         results = POST("/service/start/", {"service": service})
         assert results.status_code == 200, results.text
 
@@ -266,11 +334,6 @@ def test_11_verify_sysds_can_be_moved_while_services_are_running(request):
     assert isinstance(results.json(), dict), results.text
     assert results.json()['pool'] == 'first_pool', results.text
     assert results.json()['basename'] == 'first_pool/.system', results.text
-
-    for service in services_list:
-        if service != 'ssh':
-            results = POST("/service/stop/", {"service": service})
-            assert results.status_code == 200, results.text
 
 
 def test_12_delete_second_pool_and_verify_sysds_is_moved_to_first_pool(request, pool_data):

@@ -84,7 +84,7 @@ hardware_func()
 			section_header "camcontrol inquiry ${disk}"
 			camcontrol inquiry "${disk}"
 			section_footer
-		elif echo "${disk}" | egrep -q '^ada[0-9]+'
+		elif echo "${disk}" | egrep -q '^(ada|nda)[0-9]+'
 		then
 			section_header "camcontrol identify ${disk}"
 			camcontrol identify "${disk}"
@@ -92,10 +92,10 @@ hardware_func()
 		fi
 	done
 
-	if which getencstat > /dev/null
+	if which sesutil > /dev/null
 	then
-		section_header "getencstat -V /dev/ses*"
-		getencstat -V /dev/ses*
+		section_header "sesutil map"
+		sesutil map
 		section_footer
 	fi
 
@@ -119,8 +119,12 @@ hardware_func()
 		done
 	fi
 
-	section_header "Enclosures (midclt call enclosure.query)"
-	midclt call enclosure.query |jq .
+	section_header "Enclosures (sesutil map)"
+	sesutil map
+	section_footer
+
+	section_header "Enclosures (sesutil status)"
+	sesutil status
 	section_footer
 
 	for dev in $(mprutil_get_adapters); do

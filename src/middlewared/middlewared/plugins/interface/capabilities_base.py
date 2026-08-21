@@ -24,7 +24,7 @@ class InterfaceCapabilitiesBase(ServicePartBase):
         raise NotImplementedError
 
     @private
-    @accepts(Str('iface'), List('capabilities', default=[c for c in netif.InterfaceCapability.__members__]))
+    @accepts(Str('iface'), List('capabilities', default=[] if netif is None else [c for c in netif.InterfaceCapability.__members__]))
     def enable_capabilities(self, iface, capabilities):
         raise NotImplementedError
 

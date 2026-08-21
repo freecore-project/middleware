@@ -31,7 +31,7 @@ class SMBService(Service):
             f"[{version}]. Expected version was: [{GROUPMAP_JSON_VERSION}]. "
             "Behavior is undefined with a version mismatch and so refusing "
             "to perform groupmap operation. Please file a bug report at "
-            "jira.ixsystems.com with this traceback."
+            "the FreeCORE issue tracker with this traceback."
         )
 
     async def groupmap_listmem(self, sid):

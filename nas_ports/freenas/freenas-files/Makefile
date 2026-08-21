@@ -14,6 +14,7 @@ PREFIX=/
 
 USES= 	python
 RUN_DEPENDS=	${PYTHON_PKGNAMEPREFIX}snmp_passpersist>=1.3.0:net-mgmt/py-snmp_passpersist \
+		${PYTHON_PKGNAMEPREFIX}sysctl>0:devel/py-sysctl@${PY_FLAVOR} \
 		${PYTHON_PKGNAMEPREFIX}middlewared>0:freenas/py-middlewared@${PY_FLAVOR} \
 		firmware>0:freenas/firmware
 
@@ -61,9 +62,14 @@ do-install:
 	#
 	#
 	${CP} -a ${WRKSRC}/freenas/ ${STAGEDIR}/
+	# the internal development record: the OpenZFS scripts keep their upstream names;
+	# the TrueNAS 13.3 names stay as links for existing scripts and habits.
+	${LN} -sf zarcstat ${STAGEDIR}${PREFIX}/usr/local/bin/arcstat
+	${LN} -sf zarcsummary ${STAGEDIR}${PREFIX}/usr/local/bin/arc_summary
 	(cd ${STAGEDIR}; ${FIND} . \( -type f -o -type l \) \
 		| ${GREP} -v "/debian/" \
 		| ${GREP} -v "/netcli.sh" \
+		| ${GREP} -v "^\./usr/local/bin/scponly$$" \
 		| ${GREP} -v "/systemd/" \
 		| ${SED} -e 's,^\./,,g' \
 		| ${AWK} '{print length, $$0}' | ${SORT} -rn \

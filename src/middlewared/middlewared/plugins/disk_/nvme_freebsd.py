@@ -10,21 +10,22 @@ class DiskService(Service):
     def nvme_to_nvd_map(self, ignore_boot_disks=False):
         nvme_to_nvd = {}
         boot_disks = self.middleware.call_sync('boot.get_disks') if ignore_boot_disks else []
-        for disk in self.middleware.call_sync('disk.query', [['devname', '^', 'nvd']]):
-            if disk['devname'] in boot_disks:
-                continue
+        for prefix in ('nvd', 'nda'):
+            for disk in self.middleware.call_sync('disk.query', [['devname', '^', prefix]]):
+                if disk['devname'] in boot_disks:
+                    continue
 
-            try:
-                n = int(disk['devname'][len('nvd'):])
-            except ValueError:
-                continue
+                try:
+                    n = int(disk['devname'][len(prefix):])
+                except ValueError:
+                    continue
 
-            nvd = f'/dev/{disk["devname"]}'
-            if not exists(nvd):
-                continue
+                dev = f'/dev/{disk["devname"]}'
+                if not exists(dev):
+                    continue
 
-            nvme, nsid = get_nsid(nvd)
-            if nvme:
-                nvme_to_nvd[int(nvme[4:])] = n
+                nvme, nsid = get_nsid(dev)
+                if nvme:
+                    nvme_to_nvd[int(nvme[4:])] = n
 
         return nvme_to_nvd

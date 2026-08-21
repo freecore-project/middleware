@@ -52,13 +52,13 @@ class ACMERegistrationService(CRUDService):
 
     @private
     async def register_extend(self, data):
-        data['body'] = {
-            key: value for key, value in
-            (await self.middleware.call(
-                'datastore.query', 'system.acmeregistrationbody',
-                [['acme', '=', data['id']]], {'get': True}
-            )).items() if key != 'acme'
-        }
+        body = await self.middleware.call(
+            'datastore.query', 'system.acmeregistrationbody', [['acme', '=', data['id']]],
+        )
+        # A create interrupted between the two inserts leaves a registration with no body.
+        # Report that as an empty body rather than raising, so a caller can recognise the
+        # registration as unusable and discard it.
+        data['body'] = {key: value for key, value in body[0].items() if key != 'acme'} if body else {}
         return data
 
     @private
@@ -143,9 +143,10 @@ class ACMERegistrationService(CRUDService):
                 'Please specify root email address which will be used with the ACME server'
             )
 
-        if self.middleware.call_sync(
+        existing = self.middleware.call_sync(
             'acme.registration.query', [['directory', '=', data['acme_directory_uri']]]
-        ):
+        )
+        if existing and existing[0]['body']:
             verrors.add(
                 'acme_registration_create.acme_directory_uri',
                 'A registration with the specified directory uri already exists'
@@ -169,31 +170,50 @@ class ACMERegistrationService(CRUDService):
         # We have registered with the acme server
 
         # Save registration object
-        registration_id = self.middleware.call_sync(
-            'datastore.insert',
-            self._config.datastore,
-            {
-                'uri': register.uri,
-                'tos': register.terms_of_service,
-                'new_account_uri': directory.newAccount,
-                'new_nonce_uri': directory.newNonce,
-                'new_order_uri': directory.newOrder,
-                'revoke_cert_uri': directory.revokeCert,
-                'directory': data['acme_directory_uri']
-            }
-        )
+        registration = {
+            'uri': register.uri,
+            'tos': register.terms_of_service,
+            'new_account_uri': directory.newAccount,
+            'new_nonce_uri': directory.newNonce,
+            'new_order_uri': directory.newOrder,
+            'revoke_cert_uri': directory.revokeCert,
+            'directory': data['acme_directory_uri']
+        }
+        if existing:
+            # Repairing a registration left bodyless by an interrupted create. Reuse the
+            # row rather than replacing it: certificates carry a foreign key to it, so a
+            # delete is refused outright once anything has been issued.
+            registration_id = existing[0]['id']
+            self.middleware.call_sync(
+                'datastore.update', self._config.datastore, registration_id, registration,
+            )
+        else:
+            registration_id = self.middleware.call_sync(
+                'datastore.insert', self._config.datastore, registration,
+            )
 
         # Save registration body
-        self.middleware.call_sync(
-            'datastore.insert',
-            'system.acmeregistrationbody',
-            {
-                'contact': register.body.contact[0],
-                'status': register.body.status,
-                'key': key.json_dumps(),
-                'acme': registration_id
-            }
-        )
+        try:
+            self.middleware.call_sync(
+                'datastore.insert',
+                'system.acmeregistrationbody',
+                {
+                    # An ACME server is not obliged to echo the contact back, and Let's
+                    # Encrypt no longer does - it returns an empty contact list. An absent
+                    # contact is not an error, and must not abort a valid registration.
+                    'contact': register.body.contact[0] if register.body.contact else '',
+                    'status': register.body.status,
+                    'key': key.json_dumps(),
+                    'acme': registration_id
+                }
+            )
+        except Exception:
+            if not existing:
+                # A registration row is unusable without its body and no public API can
+                # remove it, so leaving a fresh one behind strands every later issuance
+                # against this directory. Only roll back what this call inserted.
+                self.middleware.call_sync('datastore.delete', self._config.datastore, registration_id)
+            raise
 
         return self.middleware.call_sync(f'{self._config.namespace}._get_instance', registration_id)
 

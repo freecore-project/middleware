@@ -4,10 +4,6 @@ import logging.handlers
 import os
 import sys
 
-import sentry_sdk
-
-from .utils import sw_version, sw_version_is_stable
-
 
 # markdown debug is also considered useless
 logging.getLogger('MARKDOWN').setLevel(logging.INFO)
@@ -17,8 +13,8 @@ logging.getLogger('asyncio').setLevel(logging.WARN)
 logging.getLogger('aiohttp.internal').setLevel(logging.WARN)
 # We dont need internal botocore debug logging
 logging.getLogger('botocore').setLevel(logging.WARN)
-# we dont need ws4py close debug messages
-logging.getLogger('ws4py').setLevel(logging.WARN)
+# we dont need websocket-client debug messages
+logging.getLogger('websocket').setLevel(logging.WARN)
 # we dont need GitPython debug messages (used in iocage)
 logging.getLogger('git.cmd').setLevel(logging.WARN)
 # issues garbage warnings
@@ -42,84 +38,47 @@ logging.Logger.trace = trace
 
 
 class CrashReporting(object):
+    """
+    the internal development record: inert. This used to initialise sentry_sdk against a
+    hardcoded DSN at sentry.ixsystems.com and ship every unhandled middleware
+    exception there, with MAX_STRING_LENGTH raised to 10240 so tracebacks
+    carried a lot of context, plus the last 10 KiB of middlewared.log as an
+    attachment.
+
+    FreeCORE is an independent fork; iXsystems neither ships it nor can action
+    its crashes, and our FreeBSD 15 / Python 3.11 port generates plenty of
+    tracebacks that are meaningless to them and revealing about us. So the
+    reporter no longer reports anywhere.
+
+    The class, its attribute and its two methods are kept so main.py
+    (crash_reporting.is_disabled() / .report()) and system.py
+    (CrashReporting.enabled_in_settings) need no changes, and so re-pointing
+    this at a collector of our own later is a small, local edit.
+    """
+
     enabled_in_settings = False
 
-    """
-    Pseudo-Class for remote crash reporting
-    """
-
     def __init__(self):
-        if sw_version_is_stable():
-            self.sentinel_file_path = '/tmp/.crashreporting_disabled'
-        else:
-            self.sentinel_file_path = '/data/.crashreporting_disabled'
         self.logger = logging.getLogger('middlewared.logger.CrashReporting')
-        sentry_sdk.init(
-            'https://11101daa5d5643fba21020af71900475:d60cd246ba684afbadd479653de2c216@sentry.ixsystems.com/2?timeout=3',
-            release=sw_version(),
-            integrations=[],
-            default_integrations=False,
-        )
-        sentry_sdk.utils.MAX_STRING_LENGTH = 10240
-        # FIXME: remove this when 0.10.3 is released
-        strip_string = sentry_sdk.utils.strip_string
-        sentry_sdk.utils.strip_string = lambda s: strip_string(s, sentry_sdk.utils.MAX_STRING_LENGTH)
-        sentry_sdk.utils.slim_string = sentry_sdk.utils.strip_string
-        sentry_sdk.serializer.strip_string = sentry_sdk.utils.strip_string
-        sentry_sdk.serializer.slim_string = sentry_sdk.utils.strip_string
 
     def is_disabled(self):
         """
-        Check the existence of sentinel file and its absolute path
-        against STABLE and DEVELOPMENT branches.
+        Always disabled -- there is no remote crash-report endpoint in this fork.
 
         Returns:
-            bool: True if crash reporting is disabled, False otherwise.
+            bool: always True.
         """
-        # Allow report to be disabled via sentinel file or environment var,
-        # if FreeNAS current train is STABLE, the sentinel file path will be /tmp/,
-        # otherwise it's path will be /data/ and can be persistent.
-
-        if not self.enabled_in_settings:
-            return True
-
-        if os.path.exists(self.sentinel_file_path) or 'CRASHREPORTING_DISABLED' in os.environ:
-            return True
-
-        if os.stat(__file__).st_dev != os.stat('/').st_dev:
-            return True
-
-        return False
+        return True
 
     def report(self, exc_info, log_files):
-        """"
+        """
+        No-op. Kept for call-site compatibility with main.py.
+
         Args:
             exc_info (tuple): Same as sys.exc_info().
-            request (obj, optional): It is the HTTP Request.
-            sw_version (str): The current middlewared version.
-            t_log_files (tuple): A tuple with log file absolute path and name.
+            log_files (tuple): Tuples of log file absolute path and name.
         """
-        if self.is_disabled():
-            return
-
-        data = {}
-        for path, name in log_files:
-            if os.path.exists(path):
-                with open(path, 'r') as absolute_file_path:
-                    contents = absolute_file_path.read()[-10240:]
-                    data[name] = contents
-
-        self.logger.debug('Sending a crash report...')
-        try:
-            with sentry_sdk.configure_scope() as scope:
-                payload_size = 0
-                for k, v in data.items():
-                    if payload_size + len(v) < 190000:
-                        scope.set_extra(k, v)
-                        payload_size += len(v)
-                sentry_sdk.capture_exception(exc_info)
-        except Exception:
-            self.logger.debug('Failed to send crash report', exc_info=True)
+        return
 
 
 class LoggerFormatter(logging.Formatter):

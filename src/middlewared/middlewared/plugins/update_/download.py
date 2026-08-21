@@ -1,15 +1,22 @@
 # -*- coding=utf-8 -*-
+import hashlib
 import os
-import subprocess
 import time
 
 import humanfriendly
 import requests
 
 from middlewared.service import CallError, private, Service
-from middlewared.utils import osc
 
 from .utils import scale_update_server
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class UpdateService(Service):
@@ -22,14 +29,7 @@ class UpdateService(Service):
             dst = os.path.join(location, "update.sqsh")
             if os.path.exists(dst):
                 job.set_progress(0, "Verifying existing update")
-                if osc.IS_FREEBSD:
-                    checksum = subprocess.run(
-                        ["sha256", dst], stdout=subprocess.PIPE, encoding="utf-8"
-                    ).stdout.split()[-1]
-                else:
-                    checksum = subprocess.run(
-                        ["sha256sum", dst], stdout=subprocess.PIPE, encoding="utf-8"
-                    ).stdout.split()[0]
+                checksum = sha256_file(dst)
                 if checksum == train_check["checksum"]:
                     return True
 

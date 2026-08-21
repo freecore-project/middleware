@@ -5,6 +5,7 @@
 import pytest
 import sys
 import os
+from time import sleep
 apifolder = os.getcwd()
 sys.path.append(apifolder)
 from functions import PUT, POST, GET, wait_on_job
@@ -12,9 +13,14 @@ from auto_config import hostname
 from pytest_dependency import depends
 
 try:
-    from config import AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer
+    from config import (
+        AD_CREATECOMPUTER, AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer,
+    )
 except ImportError:
-    Reason = 'ADNameServer AD_DOMAIN, ADPASSWORD, or/and ADUSERNAME are missing in config.py"'
+    Reason = (
+        'ADNameServer, AD_DOMAIN, ADPASSWORD, ADUSERNAME, '
+        'or/and AD_CREATECOMPUTER are missing in config.py'
+    )
     pytestmark = pytest.mark.skip(reason=Reason)
 else:
     from auto_config import dev_test
@@ -60,6 +66,7 @@ def test_03_enabling_activedirectory(request):
         "bindname": ADUSERNAME,
         "domainname": AD_DOMAIN,
         "netbiosname": hostname,
+        "createcomputer": AD_CREATECOMPUTER,
         "dns_timeout": 15,
         "verbose_logging": True,
         "enable": True
@@ -102,6 +109,22 @@ def test_06_wait_for_cache_fill(request):
     results = GET('/core/get_jobs/?method=activedirectory.fill_cache')
     job_status = wait_on_job(results.json()[-1]['id'], 180)
     assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+
+    query = {
+        'query-filters': [['local', '=', False]],
+        'query-options': {'extra': {"search_dscache": True}},
+    }
+    for _ in range(60):
+        users = GET('/user', payload=query)
+        assert users.status_code == 200, users.text
+        if users.json():
+            groups = GET('/group', payload=query)
+            assert groups.status_code == 200, groups.text
+            if groups.json():
+                return
+        sleep(1)
+
+    pytest.fail('AD user/group cache did not become ready within 60 seconds')
 
 
 @pytest.mark.dependency(name="AD_USERS_CACHED")

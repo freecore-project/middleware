@@ -35,7 +35,7 @@ class ActiveDirectoryService(PseudoServiceBase):
 
     async def reload(self):
         if osc.IS_FREEBSD:
-            await freebsd_service("winbindd", "quietreload")
+            await freebsd_service("samba_server", "onereload")
         if osc.IS_LINUX:
             await systemd_unit("winbind", "restart")
 
