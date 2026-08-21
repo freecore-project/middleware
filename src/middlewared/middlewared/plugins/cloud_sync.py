@@ -268,7 +268,7 @@ async def run_script(job, env, hook, script_name):
         return
 
     if not hook.startswith("#!"):
-        hook = f"#!/bin/bash\n{hook}"
+        hook = f"#!/usr/bin/env bash\n{hook}"
 
     fd, name = tempfile.mkstemp()
     os.close(fd)

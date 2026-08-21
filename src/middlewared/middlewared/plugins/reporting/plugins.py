@@ -244,10 +244,19 @@ class DiskPlugin(RRDBase):
         ids = []
         for entry in glob.glob(f'{self._base_path}/disk-*'):
             ident = entry.split('-', 1)[-1]
-            if not os.path.exists(f'/dev/{ident}'):
-                continue
             if ident.startswith('pass'):
                 continue
+            # On FB14+, NVMe devices changed from nvd* to nda*.
+            # Accept the device if it exists under either naming scheme.
+            if not os.path.exists(f'/dev/{ident}'):
+                if ident.startswith('nvd'):
+                    alt = 'nda' + ident[3:]
+                elif ident.startswith('nda'):
+                    alt = 'nvd' + ident[3:]
+                else:
+                    continue
+                if not os.path.exists(f'/dev/{alt}'):
+                    continue
             if os.path.exists(os.path.join(entry, 'disk_octets.rrd')):
                 ids.append(ident)
 

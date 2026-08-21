@@ -362,7 +362,7 @@ install_loader()
 	    mount -t msdosfs /dev/${_disk}p1 /tmp/efi
 	    # Copy the .efi file and create a fallback startup script
 	    mkdir -p /tmp/efi/efi/boot
-	    cp ${_mnt}/boot/boot1.efi /tmp/efi/efi/boot/BOOTx64.efi
+	    cp ${_mnt}/boot/loader.efi /tmp/efi/efi/boot/BOOTx64.efi
 	    echo "BOOTx64.efi" > /tmp/efi/efi/boot/startup.nsh
 	    umount /tmp/efi
 	else
@@ -1062,7 +1062,7 @@ menu_install()
 	chown -R www:www /tmp/data/data
     fi
 
-    local OS=TrueNAS
+    local OS=${AVATAR_PROJECT}
 
     # Tell it to look in /.mount for the packages.
     /usr/local/bin/freenas-install -P /.mount/${OS}/Packages -M /.mount/${OS}-MANIFEST /tmp/data

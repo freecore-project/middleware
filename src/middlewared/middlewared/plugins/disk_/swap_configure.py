@@ -58,8 +58,8 @@ class DiskService(Service):
                 used_partitions_in_mirror.update(p['name'] for p in mirror['providers'])
 
                 # If mirror has been configured automatically (not by middlewared)
-                # and there is no geli attached yet we should look for core in it.
-                if osc.IS_FREEBSD and mirror['config_type'] == 'AUTOMATIC' and not mirror['encrypted_provider']:
+                # we should look for core in it.
+                if osc.IS_FREEBSD and mirror['config_type'] == 'AUTOMATIC':
                     await run(
                         'savecore', '-z', '-m', '5', '/data/crash/', mirror_name,
                         check=False
@@ -184,7 +184,7 @@ class DiskService(Service):
                     continue
             elif osc.IS_FREEBSD and not data['encrypted_provider']:
                 try:
-                    await run('geli', 'onetime', swap_path)
+                    await run('geli', 'onetime', '-l', '128', '-e', 'AES-XTS', swap_path)
                 except subprocess.CalledProcessError as e:
                     self.logger.warning('Failed to encrypt swap partition %s: %s', swap_path, e.stderr.decode())
                     continue
