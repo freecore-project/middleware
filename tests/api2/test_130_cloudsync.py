@@ -27,6 +27,25 @@ else:
     # comment pytestmark for development testing with --dev-test
     pytestmark = pytest.mark.skipif(dev_test, reason='Skip for testing')
 
+# Lab fixture: an S3-compatible endpoint inside the QA estate replaces the
+# external cloud account. When AWS_ENDPOINT is absent the credential payloads
+# are exactly the inherited AWS shape.
+try:
+    from config import AWS_ENDPOINT
+except ImportError:
+    AWS_ENDPOINT = None
+
+
+def s3_attributes(secret_access_key):
+    attributes = {
+        "access_key_id": AWS_ACCESS_KEY_ID,
+        "secret_access_key": secret_access_key,
+    }
+    if AWS_ENDPOINT:
+        attributes["endpoint"] = AWS_ENDPOINT
+        attributes["skip_region"] = True
+    return attributes
+
 
 @pytest.fixture(scope='module')
 def credentials():
@@ -49,10 +68,7 @@ def test_02_create_cloud_credentials(request, credentials):
     result = POST("/cloudsync/credentials/", {
         "name": "Test",
         "provider": "S3",
-        "attributes": {
-            "access_key_id": AWS_ACCESS_KEY_ID,
-            "secret_access_key": "garbage",
-        },
+        "attributes": s3_attributes("garbage"),
     })
     assert result.status_code == 200, result.text
     credentials.update(result.json())
@@ -63,10 +79,7 @@ def test_03_update_cloud_credentials(request, credentials):
     result = PUT(f"/cloudsync/credentials/id/{credentials['id']}/", {
         "name": "Test",
         "provider": "S3",
-        "attributes": {
-            "access_key_id": AWS_ACCESS_KEY_ID,
-            "secret_access_key": AWS_SECRET_ACCESS_KEY,
-        },
+        "attributes": s3_attributes(AWS_SECRET_ACCESS_KEY),
     })
     assert result.status_code == 200, result.text
 

@@ -74,14 +74,6 @@ class CertificateRevokedAlertSource(AlertSource):
             ((await self.middleware.call('ftp.config'))['ssltls_certificate'], 'FTP', 'certificate', 'certificate'),
             ((await self.middleware.call('webdav.config'))['certssl'], 'Webdav', 'certificate', 'certificate'),
             (
-                (await self.middleware.call('openvpn.server.config'))['server_certificate'],
-                'OpenVPN server', 'certificate', 'certificate'
-            ),
-            (
-                (await self.middleware.call('openvpn.client.config'))['client_certificate'],
-                'OpenVPN client', 'certificate', 'certificate'
-            ),
-            (
                 (await self.middleware.call('system.general.config'))['ui_certificate']['id'],
                 'Web UI', 'certificate', 'certificate'
             ),
@@ -89,14 +81,6 @@ class CertificateRevokedAlertSource(AlertSource):
                 (await self.middleware.call('system.advanced.config'))['syslog_tls_certificate'],
                 'Syslog', 'certificate', 'certificate'
             ),
-            (
-                (await self.middleware.call('openvpn.server.config'))['root_ca'],
-                'OpenVPN server', 'root certificate authority', 'certificateauthority'
-            ),
-            (
-                (await self.middleware.call('openvpn.client.config'))['root_ca'],
-                'OpenVPN client', 'root certificate authority', 'certificateauthority'
-            )
         ):
             if (
                 cert_id and (

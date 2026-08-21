@@ -26,7 +26,12 @@ class DeviceService(Service):
     @private
     async def get_serials(self):
         ports = []
-        for devices in DevInfo().resource_managers['I/O ports'].values():
+        try:
+            devinfo = DevInfo()
+            io_ports = devinfo.resource_managers.get('I/O ports', {})
+        except Exception:
+            return ports
+        for devices in io_ports.values():
             for dev in devices:
                 if not dev.name.startswith('uart'):
                     continue

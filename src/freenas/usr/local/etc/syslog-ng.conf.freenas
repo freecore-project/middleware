@@ -1,9 +1,9 @@
-@version:3.35
+@version:4.10
 
 #
 # options
 #
-options { suppress(60); chain_hostnames(off); flush_lines(0); threaded(yes); use-fqdn(no); stats-freq(0); };
+options { suppress(60); chain_hostnames(off); flush_lines(0); threaded(yes); use-fqdn(no); stats(freq(0)); };
 
 #
 # sources
@@ -37,6 +37,7 @@ destination allusers { usertty("*"); };
 destination mdns { file("/var/log/mdns.log"); };
 destination nginx_access { file("/tmp/nginx-access.log"); };
 destination nginx_error { file("/var/log/nginx/error.log"); };
+destination tnaudit { file("/var/log/samba4/audit.log" create-dirs(yes)); };
 #destination loghost { udp("loghost" port(514)); };
 
 #
@@ -90,10 +91,25 @@ filter f_nginx { program("nginx"); };
 filter f_not_nginx { not program("nginx"); };
 
 #
+# Samba (FreeCORE fork) authentication audit stream: ident TNAUDIT_SMB, facility
+# auth, priority notice, body "@cee:{"TNAUDIT": ...}".  The RFC 5424 header often
+# survives inside the message text, so match the body as well as the program.
+# (freecore/the internal development record)
+#
+filter f_tnaudit { program("^TNAUDIT_") or message("@cee:.\"TNAUDIT\""); };
+
+#
 # message filters
 #
 filter f_arpchange { message("^arp:.*moved from.*on.*$"); };
 filter f_not_arpchange { not filter(f_arpchange); };
+
+#
+# TNAUDIT_* (Samba audit) -> /var/log/samba4/audit.log only.  Must precede the
+# console/messages/auth.log statements below: flags(final) stops matching
+# messages here.  (freecore/the internal development record)
+#
+log { source(src); filter(f_tnaudit); destination(tnaudit); flags(final); };
 
 #
 # *.err;kern.warning;auth.notice;mail.crit		/dev/console

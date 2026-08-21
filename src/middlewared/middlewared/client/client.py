@@ -1,9 +1,9 @@
 from . import ejson as json
 from .protocol import DDPProtocol
 from .utils import ProgressBar, undefined
-from collections import defaultdict, namedtuple, Callable
+from collections import defaultdict, namedtuple
+from collections.abc import Callable
 from threading import Event as TEvent, Lock, Thread
-from ws4py.client.threadedclient import WebSocketClient
 
 import argparse
 from base64 import b64decode
@@ -14,9 +14,11 @@ import pprint
 import socket
 import sys
 import time
+import urllib.parse
 import uuid
 import random
 import platform
+import websocket
 
 
 try:
@@ -59,14 +61,17 @@ class ReserveFDException(Exception):
     pass
 
 
-class WSClient(WebSocketClient):
+class WSClient(object):
     def __init__(self, url, *args, **kwargs):
         self.client = kwargs.pop('client')
         self.reserved_ports = kwargs.pop('reserved_ports', False)
         self.protocol = DDPProtocol(self)
-        super(WSClient, self).__init__(url, *args, **kwargs)
+        self.url = url
+        self.ws = None
+        self.sock = None
+        self._recv_thread = None
 
-    def get_reserved_port(self):
+    def get_reserved_port(self, sock):
 
         # platform module is used because middlewared.utils.osc
         # module causes a cyclical import issue with ErrnoMixin.
@@ -78,10 +83,10 @@ class WSClient(WebSocketClient):
 
             n_retries = 5
             for retry in range(n_retries):
-                self.sock.setsockopt(socket.IPPROTO_IP, IP_PORTRANGE, IP_PORTRANGE_LOW)
+                sock.setsockopt(socket.IPPROTO_IP, IP_PORTRANGE, IP_PORTRANGE_LOW)
 
                 try:
-                    self.sock.bind(('', 0))
+                    sock.bind(('', 0))
                     return
                 except OSError:
                     time.sleep(0.1)
@@ -104,7 +109,7 @@ class WSClient(WebSocketClient):
 
             for port in ports_to_try:
                 try:
-                    self.sock.bind(('', port))
+                    sock.bind(('', port))
                     return
                 except OSError:
                     time.sleep(0.1)
@@ -113,36 +118,88 @@ class WSClient(WebSocketClient):
         raise ReserveFDException()
 
     def connect(self):
-        if self.reserved_ports:
-            self.get_reserved_port()
+        # Parse URL to determine socket type
+        is_unix = 'unix://' in self.url
 
-        self.sock.settimeout(10)
-
-        max_attempts = 3
-        for i in range(max_attempts):
-            try:
-                rv = super(WSClient, self).connect()
-            except OSError as e:
-                # Lets retry a few times in case the error is
-                # [Errno 48] Address already in use
-                # which I believe may be caused by a race condition
-                if e.errno == errno.EADDRINUSE and i < max_attempts - 1:
-                    continue
-                raise
+        if is_unix:
+            # ws+unix:///var/run/middlewared.sock -> unix socket path
+            sock_path = self.url.replace('ws+unix://', '')
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(sock_path)
+            self.ws = websocket.WebSocket()
+            self.ws.connect('ws://localhost/websocket', socket=sock)
+        else:
+            # TCP WebSocket — may need reserved ports
+            if self.reserved_ports:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.get_reserved_port(sock)
+                sock.settimeout(10)
             else:
-                break
+                sock = None
+
+            max_attempts = 3
+            for i in range(max_attempts):
+                try:
+                    self.ws = websocket.WebSocket()
+                    if sock:
+                        parsed = urllib.parse.urlparse(self.url)
+                        host = parsed.hostname or 'localhost'
+                        port = parsed.port or 80
+                        sock.connect((host, port))
+                        self.ws.connect(self.url, socket=sock)
+                    else:
+                        self.ws.settimeout(10)
+                        self.ws.connect(self.url)
+                except OSError as e:
+                    if e.errno == errno.EADDRINUSE and i < max_attempts - 1:
+                        if sock:
+                            sock.close()
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            self.get_reserved_port(sock)
+                            sock.settimeout(10)
+                        continue
+                    raise
+                else:
+                    break
+
+        self.sock = self.ws.sock
         if self.sock:
             self.sock.settimeout(None)
-        return rv
 
-    def opened(self):
+        # Start receive thread
+        self._recv_thread = Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+
+        # Notify protocol of open
         self.protocol.on_open()
 
-    def closed(self, code, reason=None):
-        self.protocol.on_close(code, reason)
+    def _recv_loop(self):
+        try:
+            while self.ws and self.ws.connected:
+                try:
+                    data = self.ws.recv()
+                    if data is None or data == '':
+                        break
+                    if isinstance(data, bytes):
+                        data = data.decode('utf8')
+                    self.protocol.on_message(data)
+                except websocket.WebSocketConnectionClosedException:
+                    break
+                except Exception:
+                    break
+        finally:
+            self.protocol.on_close(1006, 'Connection closed')
 
-    def received_message(self, message):
-        self.protocol.on_message(message.data.decode('utf8'))
+    def send(self, data):
+        self.ws.send(data)
+
+    def close(self):
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
     def on_open(self):
         self.client.on_open()
@@ -281,8 +338,6 @@ class Client(object):
             client=self,
             reserved_ports=reserved_ports,
         )
-        if 'unix://' in uri:
-            self._ws.resource = '/websocket'
         self._ws.connect()
         self._connected.wait(10)
         if not self._connected.is_set():

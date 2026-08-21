@@ -92,6 +92,26 @@ INTERFACES_WITH_BRIDGE = INTERFACES + [
 ]
 
 
+class FakeInterface:
+    def __init__(self, members):
+        self.members = members
+
+
+@pytest.mark.parametrize('name,members,expected', [
+    ('bridge9000', ['vtnet0', 'epair0a'], True),
+    ('bridge9001', ['tap0'], True),
+    ('bridge9002', ['vnet0'], True),
+    ('bridge9003', ['vtnet0'], False),
+    ('vtnet0', ['epair0a'], False),
+])
+def test__interfaces_service__runtime_bridge_members(name, members, expected):
+    service = InterfaceService(Middleware())
+
+    assert service._InterfaceService__bridge_has_transient_members(
+        name, FakeInterface(members)
+    ) is expected
+
+
 @pytest.mark.asyncio
 async def test__interfaces_service__create_bridge_invalid_ports():
 

@@ -7,16 +7,16 @@ from .lldp import LLDPService
 from .mdns import MDNSService
 from .netbios import NetBIOSService
 from .nfs import NFSService
-from .openvpn_client import OpenVPNClientService
-from .openvpn_server import OpenVPNServerService
+from .rar2fs import Rar2fsService
 from .rsync import RsyncService
 from .smartd import SMARTDService
 from .snmp import SNMPService
 from .ssh import SSHService
 from .tftp import TFTPService
-from .truecommand import TruecommandService
 from .ups import UPSService
 from .webdav import WebDAVService
+from .wireguard import WireguardService
+from .wireguard_client import WireguardClientService
 from .wsd import WSDService
 from .routing import RoutingService
 from .hostname import HostnameService
@@ -28,7 +28,6 @@ from .pseudo.misc import (
     CronService,
     DiskService,
     FailoverService,
-    KmipService,
     LoaderService,
     MOTDService,
     HttpService,
@@ -39,7 +38,7 @@ from .pseudo.misc import (
     RcService,
     ResolvConfService,
     SslService,
-    SysconsService,
+    VtService,
     SysctlService,
     SyslogdService,
     SystemService,
@@ -59,8 +58,7 @@ all_services = [
     MDNSService,
     NetBIOSService,
     NFSService,
-    OpenVPNClientService,
-    OpenVPNServerService,
+    Rar2fsService,
     RsyncService,
     SMARTDService,
     SNMPService,
@@ -68,6 +66,8 @@ all_services = [
     TFTPService,
     UPSService,
     WebDAVService,
+    WireguardService,
+    WireguardClientService,
     WSDService,
     ActiveDirectoryService,
     LdapService,
@@ -78,7 +78,6 @@ all_services = [
     CronService,
     DiskService,
     FailoverService,
-    KmipService,
     LoaderService,
     MOTDService,
     HostnameService,
@@ -91,13 +90,12 @@ all_services = [
     ResolvConfService,
     RoutingService,
     SslService,
-    SysconsService,
+    VtService,
     SysctlService,
     SyslogdService,
     SystemService,
     SystemDatasetsService,
     TimeservicesService,
-    TruecommandService,
     TtysService,
     UserService,
 ]
